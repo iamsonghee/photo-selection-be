@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+supabase
+python-jose
+python-dotenv
+pillow
+httpx
+google-cloud-storage
+boto3
+pyjwt[crypto]

@@ -1,0 +1,15 @@
+# Dependencies
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Environment and secrets (do not commit)
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+.DS_Store
