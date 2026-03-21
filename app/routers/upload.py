@@ -124,15 +124,15 @@ async def upload_photos(
     if not project_r.data or len(project_r.data) == 0:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # 허용된 파일만 읽고, number 미리 순서대로 할당 (contents, content_type, original_filename)
-    valid: list[tuple[bytes, str, str]] = []
+    # 허용된 파일만 읽고, number 미리 순서대로 할당 (contents, content_type, original_filename, file_size)
+    valid: list[tuple[bytes, str, str, int]] = []
     for f in files:
         if not f.content_type or f.content_type not in ALLOWED_CONTENT_TYPES:
             continue
         contents = await f.read()
         if not contents:
             continue
-        valid.append((contents, f.content_type or "image/jpeg", f.filename or ""))
+        valid.append((contents, f.content_type or "image/jpeg", f.filename or "", len(contents)))
 
     if not valid:
         raise HTTPException(status_code=400, detail="No valid image files (jpeg, png, webp)")
@@ -152,13 +152,13 @@ async def upload_photos(
     loop = asyncio.get_event_loop()
     tasks = [
         _process_one(loop, contents, content_type, num, project_id, photographer_id)
-        for (contents, content_type, _), num in zip(valid, numbers)
+        for (contents, content_type, _, __), num in zip(valid, numbers)
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # 성공한 항목만 수집 (예외는 로깅), 원본 파일명 매칭
+    # 성공한 항목만 수집 (예외는 로깅), 원본 파일명 + 사이즈 매칭
     rows: list[dict] = []
-    for r, (_, __, original_filename) in zip(results, valid):
+    for r, (_, __, original_filename, file_size) in zip(results, valid):
         if isinstance(r, Exception):
             logger.error(f"에러내용: {r}")
             logger.warning("process task failed: %s", r)
@@ -169,6 +169,7 @@ async def upload_photos(
                 "project_id": project_id,
                 "number": number,
                 "r2_thumb_url": r2_url,
+                "file_size": file_size,
             }
             if original_filename:
                 row["original_filename"] = original_filename
