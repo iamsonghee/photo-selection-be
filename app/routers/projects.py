@@ -9,6 +9,8 @@ from app.storage import delete_r2_objects_by_prefix
 
 router = APIRouter()
 
+BETA_MAX_PROJECTS_TOTAL = 10
+
 
 class ProjectCreate(BaseModel):
     name: str
@@ -35,6 +37,27 @@ def create_project(
 ):
     """프로젝트 생성."""
     client = get_supabase()
+
+    # 베타 제한: 누적 프로젝트 수 체크
+    count_r = (
+        client.table("projects")
+        .select("id")
+        .eq("photographer_id", str(photographer_id))
+        .execute()
+    )
+    current_count = len(count_r.data or [])
+    if current_count >= BETA_MAX_PROJECTS_TOTAL:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "beta_limit_exceeded",
+                "limit_type": "projects_total",
+                "current": current_count,
+                "max": BETA_MAX_PROJECTS_TOTAL,
+                "message": f"베타 기간 중 최대 {BETA_MAX_PROJECTS_TOTAL}개의 프로젝트를 생성할 수 있습니다.",
+            },
+        )
+
     r = (
         client.table("projects")
         .insert({"photographer_id": str(photographer_id), "name": body.name})

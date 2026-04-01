@@ -18,7 +18,30 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
-THUMB_MAX_SIZE = 1200
+
+# 원본 썸네일 (갤러리)
+THUMB_MAX_SIZE = 400
+THUMB_JPEG_QUALITY = 75
+
+# 원본 미리보기 (뷰어)
+PREVIEW_MAX_SIZE = 1200
+PREVIEW_JPEG_QUALITY = 82
+
+# 보정본
+VERSION_MAX_SIZE = 1500
+VERSION_JPEG_QUALITY = 85
+VERSION_MAX_BYTES = 2_000_000  # 2MB
+
+# 프로필
+PROFILE_MAX_SIZE = 400
+PROFILE_JPEG_QUALITY = 85
+
+# 베타 제한
+BETA_MAX_PHOTOS_PER_PROJECT = 1500
+BETA_MAX_REVISION_COUNT = 2
+
+# Pillow / boto3 블로킹 작업용 스레드풀
+_executor = ThreadPoolExecutor(max_workers=8)
 
 
 def _infer_content_type(filename: str) -> str:
@@ -31,21 +54,6 @@ def _infer_content_type(filename: str) -> str:
     if lower.endswith(".webp"):
         return "image/webp"
     return "image/jpeg"
-THUMB_JPEG_QUALITY = 85
-
-# Pillow / boto3 블로킹 작업용 스레드풀
-_executor = ThreadPoolExecutor(max_workers=8)
-
-
-def _make_thumbnail_sync(image_bytes: bytes, content_type: str) -> bytes:
-    """동기 썸네일 생성 (executor에서 호출)."""
-    img = Image.open(io.BytesIO(image_bytes))
-    if img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
-    img.thumbnail((THUMB_MAX_SIZE, THUMB_MAX_SIZE), Image.Resampling.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=THUMB_JPEG_QUALITY)
-    return buf.getvalue()
 
 
 def _upload_to_r2_sync(key: str, body: bytes, content_type: str):
@@ -53,42 +61,68 @@ def _upload_to_r2_sync(key: str, body: bytes, content_type: str):
     return upload_to_r2(key, body, content_type)
 
 
+# ── 원본 사진: 썸네일 + 미리보기 ────────────────────────────────────────────
+
+def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
+    """동기: 썸네일(400px/75%) + 미리보기(1200px/82%) 동시 생성."""
+    img = Image.open(io.BytesIO(image_bytes))
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    # 썸네일 (갤러리용)
+    thumb = img.copy()
+    thumb.thumbnail((THUMB_MAX_SIZE, THUMB_MAX_SIZE), Image.Resampling.LANCZOS)
+    thumb_buf = io.BytesIO()
+    thumb.save(thumb_buf, format="JPEG", quality=THUMB_JPEG_QUALITY)
+
+    # 미리보기 (뷰어용)
+    preview = img.copy()
+    preview.thumbnail((PREVIEW_MAX_SIZE, PREVIEW_MAX_SIZE), Image.Resampling.LANCZOS)
+    preview_buf = io.BytesIO()
+    preview.save(preview_buf, format="JPEG", quality=PREVIEW_JPEG_QUALITY)
+
+    return thumb_buf.getvalue(), preview_buf.getvalue()
+
+
 async def _process_one(
     loop: asyncio.AbstractEventLoop,
     contents: bytes,
-    content_type: str,
     number: int,
     project_id: str,
     photographer_id: UUID,
-) -> Optional[Tuple[str, int]]:
-    """파일 하나: 썸네일 생성 → R2 업로드. 성공 시 (r2_url, number) 반환."""
+) -> Optional[Tuple[str, str, int]]:
+    """파일 하나: 썸네일+미리보기 생성 → R2 병렬 업로드.
+    성공 시 (thumb_url, preview_url, number) 반환."""
+    photo_id = uuid_module.uuid4().hex
+
     try:
-        thumb_bytes = await loop.run_in_executor(
+        thumb_bytes, preview_bytes = await loop.run_in_executor(
             _executor,
-            _make_thumbnail_sync,
+            _make_thumb_and_preview_sync,
             contents,
-            content_type,
         )
     except Exception as e:
         logger.error(f"에러내용: {e}")
-        logger.warning("thumbnail failed for number %s: %s", number, e)
+        logger.warning("resize failed for number %s: %s", number, e)
         return None
-    key = f"photos/{photographer_id}/{project_id}/{uuid_module.uuid4().hex}.jpg"
+
+    thumb_key = f"photos/{photographer_id}/{project_id}/{photo_id}_thumb.jpg"
+    preview_key = f"photos/{photographer_id}/{project_id}/{photo_id}_preview.jpg"
+
     try:
-        r2_url = await loop.run_in_executor(
-            _executor,
-            _upload_to_r2_sync,
-            key,
-            thumb_bytes,
-            "image/jpeg",
+        thumb_url, preview_url = await asyncio.gather(
+            loop.run_in_executor(_executor, _upload_to_r2_sync, thumb_key, thumb_bytes, "image/jpeg"),
+            loop.run_in_executor(_executor, _upload_to_r2_sync, preview_key, preview_bytes, "image/jpeg"),
         )
     except Exception as e:
         logger.error(f"에러내용: {e}")
         logger.warning("R2 upload failed for number %s: %s", number, e)
         return None
-    if not r2_url:
+
+    if not thumb_url or not preview_url:
         return None
-    return (r2_url, number)
+
+    return (thumb_url, preview_url, number)
 
 
 @router.post("/photos")
@@ -98,9 +132,9 @@ async def upload_photos(
     photographer_id: UUID = Depends(get_current_photographer),
 ):
     """
-    사진 일괄 업로드: 썸네일 생성 후 R2 업로드, photos 테이블 INSERT, projects.photo_count UPDATE.
+    사진 일괄 업로드: 썸네일(400px/75%) + 미리보기(1200px/82%) 생성 후 R2 병렬 업로드.
+    photos.r2_thumb_url (갤러리), photos.r2_preview_url (뷰어) 저장.
     asyncio.gather로 파일 병렬 처리, Pillow/boto3는 run_in_executor로 스레드풀 실행.
-    photo number는 병렬 전에 순서대로 미리 할당.
     """
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
@@ -124,8 +158,8 @@ async def upload_photos(
     if not project_r.data or len(project_r.data) == 0:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # 허용된 파일만 읽고, number 미리 순서대로 할당 (contents, content_type, original_filename, file_size)
-    valid: list[tuple[bytes, str, str, int]] = []
+    # 허용된 파일만 읽고 number 미리 순서대로 할당
+    valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, original_filename, file_size)
     for f in files:
         if not f.content_type or f.content_type not in ALLOWED_CONTENT_TYPES:
             continue
@@ -137,7 +171,7 @@ async def upload_photos(
     if not valid:
         raise HTTPException(status_code=400, detail="No valid image files (jpeg, png, webp)")
 
-    # base_number 조회 후 number 1..len(valid) 순서 할당
+    # base_number 조회 후 number 순서 할당
     max_r = (
         supabase.table("photos")
         .select("number")
@@ -147,16 +181,34 @@ async def upload_photos(
         .execute()
     )
     base_number = max_r.data[0]["number"] if max_r.data else 0
+
+    # 베타 제한: 사진 수 체크
+    if base_number >= BETA_MAX_PHOTOS_PER_PROJECT:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "beta_limit_exceeded",
+                "limit_type": "photos_per_project",
+                "current": base_number,
+                "max": BETA_MAX_PHOTOS_PER_PROJECT,
+                "message": f"베타 기간 중 프로젝트당 최대 {BETA_MAX_PHOTOS_PER_PROJECT}장까지 업로드할 수 있습니다.",
+            },
+        )
+
+    # 부분 초과 시 가능한 만큼만
+    remaining = BETA_MAX_PHOTOS_PER_PROJECT - base_number
+    if len(valid) > remaining:
+        valid = valid[:remaining]
+
     numbers = [base_number + i for i in range(1, len(valid) + 1)]
 
     loop = asyncio.get_event_loop()
     tasks = [
-        _process_one(loop, contents, content_type, num, project_id, photographer_id)
-        for (contents, content_type, _, __), num in zip(valid, numbers)
+        _process_one(loop, contents, num, project_id, photographer_id)
+        for (contents, _, __, ___), num in zip(valid, numbers)
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # 성공한 항목만 수집 (예외는 로깅), 원본 파일명 + 사이즈 매칭
     rows: list[dict] = []
     for r, (_, __, original_filename, file_size) in zip(results, valid):
         if isinstance(r, Exception):
@@ -164,11 +216,12 @@ async def upload_photos(
             logger.warning("process task failed: %s", r)
             continue
         if r is not None:
-            r2_url, number = r
+            thumb_url, preview_url, number = r
             row: dict = {
                 "project_id": project_id,
                 "number": number,
-                "r2_thumb_url": r2_url,
+                "r2_thumb_url": thumb_url,
+                "r2_preview_url": preview_url,
                 "file_size": file_size,
             }
             if original_filename:
@@ -178,7 +231,6 @@ async def upload_photos(
     if not rows:
         return {"uploaded": 0}
 
-    # DB INSERT: 순서 유지 (number 기준으로 이미 정렬됨)
     rows.sort(key=lambda x: x["number"])
     try:
         for row in rows:
@@ -189,11 +241,8 @@ async def upload_photos(
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e
 
     photo_count = base_number + len(rows)
-    update_payload: dict = {"photo_count": photo_count}
     try:
-        supabase.table("projects").update(update_payload).eq(
-            "id", project_id
-        ).execute()
+        supabase.table("projects").update({"photo_count": photo_count}).eq("id", project_id).execute()
     except Exception as e:
         logger.error(f"에러내용: {e}")
         logger.exception("projects photo_count update failed: %s", e)
@@ -202,16 +251,14 @@ async def upload_photos(
     return {"uploaded": len(rows)}
 
 
-PROFILE_IMAGE_MAX_SIZE = 400
-PROFILE_JPEG_QUALITY = 85
-
+# ── 프로필 이미지 ────────────────────────────────────────────────────────────
 
 def _resize_profile_image_sync(image_bytes: bytes, content_type: str) -> bytes:
     """프로필 이미지 리사이즈: 최장변 400px, JPEG 85%."""
     img = Image.open(io.BytesIO(image_bytes))
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
-    img.thumbnail((PROFILE_IMAGE_MAX_SIZE, PROFILE_IMAGE_MAX_SIZE), Image.Resampling.LANCZOS)
+    img.thumbnail((PROFILE_MAX_SIZE, PROFILE_MAX_SIZE), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=PROFILE_JPEG_QUALITY)
     return buf.getvalue()
@@ -266,11 +313,29 @@ async def upload_profile_image(
     return {"url": r2_url}
 
 
-# ----- 보정본 업로드 (원본 그대로 R2, photo_versions INSERT) -----
-# R2 업로드는 원본 사진 업로드와 완전 동일: _upload_to_r2_sync + run_in_executor + asyncio.gather
+# ── 보정본 업로드 (리사이즈 후 R2, photo_versions INSERT) ────────────────────
+
+def _resize_version_sync(image_bytes: bytes) -> bytes:
+    """보정본 리사이즈: 최장변 1500px, JPEG 85%. 2MB 초과 시 품질 낮춰 2MB 이하로 맞춤."""
+    img = Image.open(io.BytesIO(image_bytes))
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    img.thumbnail((VERSION_MAX_SIZE, VERSION_MAX_SIZE), Image.Resampling.LANCZOS)
+
+    quality = VERSION_JPEG_QUALITY
+    while quality >= 60:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        if buf.tell() <= VERSION_MAX_BYTES:
+            return buf.getvalue()
+        quality -= 5
+
+    # quality 60에서도 초과하면 그대로 반환
+    return buf.getvalue()
+
 
 def _make_version_key_sync(project_id: str, version: int, photo_id: str, filename: str) -> str:
-    """보정본 R2 key 생성만 (동기). 업로드는 _upload_to_r2_sync 로 별도 호출."""
+    """보정본 R2 key 생성 (동기)."""
     safe = (filename or f"{uuid_module.uuid4().hex}.jpg").replace(" ", "_")
     if not safe.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
         safe = f"{safe}.jpg"
@@ -286,11 +351,18 @@ async def _process_one_version(
     contents: bytes,
     content_type: str,
 ) -> Optional[Tuple[str, str]]:
-    """
-    보정본 1건: _process_one과 동일 구조.
-    1) run_in_executor로 key 생성, 2) run_in_executor로 _upload_to_r2_sync(key, contents, content_type) 호출.
-    성공 시 (r2_url, photo_id) 반환.
-    """
+    """보정본 1건: 리사이즈(1500px/85%/2MB 제한) → R2 업로드. 성공 시 (r2_url, photo_id) 반환."""
+    try:
+        resized_bytes = await loop.run_in_executor(
+            _executor,
+            _resize_version_sync,
+            contents,
+        )
+    except Exception as e:
+        logger.error(f"에러내용: {e}")
+        logger.warning("version resize failed for photo %s: %s", photo_id, e)
+        return None
+
     try:
         key = await loop.run_in_executor(
             _executor,
@@ -301,23 +373,23 @@ async def _process_one_version(
             filename,
         )
     except Exception as e:
-        print(f"versions 업로드 에러: {e}")
         logger.error(f"에러내용: {e}")
         logger.warning("version key failed for photo %s: %s", photo_id, e)
         return None
+
     try:
         r2_url = await loop.run_in_executor(
             _executor,
             _upload_to_r2_sync,
             key,
-            contents,
-            content_type or "image/jpeg",
+            resized_bytes,
+            "image/jpeg",
         )
     except Exception as e:
-        print(f"versions 업로드 에러: {e}")
         logger.error(f"에러내용: {e}")
         logger.warning("version R2 upload failed for photo %s: %s", photo_id, e)
         return None
+
     if not r2_url:
         return None
     return (r2_url, photo_id)
@@ -332,8 +404,7 @@ async def upload_versions(
     photographer_id: UUID = Depends(get_current_photographer),
 ):
     """
-    보정본 일괄 업로드: 원본 그대로 R2 업로드, photo_versions INSERT.
-    R2 업로드 방식은 POST /api/upload/photos 와 동일 (storage.upload_to_r2, run_in_executor, asyncio.gather).
+    보정본 일괄 업로드: 리사이즈(최장변 1500px, JPEG 85%, 2MB 제한) 후 R2 업로드, photo_versions INSERT.
     form: project_id, version (1 or 2), photo_ids (id1,id2,id3), files (multipart).
     """
     if version not in (1, 2):
@@ -344,7 +415,6 @@ async def upload_versions(
     try:
         supabase = get_supabase()
     except Exception as e:
-        print(f"versions 업로드 에러: {e}")
         logger.error(f"에러내용: {e}")
         logger.exception("get_supabase failed")
         raise HTTPException(status_code=503, detail="DB 연결 실패") from e
@@ -360,6 +430,35 @@ async def upload_versions(
     if not project_r.data or len(project_r.data) == 0:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # 베타 제한: 보정본 횟수 체크
+    photos_r = (
+        supabase.table("photos")
+        .select("id")
+        .eq("project_id", project_id)
+        .execute()
+    )
+    photo_ids_list = [p["id"] for p in photos_r.data or []]
+    existing_versions: set[int] = set()
+    if photo_ids_list:
+        pv_r = (
+            supabase.table("photo_versions")
+            .select("version")
+            .in_("photo_id", photo_ids_list)
+            .execute()
+        )
+        existing_versions = {v["version"] for v in pv_r.data or []}
+    if version not in existing_versions and len(existing_versions) >= BETA_MAX_REVISION_COUNT:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "beta_limit_exceeded",
+                "limit_type": "revision_count",
+                "current": len(existing_versions),
+                "max": BETA_MAX_REVISION_COUNT,
+                "message": f"베타 기간 중 최대 {BETA_MAX_REVISION_COUNT}회까지 보정본을 업로드할 수 있습니다.",
+            },
+        )
+
     pid_list = [p.strip() for p in photo_ids.split(",") if p.strip()]
     if len(pid_list) != len(files):
         raise HTTPException(
@@ -367,7 +466,6 @@ async def upload_versions(
             detail="photo_ids count must match files count",
         )
 
-    # 원본 업로드와 동일: 허용된 파일만 읽고 (contents, content_type, filename) 수집
     valid: list[tuple[str, bytes, str, str]] = []  # (photo_id, contents, content_type, filename)
     for photo_id, upload_file in zip(pid_list, files):
         content_type = upload_file.content_type
@@ -385,7 +483,6 @@ async def upload_versions(
     if not valid:
         return {"uploaded": 0, "items": [], "message": "처리된 파일이 없습니다. JPEG/PNG/WebP 형식과 파일 크기를 확인하세요."}
 
-    # 원본 업로드와 동일: asyncio.gather + run_in_executor 로 R2 업로드
     loop = asyncio.get_event_loop()
     tasks = [
         _process_one_version(loop, project_id, version, photo_id, filename, contents, content_type)
@@ -394,9 +491,8 @@ async def upload_versions(
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: list[dict] = []
-    for r, (photo_id, _, _, _) in zip(gathered, valid):
+    for r, (photo_id, _, __, ___) in zip(gathered, valid):
         if isinstance(r, Exception):
-            print(f"versions 업로드 에러: {r}")
             logger.error(f"에러내용: {r}")
             logger.warning("version upload task failed: %s", r)
             continue
