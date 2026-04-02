@@ -238,8 +238,7 @@ async def upload_photos(
 
     rows.sort(key=lambda x: x["number"])
     try:
-        for row in rows:
-            supabase.table("photos").insert(row).execute()
+        supabase.table("photos").insert(rows).execute()
     except Exception as e:
         logger.error(f"에러내용: {e}")
         logger.exception("photos insert failed: %s", e)
