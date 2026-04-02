@@ -135,9 +135,9 @@ async def upload_photos(
     photographer_id: UUID = Depends(get_current_photographer),
 ):
     """
-    사진 일괄 업로드: 썸네일(400px/75%) + 미리보기(1200px/82%) 생성 후 R2 업로드.
+    사진 일괄 업로드: 썸네일(400px/75%) + 미리보기(1200px/82%) 생성 후 R2 병렬 업로드.
     photos.r2_thumb_url (갤러리), photos.r2_preview_url (뷰어) 저장.
-    파일은 순차 처리(메모리·호스팅 OOM 방지). Pillow/boto3는 run_in_executor로 스레드풀 실행.
+    asyncio.gather로 파일 병렬 처리, Pillow/boto3는 run_in_executor로 스레드풀 실행.
     """
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
@@ -206,15 +206,13 @@ async def upload_photos(
     numbers = [base_number + i for i in range(1, len(valid) + 1)]
 
     loop = asyncio.get_event_loop()
-    # asyncio.gather(전부 병렬)은 대용량 HEIC 여러 장 시 메모리·Railway OOM 위험 → 순차 처리
-    results: list[object] = []
-    for (contents, _, __, ___), num in zip(valid, numbers):
-        try:
-            r = await _process_one(loop, contents, num, project_id, photographer_id)
-            results.append(r)
-        except Exception as e:
-            logger.error(f"에러내용: {e}")
-            results.append(e)
+    # PC는 요청당 최대 5장·병렬 처리로 속도 유지. 동시에 많은 고해상도 HEIC이면 메모리 피크가 커질 수 있어
+    # 필요 시 배치 크기·호스팅 메모리로 조절.
+    tasks = [
+        _process_one(loop, contents, num, project_id, photographer_id)
+        for (contents, _, __, ___), num in zip(valid, numbers)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     rows: list[dict] = []
     for r, (_, __, original_filename, _) in zip(results, valid):
