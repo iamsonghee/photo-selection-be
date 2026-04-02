@@ -9,6 +9,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from PIL import Image
+from pillow_heif import register_heif_opener
+register_heif_opener()
 
 from app.database import get_supabase
 from app.dependencies import get_current_photographer
@@ -17,7 +19,7 @@ from app.storage import upload_to_r2
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
 
 # 원본 썸네일 (갤러리)
 THUMB_MAX_SIZE = 400
@@ -90,9 +92,9 @@ async def _process_one(
     number: int,
     project_id: str,
     photographer_id: UUID,
-) -> Optional[Tuple[str, str, int]]:
+) -> Optional[Tuple[str, str, int, int]]:
     """파일 하나: 썸네일+미리보기 생성 → R2 병렬 업로드.
-    성공 시 (thumb_url, preview_url, number) 반환."""
+    성공 시 (thumb_url, preview_url, number, r2_stored_bytes) — r2_stored_bytes는 썸네일+미리보기 JPEG 합계."""
     photo_id = uuid_module.uuid4().hex
 
     try:
@@ -122,7 +124,8 @@ async def _process_one(
     if not thumb_url or not preview_url:
         return None
 
-    return (thumb_url, preview_url, number)
+    r2_stored_bytes = len(thumb_bytes) + len(preview_bytes)
+    return (thumb_url, preview_url, number, r2_stored_bytes)
 
 
 @router.post("/photos")
@@ -210,19 +213,19 @@ async def upload_photos(
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     rows: list[dict] = []
-    for r, (_, __, original_filename, file_size) in zip(results, valid):
+    for r, (_, __, original_filename, _) in zip(results, valid):
         if isinstance(r, Exception):
             logger.error(f"에러내용: {r}")
             logger.warning("process task failed: %s", r)
             continue
         if r is not None:
-            thumb_url, preview_url, number = r
+            thumb_url, preview_url, number, r2_stored_bytes = r
             row: dict = {
                 "project_id": project_id,
                 "number": number,
                 "r2_thumb_url": thumb_url,
                 "r2_preview_url": preview_url,
-                "file_size": file_size,
+                "file_size": r2_stored_bytes,
             }
             if original_filename:
                 row["original_filename"] = original_filename
@@ -350,8 +353,8 @@ async def _process_one_version(
     filename: str,
     contents: bytes,
     content_type: str,
-) -> Optional[Tuple[str, str]]:
-    """보정본 1건: 리사이즈(1500px/85%/2MB 제한) → R2 업로드. 성공 시 (r2_url, photo_id) 반환."""
+) -> Optional[Tuple[str, str, int]]:
+    """보정본 1건: 리사이즈(1500px/85%/2MB 제한) → R2 업로드. 성공 시 (r2_url, photo_id, file_size_bytes) 반환."""
     try:
         resized_bytes = await loop.run_in_executor(
             _executor,
@@ -392,7 +395,7 @@ async def _process_one_version(
 
     if not r2_url:
         return None
-    return (r2_url, photo_id)
+    return (r2_url, photo_id, len(resized_bytes))
 
 
 @router.post("/versions")
@@ -497,8 +500,10 @@ async def upload_versions(
             logger.warning("version upload task failed: %s", r)
             continue
         if r is not None:
-            r2_url, pid = r
-            results.append({"photo_id": pid, "version": version, "r2_url": r2_url})
+            r2_url, pid, file_size = r
+            results.append(
+                {"photo_id": pid, "version": version, "r2_url": r2_url, "file_size": file_size}
+            )
 
     if not results:
         logger.error("에러내용: 업로드 결과가 0건입니다. R2 업로드 결과를 확인하세요.")
@@ -513,6 +518,7 @@ async def upload_versions(
             "version": item["version"],
             "r2_url": item["r2_url"],
             "photographer_memo": None,
+            "file_size": item["file_size"],
         }
         for item in results
     ]

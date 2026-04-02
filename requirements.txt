@@ -5,6 +5,7 @@ supabase
 python-jose
 python-dotenv
 pillow
+pillow-heif
 httpx
 google-cloud-storage
 boto3
