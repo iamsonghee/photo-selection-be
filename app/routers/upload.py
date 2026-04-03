@@ -55,11 +55,11 @@ def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
     return max(min_v, min(max_v, v))
 
 
-# 요청 한 번에 여러 장 병렬 처리 시 메모리·CPU 피크 완화 (기본 3)
-UPLOAD_PHOTOS_CONCURRENCY = _env_int("UPLOAD_PHOTOS_CONCURRENCY", 3, 1, 12)
+# 요청 한 번에 여러 장 병렬 처리 시 메모리·CPU 피크 완화 (기본 5, 환경으로 조절)
+UPLOAD_PHOTOS_CONCURRENCY = _env_int("UPLOAD_PHOTOS_CONCURRENCY", 5, 1, 12)
 VERSION_UPLOAD_CONCURRENCY = _env_int("VERSION_UPLOAD_CONCURRENCY", 3, 1, 12)
-# Pillow/R2 동기 작업 스레드 수 (동시 이미지 디코딩 상한에 맞춤)
-IMAGE_EXECUTOR_MAX_WORKERS = _env_int("IMAGE_EXECUTOR_MAX_WORKERS", 6, 2, 16)
+# Pillow/R2 동기 작업 스레드 수 (동시 이미지 디코딩 상한에 맞춤, 기본 8)
+IMAGE_EXECUTOR_MAX_WORKERS = _env_int("IMAGE_EXECUTOR_MAX_WORKERS", 8, 2, 16)
 
 # Pillow / boto3 블로킹 작업용 스레드풀
 _executor = ThreadPoolExecutor(max_workers=IMAGE_EXECUTOR_MAX_WORKERS)
@@ -168,7 +168,7 @@ async def upload_photos(
     """
     사진 일괄 업로드: 썸네일(400px/75%) + 미리보기(1200px/82%) 생성 후 R2 병렬 업로드.
     photos.r2_thumb_url (갤러리), photos.r2_preview_url (뷰어) 저장.
-    동시 처리 상한: UPLOAD_PHOTOS_CONCURRENCY(기본 3). 스레드 풀: IMAGE_EXECUTOR_MAX_WORKERS(기본 6).
+    동시 처리 상한: UPLOAD_PHOTOS_CONCURRENCY(기본 5). 스레드 풀: IMAGE_EXECUTOR_MAX_WORKERS(기본 8).
     """
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
