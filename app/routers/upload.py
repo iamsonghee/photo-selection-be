@@ -55,6 +55,8 @@ def _infer_content_type(filename: str) -> str:
         return "image/png"
     if lower.endswith(".webp"):
         return "image/webp"
+    if lower.endswith((".heic", ".heif")):
+        return "image/heic"
     return "image/jpeg"
 
 
@@ -164,12 +166,15 @@ async def upload_photos(
     # 허용된 파일만 읽고 number 미리 순서대로 할당
     valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, original_filename, file_size)
     for f in files:
-        if not f.content_type or f.content_type not in ALLOWED_CONTENT_TYPES:
+        ct = f.content_type or ""
+        if not ct or ct not in ALLOWED_CONTENT_TYPES:
+            ct = _infer_content_type(f.filename or "")
+        if ct not in ALLOWED_CONTENT_TYPES:
             continue
         contents = await f.read()
         if not contents:
             continue
-        valid.append((contents, f.content_type or "image/jpeg", f.filename or "", len(contents)))
+        valid.append((contents, ct, f.filename or "", len(contents)))
 
     if not valid:
         raise HTTPException(status_code=400, detail="No valid image files (jpeg, png, webp)")
