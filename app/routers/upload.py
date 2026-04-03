@@ -2,6 +2,7 @@
 import asyncio
 import io
 import logging
+import os
 import uuid as uuid_module
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
@@ -42,8 +43,26 @@ PROFILE_JPEG_QUALITY = 85
 BETA_MAX_PHOTOS_PER_PROJECT = 1500
 BETA_MAX_REVISION_COUNT = 2
 
+
+def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return max(min_v, min(max_v, v))
+
+
+# 요청 한 번에 여러 장 병렬 처리 시 메모리·CPU 피크 완화 (기본 3)
+UPLOAD_PHOTOS_CONCURRENCY = _env_int("UPLOAD_PHOTOS_CONCURRENCY", 3, 1, 12)
+VERSION_UPLOAD_CONCURRENCY = _env_int("VERSION_UPLOAD_CONCURRENCY", 3, 1, 12)
+# Pillow/R2 동기 작업 스레드 수 (동시 이미지 디코딩 상한에 맞춤)
+IMAGE_EXECUTOR_MAX_WORKERS = _env_int("IMAGE_EXECUTOR_MAX_WORKERS", 6, 2, 16)
+
 # Pillow / boto3 블로킹 작업용 스레드풀
-_executor = ThreadPoolExecutor(max_workers=8)
+_executor = ThreadPoolExecutor(max_workers=IMAGE_EXECUTOR_MAX_WORKERS)
 
 
 def _apply_exif_orientation(img: Image.Image) -> Image.Image:
@@ -149,7 +168,7 @@ async def upload_photos(
     """
     사진 일괄 업로드: 썸네일(400px/75%) + 미리보기(1200px/82%) 생성 후 R2 병렬 업로드.
     photos.r2_thumb_url (갤러리), photos.r2_preview_url (뷰어) 저장.
-    asyncio.gather로 파일 병렬 처리, Pillow/boto3는 run_in_executor로 스레드풀 실행.
+    동시 처리 상한: UPLOAD_PHOTOS_CONCURRENCY(기본 3). 스레드 풀: IMAGE_EXECUTOR_MAX_WORKERS(기본 6).
     """
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
@@ -221,13 +240,19 @@ async def upload_photos(
     numbers = [base_number + i for i in range(1, len(valid) + 1)]
 
     loop = asyncio.get_event_loop()
-    # PC는 요청당 최대 5장·병렬 처리로 속도 유지. 동시에 많은 고해상도 HEIC이면 메모리 피크가 커질 수 있어
-    # 필요 시 배치 크기·호스팅 메모리로 조절.
-    tasks = [
-        _process_one(loop, contents, num, project_id, photographer_id)
-        for (contents, _, __, ___), num in zip(valid, numbers)
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    sem = asyncio.Semaphore(UPLOAD_PHOTOS_CONCURRENCY)
+
+    async def _limited_process_one(contents: bytes, num: int):
+        async with sem:
+            return await _process_one(loop, contents, num, project_id, photographer_id)
+
+    results = await asyncio.gather(
+        *[
+            _limited_process_one(contents, num)
+            for (contents, _, __, ___), num in zip(valid, numbers)
+        ],
+        return_exceptions=True,
+    )
 
     rows: list[dict] = []
     for r, (_, __, original_filename, _) in zip(results, valid):
@@ -505,11 +530,26 @@ async def upload_versions(
         return {"uploaded": 0, "items": [], "message": "처리된 파일이 없습니다. JPEG/PNG/WebP 형식과 파일 크기를 확인하세요."}
 
     loop = asyncio.get_event_loop()
-    tasks = [
-        _process_one_version(loop, project_id, version, photo_id, filename, contents, content_type)
-        for photo_id, contents, content_type, filename in valid
-    ]
-    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    sem = asyncio.Semaphore(VERSION_UPLOAD_CONCURRENCY)
+
+    async def _limited_version(
+        photo_id: str,
+        contents: bytes,
+        content_type: str,
+        filename: str,
+    ):
+        async with sem:
+            return await _process_one_version(
+                loop, project_id, version, photo_id, filename, contents, content_type
+            )
+
+    gathered = await asyncio.gather(
+        *[
+            _limited_version(photo_id, contents, content_type, filename)
+            for photo_id, contents, content_type, filename in valid
+        ],
+        return_exceptions=True,
+    )
 
     results: list[dict] = []
     for r, (photo_id, _, __, ___) in zip(gathered, valid):
