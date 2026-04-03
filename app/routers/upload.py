@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from PIL import Image
+from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 register_heif_opener()
 
@@ -46,6 +46,15 @@ BETA_MAX_REVISION_COUNT = 2
 _executor = ThreadPoolExecutor(max_workers=8)
 
 
+def _apply_exif_orientation(img: Image.Image) -> Image.Image:
+    """EXIF Orientation에 맞게 픽셀을 회전한다. 세로 촬영본이 가로로 보이는 문제를 방지한다."""
+    try:
+        out = ImageOps.exif_transpose(img)
+        return out if out is not None else img
+    except Exception:
+        return img
+
+
 def _infer_content_type(filename: str) -> str:
     """파일 확장자로 content-type 추론 (프록시 등에서 Content-Type이 비어 있을 때 사용)."""
     lower = (filename or "").lower()
@@ -70,6 +79,7 @@ def _upload_to_r2_sync(key: str, body: bytes, content_type: str):
 def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
     """동기: 썸네일(400px/75%) + 미리보기(1200px/82%) 동시 생성."""
     img = Image.open(io.BytesIO(image_bytes))
+    img = _apply_exif_orientation(img)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
@@ -265,6 +275,7 @@ async def upload_photos(
 def _resize_profile_image_sync(image_bytes: bytes, content_type: str) -> bytes:
     """프로필 이미지 리사이즈: 최장변 400px, JPEG 85%."""
     img = Image.open(io.BytesIO(image_bytes))
+    img = _apply_exif_orientation(img)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     img.thumbnail((PROFILE_MAX_SIZE, PROFILE_MAX_SIZE), Image.Resampling.LANCZOS)
@@ -327,6 +338,7 @@ async def upload_profile_image(
 def _resize_version_sync(image_bytes: bytes) -> bytes:
     """보정본 리사이즈: 최장변 1500px, JPEG 85%. 2MB 초과 시 품질 낮춰 2MB 이하로 맞춤."""
     img = Image.open(io.BytesIO(image_bytes))
+    img = _apply_exif_orientation(img)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     img.thumbnail((VERSION_MAX_SIZE, VERSION_MAX_SIZE), Image.Resampling.LANCZOS)
