@@ -74,6 +74,24 @@ def _apply_exif_orientation(img: Image.Image) -> Image.Image:
         return img
 
 
+def _claim_photo_number_base(supabase, project_id: str) -> int:
+    """프로젝트 행을 잠근 뒤 현재 max(photos.number)를 반환 (동시 업로드 배치 간 번호 충돌 방지)."""
+    claim_r = supabase.rpc(
+        "claim_photo_number_base",
+        {"p_project_id": project_id},
+    ).execute()
+    data = claim_r.data
+    if not data:
+        logger.error("claim_photo_number_base returned empty for project_id=%s", project_id)
+        raise HTTPException(status_code=500, detail="사진 번호 할당 실패")
+    row = data[0] if isinstance(data, list) else data
+    if isinstance(row, dict):
+        if "base_number" in row:
+            return int(row["base_number"])
+        return int(next(iter(row.values())))
+    return int(row)
+
+
 def _infer_content_type(filename: str) -> str:
     """파일 확장자로 content-type 추론 (프록시 등에서 Content-Type이 비어 있을 때 사용)."""
     lower = (filename or "").lower()
@@ -208,16 +226,14 @@ async def upload_photos(
     if not valid:
         raise HTTPException(status_code=400, detail="No valid image files (jpeg, png, webp)")
 
-    # base_number 조회 후 number 순서 할당
-    max_r = (
-        supabase.table("photos")
-        .select("number")
-        .eq("project_id", project_id)
-        .order("number", desc=True)
-        .limit(1)
-        .execute()
-    )
-    base_number = max_r.data[0]["number"] if max_r.data else 0
+    # base_number: DB에서 프로젝트 단위로 잠금 후 max(number) (동시 HTTP 배치 대응)
+    try:
+        base_number = _claim_photo_number_base(supabase, project_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("claim_photo_number_base failed: %s", e)
+        raise HTTPException(status_code=500, detail="사진 번호 할당 실패") from e
 
     # 베타 제한: 사진 수 체크
     if base_number >= BETA_MAX_PHOTOS_PER_PROJECT:
@@ -284,7 +300,17 @@ async def upload_photos(
         logger.exception("photos insert failed: %s", e)
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e
 
-    photo_count = base_number + len(rows)
+    count_res = (
+        supabase.table("photos")
+        .select("id", count="exact")
+        .eq("project_id", project_id)
+        .execute()
+    )
+    photo_count = (
+        count_res.count
+        if getattr(count_res, "count", None) is not None
+        else base_number + len(rows)
+    )
     try:
         supabase.table("projects").update({"photo_count": photo_count}).eq("id", project_id).execute()
     except Exception as e:
