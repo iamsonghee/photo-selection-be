@@ -46,11 +46,18 @@ def get_current_photographer(
             detail="SUPABASE_URL is not configured",
         )
 
+    diag: Dict[str, object] = {
+        "kid": None,
+        "jwks_keys": 0,
+        "supabase_url": SUPABASE_URL,
+    }
     try:
         header = jwt.get_unverified_header(token)
         kid = header.get("kid")
+        diag["kid"] = kid
 
         keys = get_jwks()
+        diag["jwks_keys"] = len(keys)
         jwk = next((k for k in keys if k.get("kid") == kid), None) if kid else None
         if not jwk:
             jwk = keys[0]
@@ -70,15 +77,30 @@ def get_current_photographer(
             detail="Token expired",
         ) from e
     except jwt.InvalidTokenError as e:
-        logger.error(f"JWT 검증 에러: {e}")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {e}") from e
+        logger.exception("JWT InvalidTokenError", extra={"diag": diag})
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {e}",
+        ) from e
+    except httpx.HTTPError as e:
+        logger.exception("JWKS fetch error", extra={"diag": diag})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="인증 서버(JWKS) 연결 실패",
+        ) from e
+    except RuntimeError as e:
+        logger.exception("Auth config/JWKS shape error", extra={"diag": diag})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        ) from e
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"JWT 검증 에러: {e}")
+        logger.exception("JWT 검증 catch-all", extra={"diag": diag})
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="인증 처리 중 오류",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"인증 처리 중 오류: {type(e).__name__}",
         ) from e
 
     client = get_supabase()
