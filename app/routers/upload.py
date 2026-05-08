@@ -617,4 +617,25 @@ async def upload_versions(
         err_msg = str(e).strip() or "사진 버전 저장 실패"
         raise HTTPException(status_code=500, detail=err_msg) from e
 
+    # 교체된 보정본의 기존 version_reviews 삭제 (재보정 요청 상태 초기화)
+    # → editing_v2 재진입 시 교체 전에 CTA가 활성화되는 문제 방지
+    try:
+        uploaded_photo_ids = [item["photo_id"] for item in results]
+        if uploaded_photo_ids:
+            pv_ids_r = (
+                supabase.table("photo_versions")
+                .select("id")
+                .in_("photo_id", uploaded_photo_ids)
+                .eq("version", version)
+                .execute()
+            )
+            pv_ids = [row["id"] for row in pv_ids_r.data or []]
+            if pv_ids:
+                supabase.table("version_reviews") \
+                    .delete() \
+                    .in_("photo_version_id", pv_ids) \
+                    .execute()
+    except Exception as e:
+        logger.error(f"에러내용: version_reviews 삭제 실패 {e}")
+
     return {"uploaded": len(results), "items": results}
