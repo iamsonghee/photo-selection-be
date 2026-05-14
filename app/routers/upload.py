@@ -3,6 +3,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import uuid as uuid_module
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
@@ -92,8 +93,8 @@ def _claim_photo_number_base(supabase, project_id: str) -> int:
     return int(row)
 
 
-def _infer_content_type(filename: str) -> str:
-    """파일 확장자로 content-type 추론 (프록시 등에서 Content-Type이 비어 있을 때 사용)."""
+def _infer_content_type(filename: str) -> Optional[str]:
+    """파일 확장자로 content-type 추론. 알 수 없는 확장자는 None 반환 (BUG-01: CR3 등 RAW 파일 조용한 실패 방지)."""
     lower = (filename or "").lower()
     if lower.endswith((".jpg", ".jpeg")):
         return "image/jpeg"
@@ -103,7 +104,7 @@ def _infer_content_type(filename: str) -> str:
         return "image/webp"
     if lower.endswith((".heic", ".heif")):
         return "image/heic"
-    return "image/jpeg"
+    return None  # 알 수 없는 확장자 → 명시적 거부
 
 
 def _upload_to_r2_sync(key: str, body: bytes, content_type: str):
@@ -210,21 +211,36 @@ async def upload_photos(
     if not project_r.data or len(project_r.data) == 0:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # 허용된 파일만 읽고 number 미리 순서대로 할당
+    # 허용된 파일만 읽고 number 미리 순서대로 할당 (BUG-01: 거부 파일 목록 수집 / BUG-02: 소문자 정규화)
     valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, original_filename, file_size)
+    rejected_filenames: list[str] = []
     for f in files:
-        ct = f.content_type or ""
+        ct = (f.content_type or "").lower()  # BUG-02: 대문자 MIME 타입 정규화
         if not ct or ct not in ALLOWED_CONTENT_TYPES:
-            ct = _infer_content_type(f.filename or "")
+            inferred = _infer_content_type(f.filename or "")
+            if inferred is None:  # BUG-01: 알 수 없는 확장자 → 명시적 거부
+                rejected_filenames.append(f.filename or "(unknown)")
+                logger.warning("rejected unsupported file: %r (content_type=%r)", f.filename, f.content_type)
+                continue
+            ct = inferred
         if ct not in ALLOWED_CONTENT_TYPES:
+            rejected_filenames.append(f.filename or "(unknown)")
             continue
         contents = await f.read()
         if not contents:
+            rejected_filenames.append(f.filename or "(unknown)")
             continue
         valid.append((contents, ct, f.filename or "", len(contents)))
 
     if not valid:
-        raise HTTPException(status_code=400, detail="No valid image files (jpeg, png, webp)")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "no_valid_files",
+                "message": "지원하지 않는 파일 형식입니다. JPEG, PNG, WebP, HEIC만 가능합니다.",
+                "rejected": rejected_filenames,
+            }
+        )
 
     # base_number: DB에서 프로젝트 단위로 잠금 후 max(number) (동시 HTTP 배치 대응)
     try:
@@ -290,7 +306,7 @@ async def upload_photos(
             rows.append(row)
 
     if not rows:
-        return {"uploaded": 0}
+        return {"uploaded": 0, "rejected": rejected_filenames}
 
     rows.sort(key=lambda x: x["number"])
     try:
@@ -318,7 +334,7 @@ async def upload_photos(
         logger.exception("projects photo_count update failed: %s", e)
         raise HTTPException(status_code=500, detail="프로젝트 업데이트 실패") from e
 
-    return {"uploaded": len(rows)}
+    return {"uploaded": len(rows), "rejected": rejected_filenames}
 
 
 # ── 프로필 이미지 ────────────────────────────────────────────────────────────
@@ -407,8 +423,10 @@ def _resize_version_sync(image_bytes: bytes) -> bytes:
 
 
 def _make_version_key_sync(project_id: str, version: int, photo_id: str, filename: str) -> str:
-    """보정본 R2 key 생성 (동기)."""
-    safe = (filename or f"{uuid_module.uuid4().hex}.jpg").replace(" ", "_")
+    """보정본 R2 key 생성 (동기). BUG-03: 특수문자 → 언더스코어 치환."""
+    base = filename or f"{uuid_module.uuid4().hex}.jpg"
+    # URL 예약 문자(#, &, ?, %, 공백 등) 및 ASCII 비출력 문자 → 언더스코어
+    safe = re.sub(r"[^\w\-.]", "_", base)
     if not safe.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
         safe = f"{safe}.jpg"
     return f"versions/{project_id}/v{version}/{photo_id}_{safe}"
