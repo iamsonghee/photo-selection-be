@@ -2,10 +2,11 @@ from uuid import UUID
 
 import logging
 import os
+import time
 import jwt
 import json
 import httpx
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt.algorithms import ECAlgorithm
@@ -15,13 +16,19 @@ from app.database import get_supabase
 bearer_scheme = HTTPBearer(auto_error=True)
 logger = logging.getLogger(__name__)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-_jwks_cache: Optional[List[Dict]] = None
+
+# OPT-04: JWKS TTL 캐시 (1시간) — 무기한 캐시 → Supabase 키 교체 시 영구 실패 방지
+_JWKS_TTL_SECONDS = 3600
+_jwks_cache: Optional[Tuple[List[Dict], float]] = None  # (keys, fetched_at)
 
 
 def get_jwks() -> List[Dict]:
     global _jwks_cache
-    if _jwks_cache:
-        return _jwks_cache
+    now = time.monotonic()
+    if _jwks_cache is not None:
+        keys, fetched_at = _jwks_cache
+        if now - fetched_at < _JWKS_TTL_SECONDS:
+            return keys
     if not SUPABASE_URL:
         raise RuntimeError("SUPABASE_URL is not configured")
     url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
@@ -31,8 +38,8 @@ def get_jwks() -> List[Dict]:
     keys = data.get("keys")
     if not isinstance(keys, list) or not keys:
         raise RuntimeError("JWKS response missing keys")
-    _jwks_cache = keys
-    return _jwks_cache
+    _jwks_cache = (keys, now)
+    return keys
 
 
 def get_current_photographer(
