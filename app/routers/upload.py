@@ -35,6 +35,8 @@ PREVIEW_JPEG_QUALITY = 82
 VERSION_MAX_SIZE = 1500
 VERSION_JPEG_QUALITY = 85
 VERSION_MAX_BYTES = 2_000_000  # 2MB
+VERSION_THUMB_MAX_SIZE = 400
+VERSION_THUMB_JPEG_QUALITY = 78
 
 # 프로필
 PROFILE_MAX_SIZE = 400
@@ -426,24 +428,32 @@ async def upload_profile_image(
 
 # ── 보정본 업로드 (리사이즈 후 R2, photo_versions INSERT) ────────────────────
 
-def _resize_version_sync(image_bytes: bytes) -> bytes:
-    """보정본 리사이즈: 최장변 1500px, JPEG 85%. 2MB 초과 시 품질 낮춰 2MB 이하로 맞춤."""
+def _resize_version_and_thumb_sync(image_bytes: bytes) -> tuple[bytes, bytes]:
+    """보정본 1500px(full) + 400px(thumb) 동시 생성. (full_bytes, thumb_bytes) 반환."""
     img = Image.open(io.BytesIO(image_bytes))
     img = _apply_exif_orientation(img)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
-    img.thumbnail((VERSION_MAX_SIZE, VERSION_MAX_SIZE), Image.Resampling.LANCZOS)
 
+    # full (1500px, 최대 2MB)
+    full = img.copy()
+    full.thumbnail((VERSION_MAX_SIZE, VERSION_MAX_SIZE), Image.Resampling.LANCZOS)
     quality = VERSION_JPEG_QUALITY
+    full_buf = io.BytesIO()
     while quality >= 60:
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
-        if buf.tell() <= VERSION_MAX_BYTES:
-            return buf.getvalue()
+        full_buf = io.BytesIO()
+        full.save(full_buf, format="JPEG", quality=quality)
+        if full_buf.tell() <= VERSION_MAX_BYTES:
+            break
         quality -= 5
 
-    # quality 60에서도 초과하면 그대로 반환
-    return buf.getvalue()
+    # thumb (400px, 그리드 표시용)
+    thumb = img.copy()
+    thumb.thumbnail((VERSION_THUMB_MAX_SIZE, VERSION_THUMB_MAX_SIZE), Image.Resampling.LANCZOS)
+    thumb_buf = io.BytesIO()
+    thumb.save(thumb_buf, format="JPEG", quality=VERSION_THUMB_JPEG_QUALITY)
+
+    return full_buf.getvalue(), thumb_buf.getvalue()
 
 
 def _make_version_key_sync(project_id: str, version: int, photo_id: str, filename: str) -> str:
@@ -464,12 +474,13 @@ async def _process_one_version(
     filename: str,
     contents: bytes,
     content_type: str,
-) -> Optional[Tuple[str, str, int]]:
-    """보정본 1건: 리사이즈(1500px/85%/2MB 제한) → R2 업로드. 성공 시 (r2_url, photo_id, file_size_bytes) 반환."""
+) -> Optional[Tuple[str, str, str, int]]:
+    """보정본 1건: 리사이즈(1500px + 400px thumb) → R2 병렬 업로드.
+    성공 시 (r2_url, r2_thumb_url, photo_id, file_size_bytes) 반환."""
     try:
-        resized_bytes = await loop.run_in_executor(
+        full_bytes, thumb_bytes = await loop.run_in_executor(
             _executor,
-            _resize_version_sync,
+            _resize_version_and_thumb_sync,
             contents,
         )
     except Exception as e:
@@ -486,18 +497,16 @@ async def _process_one_version(
             photo_id,
             filename,
         )
+        thumb_key = f"versions/{project_id}/v{version}/{photo_id}_thumb.jpg"
     except Exception as e:
         logger.error(f"에러내용: {e}")
         logger.warning("version key failed for photo %s: %s", photo_id, e)
         return None
 
     try:
-        r2_url = await loop.run_in_executor(
-            _executor,
-            _upload_to_r2_sync,
-            key,
-            resized_bytes,
-            "image/jpeg",
+        r2_url, r2_thumb_url = await asyncio.gather(
+            loop.run_in_executor(_executor, _upload_to_r2_sync, key, full_bytes, "image/jpeg"),
+            loop.run_in_executor(_executor, _upload_to_r2_sync, thumb_key, thumb_bytes, "image/jpeg"),
         )
     except Exception as e:
         logger.error(f"에러내용: {e}")
@@ -506,7 +515,7 @@ async def _process_one_version(
 
     if not r2_url:
         return None
-    return (r2_url, photo_id, len(resized_bytes))
+    return (r2_url, r2_thumb_url or "", photo_id, len(full_bytes))
 
 
 @router.post("/versions")
@@ -626,9 +635,9 @@ async def upload_versions(
             logger.warning("version upload task failed: %s", r)
             continue
         if r is not None:
-            r2_url, pid, file_size = r
+            r2_url, r2_thumb_url, pid, file_size = r
             results.append(
-                {"photo_id": pid, "version": version, "r2_url": r2_url, "file_size": file_size}
+                {"photo_id": pid, "version": version, "r2_url": r2_url, "r2_thumb_url": r2_thumb_url, "file_size": file_size}
             )
 
     if not results:
@@ -643,6 +652,7 @@ async def upload_versions(
             "photo_id": item["photo_id"],
             "version": item["version"],
             "r2_url": item["r2_url"],
+            "r2_thumb_url": item["r2_thumb_url"] or None,
             "photographer_memo": None,
             "file_size": item["file_size"],
         }
