@@ -476,7 +476,7 @@ async def _process_one_version(
     content_type: str,
 ) -> Optional[Tuple[str, str, str, int]]:
     """보정본 1건: 리사이즈(1500px + 400px thumb) → R2 병렬 업로드.
-    성공 시 (r2_url, r2_thumb_url, photo_id, file_size_bytes) 반환."""
+    성공 시 (r2_url, r2_thumb_url, photo_id, file_size_bytes, filename) 반환."""
     try:
         full_bytes, thumb_bytes = await loop.run_in_executor(
             _executor,
@@ -515,7 +515,7 @@ async def _process_one_version(
 
     if not r2_url:
         return None
-    return (r2_url, r2_thumb_url or "", photo_id, len(full_bytes))
+    return (r2_url, r2_thumb_url or "", photo_id, len(full_bytes), filename)
 
 
 @router.post("/versions")
@@ -635,9 +635,9 @@ async def upload_versions(
             logger.warning("version upload task failed: %s", r)
             continue
         if r is not None:
-            r2_url, r2_thumb_url, pid, file_size = r
+            r2_url, r2_thumb_url, pid, file_size, orig_filename = r
             results.append(
-                {"photo_id": pid, "version": version, "r2_url": r2_url, "r2_thumb_url": r2_thumb_url, "file_size": file_size}
+                {"photo_id": pid, "version": version, "r2_url": r2_url, "r2_thumb_url": r2_thumb_url, "file_size": file_size, "filename": orig_filename}
             )
 
     if not results:
@@ -655,6 +655,7 @@ async def upload_versions(
             "r2_thumb_url": item["r2_thumb_url"] or None,
             "photographer_memo": None,
             "file_size": item["file_size"],
+            "filename": item.get("filename") or None,
         }
         for item in results
     ]
