@@ -4,8 +4,9 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# CPU-only torch wheel로 설치해 이미지 용량과 메모리 사용을 줄인다.
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch \
+# CPU-only torch/torchvision 휠을 같은 인덱스에서 함께 설치 (버전 불일치 시
+# "operator torchvision::nms does not exist" 같은 ABI 에러가 발생한다).
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
