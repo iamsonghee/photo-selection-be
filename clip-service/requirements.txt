@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+supabase
+httpx
+pillow
+numpy<2
+open_clip_torch
