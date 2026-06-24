@@ -77,22 +77,28 @@ def _apply_exif_orientation(img: Image.Image) -> Image.Image:
         return img
 
 
-def _claim_photo_number_base(supabase, project_id: str) -> int:
-    """프로젝트 행을 잠근 뒤 현재 max(photos.number)를 반환 (동시 업로드 배치 간 번호 충돌 방지)."""
-    claim_r = supabase.rpc(
-        "claim_photo_number_base",
-        {"p_project_id": project_id},
+def _count_photos(supabase, project_id: str) -> int:
+    """베타 업로드 장수 제한 체크/잔여량 계산용 — 잠금 없는 빠른 카운트.
+    실제 number 할당은 insert_photos_with_numbers RPC가 INSERT 시점에 원자적으로 처리한다."""
+    count_r = (
+        supabase.table("photos")
+        .select("id", count="exact")
+        .eq("project_id", project_id)
+        .execute()
+    )
+    return count_r.count or 0
+
+
+def _insert_photos_with_numbers(supabase, project_id: str, rows: list[dict]) -> list[dict]:
+    """프로젝트 행을 잠그고 max(number)를 구한 뒤 순서대로 번호를 매겨 INSERT — 모두 한 트랜잭션(RPC) 안에서 처리해
+    번호 계산과 INSERT 사이에 락이 풀리는 시간 간극을 없앤다 (claim_photo_number_base는 락을 readonly RPC 호출
+    동안만 쥐고 있었고, 실제 INSERT는 이미지 리사이즈+R2 업로드가 끝난 한참 뒤 별도 트랜잭션에서 실행돼
+    동시 업로드 배치끼리 같은 번호를 할당받는 레이스 컨디션이 있었다)."""
+    insert_r = supabase.rpc(
+        "insert_photos_with_numbers",
+        {"p_project_id": project_id, "p_rows": rows},
     ).execute()
-    data = claim_r.data
-    if not data:
-        logger.error("claim_photo_number_base returned empty for project_id=%s", project_id)
-        raise HTTPException(status_code=500, detail="사진 번호 할당 실패")
-    row = data[0] if isinstance(data, list) else data
-    if isinstance(row, dict):
-        if "base_number" in row:
-            return int(row["base_number"])
-        return int(next(iter(row.values())))
-    return int(row)
+    return insert_r.data or []
 
 
 def _infer_content_type(filename: str) -> Optional[str]:
@@ -165,12 +171,13 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
 async def _process_one(
     loop: asyncio.AbstractEventLoop,
     contents: bytes,
-    number: int,
+    index: int,
     project_id: str,
     photographer_id: UUID,
-) -> Optional[Tuple[str, str, int, int]]:
-    """파일 하나: 썸네일+미리보기 생성 → R2 병렬 업로드.
-    성공 시 (thumb_url, preview_url, number, r2_stored_bytes) — r2_stored_bytes는 썸네일+미리보기 JPEG 합계."""
+) -> Optional[Tuple[str, str, int]]:
+    """파일 하나: 썸네일+미리보기 생성 → R2 병렬 업로드. (photos.number는 모든 파일 업로드가 끝난 뒤
+    insert_photos_with_numbers RPC가 한 번에 원자적으로 할당하므로 여기서는 다루지 않는다 — index는 로그 추적용.)
+    성공 시 (thumb_url, preview_url, r2_stored_bytes) — r2_stored_bytes는 썸네일+미리보기 JPEG 합계."""
     photo_id = uuid_module.uuid4().hex
 
     try:
@@ -181,7 +188,7 @@ async def _process_one(
         )
     except Exception as e:
         logger.error(f"에러내용: {e}")
-        logger.warning("resize failed for number %s: %s", number, e)
+        logger.warning("resize failed for index %s: %s", index, e)
         return None
 
     thumb_key = f"photos/{photographer_id}/{project_id}/{photo_id}_thumb.jpg"
@@ -194,14 +201,14 @@ async def _process_one(
         )
     except Exception as e:
         logger.error(f"에러내용: {e}")
-        logger.warning("R2 upload failed for number %s: %s", number, e)
+        logger.warning("R2 upload failed for index %s: %s", index, e)
         return None
 
     if not thumb_url or not preview_url:
         return None
 
     r2_stored_bytes = len(thumb_bytes) + len(preview_bytes)
-    return (thumb_url, preview_url, number, r2_stored_bytes)
+    return (thumb_url, preview_url, r2_stored_bytes)
 
 
 @router.post("/photos")
@@ -237,7 +244,7 @@ async def upload_photos(
     if not project_r.data or len(project_r.data) == 0:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # 허용된 파일만 읽고 number 미리 순서대로 할당 (BUG-01: 거부 파일 목록 수집 / BUG-02: 소문자 정규화)
+    # 허용된 파일만 읽음 (BUG-01: 거부 파일 목록 수집 / BUG-02: 소문자 정규화)
     valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, original_filename, file_size)
     rejected_filenames: list[str] = []
     for f in files:
@@ -268,50 +275,48 @@ async def upload_photos(
             }
         )
 
-    # base_number: DB에서 프로젝트 단위로 잠금 후 max(number) (동시 HTTP 배치 대응)
+    # 베타 제한 체크/잔여량 계산용 — 잠금 없는 빠른 카운트.
+    # 실제 number 할당은 모든 파일 처리가 끝난 뒤 insert_photos_with_numbers RPC가 INSERT와 함께 원자적으로 처리한다.
     try:
-        base_number = _claim_photo_number_base(supabase, project_id)
-    except HTTPException:
-        raise
+        current_count = _count_photos(supabase, project_id)
     except Exception as e:
-        logger.exception("claim_photo_number_base failed: %s", e)
-        raise HTTPException(status_code=500, detail="사진 번호 할당 실패") from e
+        logger.exception("photo count check failed: %s", e)
+        raise HTTPException(status_code=500, detail="사진 수 확인 실패") from e
 
     # 베타 제한: 사진 수 체크
-    if base_number >= BETA_MAX_PHOTOS_PER_PROJECT:
+    if current_count >= BETA_MAX_PHOTOS_PER_PROJECT:
         raise HTTPException(
             status_code=403,
             detail={
                 "error": "beta_limit_exceeded",
                 "limit_type": "photos_per_project",
-                "current": base_number,
+                "current": current_count,
                 "max": BETA_MAX_PHOTOS_PER_PROJECT,
                 "message": f"베타 기간 중 프로젝트당 최대 {BETA_MAX_PHOTOS_PER_PROJECT}장까지 업로드할 수 있습니다.",
             },
         )
 
     # 부분 초과 시 가능한 만큼만
-    remaining = BETA_MAX_PHOTOS_PER_PROJECT - base_number
+    remaining = BETA_MAX_PHOTOS_PER_PROJECT - current_count
     if len(valid) > remaining:
         valid = valid[:remaining]
-
-    numbers = [base_number + i for i in range(1, len(valid) + 1)]
 
     loop = asyncio.get_event_loop()
     sem = asyncio.Semaphore(UPLOAD_PHOTOS_CONCURRENCY)
 
-    async def _limited_process_one(contents: bytes, num: int):
+    async def _limited_process_one(contents: bytes, index: int):
         async with sem:
-            return await _process_one(loop, contents, num, project_id, photographer_id)
+            return await _process_one(loop, contents, index, project_id, photographer_id)
 
     results = await asyncio.gather(
         *[
-            _limited_process_one(contents, num)
-            for (contents, _, __, ___), num in zip(valid, numbers)
+            _limited_process_one(contents, idx)
+            for idx, (contents, _, __, ___) in enumerate(valid)
         ],
         return_exceptions=True,
     )
 
+    # asyncio.gather는 입력 순서를 보존하므로, valid의 원래 파일 순서 그대로 number가 매겨진다.
     rows: list[dict] = []
     for r, (_, __, original_filename, _) in zip(results, valid):
         if isinstance(r, Exception):
@@ -319,10 +324,8 @@ async def upload_photos(
             logger.warning("process task failed: %s", r)
             continue
         if r is not None:
-            thumb_url, preview_url, number, r2_stored_bytes = r
+            thumb_url, preview_url, r2_stored_bytes = r
             row: dict = {
-                "project_id": project_id,
-                "number": number,
                 "r2_thumb_url": thumb_url,
                 "r2_preview_url": preview_url,
                 "file_size": r2_stored_bytes,
@@ -334,13 +337,16 @@ async def upload_photos(
     if not rows:
         return {"uploaded": 0, "rejected": rejected_filenames}
 
-    rows.sort(key=lambda x: x["number"])
+    # number 할당 + INSERT를 한 트랜잭션(RPC) 안에서 원자 처리 — 동시 업로드 배치 간 번호 충돌 방지
     try:
-        supabase.table("photos").insert(rows).execute()
+        inserted = _insert_photos_with_numbers(supabase, project_id, rows)
     except Exception as e:
         logger.error(f"에러내용: {e}")
         logger.exception("photos insert failed: %s", e)
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e
+
+    if not inserted:
+        raise HTTPException(status_code=500, detail="사진 저장 실패")
 
     count_res = (
         supabase.table("photos")
@@ -351,7 +357,7 @@ async def upload_photos(
     photo_count = (
         count_res.count
         if getattr(count_res, "count", None) is not None
-        else base_number + len(rows)
+        else current_count + len(inserted)
     )
     try:
         supabase.table("projects").update({"photo_count": photo_count}).eq("id", project_id).execute()
@@ -360,7 +366,7 @@ async def upload_photos(
         logger.exception("projects photo_count update failed: %s", e)
         raise HTTPException(status_code=500, detail="프로젝트 업데이트 실패") from e
 
-    return {"uploaded": len(rows), "rejected": rejected_filenames}
+    return {"uploaded": len(inserted), "rejected": rejected_filenames}
 
 
 # ── 프로필 이미지 ────────────────────────────────────────────────────────────

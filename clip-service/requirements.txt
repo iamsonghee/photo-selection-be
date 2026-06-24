@@ -7,3 +7,4 @@ httpx
 pillow
 numpy<2
 open_clip_torch
+opencv-python-headless<4.12

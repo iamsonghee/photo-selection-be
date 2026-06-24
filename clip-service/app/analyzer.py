@@ -9,6 +9,7 @@ from app.config import CLIP_SIMILARITY_THRESHOLD, MAX_CONCURRENT_PROJECTS
 from app.db import get_supabase
 from app.downloader import download_all
 from app.grouping import group_by_similarity
+from app.quality import compute_quality_scores, pick_best_index
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,17 @@ async def run(project_id: str) -> None:
 
 
 async def _run_pipeline(supabase, project_id: str) -> None:
+    project_r = (
+        supabase.table("projects")
+        .select("clip_analysis_last_number, clip_analysis_threshold")
+        .eq("id", project_id)
+        .limit(1)
+        .execute()
+    )
+    project_row = (project_r.data or [{}])[0]
+    last_number = project_row.get("clip_analysis_last_number")
+    last_threshold = project_row.get("clip_analysis_threshold")
+
     photos_r = (
         supabase.table("photos")
         .select("id, number, r2_thumb_url")
@@ -69,7 +81,29 @@ async def _run_pipeline(supabase, project_id: str) -> None:
         logger.info("project_id=%s has fewer than 2 photos with thumbnails, skipping", project_id)
         return
 
-    urls = [r["r2_thumb_url"] for r in rows]
+    current_max_number = rows[-1]["number"]
+
+    # 증분 분석: 이전 분석 기준점(last_number)이 있고, 그 기준 사진이 삭제되지 않았고,
+    # threshold도 그대로일 때만 새로 추가된 사진만 본다. 하나라도 어긋나면 안전하게 전체 재분석.
+    threshold_changed = (
+        last_threshold is not None and abs(float(last_threshold) - CLIP_SIMILARITY_THRESHOLD) > 1e-9
+    )
+    boundary_exists = last_number is not None and any(r["number"] == last_number for r in rows)
+    can_incremental = last_number is not None and boundary_exists and not threshold_changed
+
+    if can_incremental:
+        target_rows = [r for r in rows if r["number"] > last_number]
+        if not target_rows:
+            logger.info(
+                "project_id=%s: no new photos since last analysis (number<=%s), skipping",
+                project_id, last_number,
+            )
+            _update_clip_progress(supabase, project_id, current_max_number)
+            return
+    else:
+        target_rows = rows
+
+    urls = [r["r2_thumb_url"] for r in target_rows]
     loop = asyncio.get_event_loop()
     images = await download_all(urls)
 
@@ -86,19 +120,25 @@ async def _run_pipeline(supabase, project_id: str) -> None:
     groups = group_by_similarity(full_embeddings, CLIP_SIMILARITY_THRESHOLD)
     if not groups:
         logger.info("project_id=%s: no similarity groups found", project_id)
+        _update_clip_progress(supabase, project_id, current_max_number)
         return
 
+    quality_scores = await loop.run_in_executor(None, compute_quality_scores, images)
+
     for member_indices in groups:
-        photo_ids = [rows[i]["id"] for i in member_indices]
+        photo_ids = [target_rows[i]["id"] for i in member_indices]
         vectors = [full_embeddings[i] for i in member_indices]
         avg_sim = _avg_pairwise_similarity(vectors)
+
+        member_scores = [quality_scores[i] for i in member_indices]
+        representative_photo_id = photo_ids[pick_best_index(member_scores)]
 
         group_r = (
             supabase.table("photo_groups")
             .insert(
                 {
                     "project_id": project_id,
-                    "representative_photo_id": photo_ids[0],
+                    "representative_photo_id": representative_photo_id,
                     "photo_count": len(photo_ids),
                     "avg_similarity": avg_sim,
                 }
@@ -113,6 +153,23 @@ async def _run_pipeline(supabase, project_id: str) -> None:
             .in_("id", photo_ids)
             .execute()
         )
+
+    _update_clip_progress(supabase, project_id, current_max_number)
+
+
+def _update_clip_progress(supabase, project_id: str, max_number: int) -> None:
+    """이번 분석이 다룬 범위를 기록 — 다음 실행이 어디서부터 증분으로 봐야 하는지 판단하는 기준점."""
+    (
+        supabase.table("projects")
+        .update(
+            {
+                "clip_analysis_last_number": max_number,
+                "clip_analysis_threshold": CLIP_SIMILARITY_THRESHOLD,
+            }
+        )
+        .eq("id", project_id)
+        .execute()
+    )
 
 
 def _avg_pairwise_similarity(vectors) -> float:
