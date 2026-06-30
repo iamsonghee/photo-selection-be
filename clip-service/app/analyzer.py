@@ -8,6 +8,7 @@ from app.clip_model import compute_embeddings
 from app.config import CLIP_SIMILARITY_THRESHOLD, MAX_CONCURRENT_PROJECTS
 from app.db import get_supabase
 from app.downloader import download_all
+from app.embeddings_store import persist_embeddings
 from app.grouping import group_by_similarity
 from app.quality import compute_quality_scores, pick_best_index
 
@@ -116,6 +117,10 @@ async def _run_pipeline(supabase, project_id: str) -> None:
     emb_iter = iter(embeddings)
     for img in images:
         full_embeddings.append(next(emb_iter) if img is not None else None)
+
+    # 그룹 결과와 무관하게(싱글톤 포함) 분석 대상이 된 모든 사진의 임베딩을 영속화 —
+    # 추후 보정본 CLIP 매칭(matcher.py)이 재계산 없이 재사용할 수 있도록.
+    persist_embeddings(supabase, list(zip([r["id"] for r in target_rows], full_embeddings)))
 
     groups = group_by_similarity(full_embeddings, CLIP_SIMILARITY_THRESHOLD)
     if not groups:

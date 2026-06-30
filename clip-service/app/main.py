@@ -3,10 +3,10 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app import analyzer, state
+from app import analyzer, matcher, state
 from app.auth import verify_internal_token
 from app.clip_model import warm_up
 from app.db import get_supabase
@@ -29,6 +29,17 @@ app = FastAPI(title="photo-selection clip-service", lifespan=lifespan)
 
 class AnalyzeRequest(BaseModel):
     project_id: str
+
+
+class MatchRetouchResult(BaseModel):
+    photo_id: str
+    filename: str
+    similarity: float
+    type: str  # "clip" | "clip_low"
+
+
+class MatchRetouchResponse(BaseModel):
+    matches: list[MatchRetouchResult]
 
 
 @app.get("/health")
@@ -73,6 +84,22 @@ def analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(analyzer.run, project_id)
     return {"status": "processing"}
+
+
+@app.post("/match-retouch", dependencies=[Depends(verify_internal_token)])
+async def match_retouch(
+    project_id: str = Form(...),
+    photo_ids: str = Form(...),
+    files: list[UploadFile] = File(...),
+) -> MatchRetouchResponse:
+    pid_list = [p.strip() for p in photo_ids.split(",") if p.strip()]
+    if not pid_list or not files:
+        return MatchRetouchResponse(matches=[])
+
+    retouch_files = [(f.filename or f"file_{i}", await f.read()) for i, f in enumerate(files)]
+    supabase = get_supabase()
+    matches = await matcher.match_retouch(supabase, project_id, pid_list, retouch_files)
+    return MatchRetouchResponse(matches=[MatchRetouchResult(**m) for m in matches])
 
 
 @app.get("/analyze/{project_id}/status", dependencies=[Depends(verify_internal_token)])

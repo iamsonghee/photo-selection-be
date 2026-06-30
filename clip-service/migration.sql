@@ -26,3 +26,7 @@ ALTER TABLE projects
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS clip_analysis_started_at TIMESTAMPTZ;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS clip_analysis_completed_at TIMESTAMPTZ;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS clip_analysis_error TEXT;
+
+-- 보정본 CLIP 매칭을 위한 원본 임베딩 영속화 (pgvector 미설치 환경이므로 double precision[] 사용).
+-- 유사도 검색용 인덱스 불필요 — project_id+id IN (...) 소규모 후보군 조회만 사용.
+ALTER TABLE photos ADD COLUMN IF NOT EXISTS clip_embedding DOUBLE PRECISION[];
