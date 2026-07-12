@@ -615,22 +615,27 @@ async def upload_versions(
         raise HTTPException(status_code=404, detail="Project not found")
 
     # 베타 제한: 보정본 횟수 체크
-    photos_r = (
-        supabase.table("photos")
-        .select("id")
-        .eq("project_id", project_id)
-        .execute()
-    )
-    photo_ids_list = [p["id"] for p in photos_r.data or []]
-    existing_versions: set[int] = set()
-    if photo_ids_list:
-        pv_r = (
-            supabase.table("photo_versions")
-            .select("version")
-            .in_("photo_id", photo_ids_list)
+    try:
+        photos_r = (
+            supabase.table("photos")
+            .select("id")
+            .eq("project_id", project_id)
+            .limit(1000)
             .execute()
         )
-        existing_versions = {v["version"] for v in pv_r.data or []}
+        photo_ids_list = [p["id"] for p in photos_r.data or []]
+        existing_versions: set[int] = set()
+        if photo_ids_list:
+            pv_r = (
+                supabase.table("photo_versions")
+                .select("version")
+                .in_("photo_id", photo_ids_list[:200])
+                .execute()
+            )
+            existing_versions = {v["version"] for v in pv_r.data or []}
+    except Exception as e:
+        logger.error(f"에러내용: version beta check failed: {e}")
+        raise HTTPException(status_code=500, detail=f"보정본 횟수 확인 실패: {e}") from e
     if version not in existing_versions and len(existing_versions) >= BETA_MAX_REVISION_COUNT:
         raise HTTPException(
             status_code=403,
