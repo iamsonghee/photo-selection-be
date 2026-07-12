@@ -78,18 +78,29 @@ def get_r2_client():
     return _r2_client
 
 
-def upload_to_r2(key: str, body: bytes, content_type: str) -> Optional[str]:
+def upload_to_r2(
+    key: str, body: bytes, content_type: str, cache_control: Optional[str] = None
+) -> Optional[str]:
     """
     R2 버킷에 업로드. 성공 시 공개 URL 반환 (R2_PUBLIC_URL 설정 시).
+
+    cache_control: 지정하면 객체 응답에 Cache-Control 헤더로 저장된다. 같은 key가
+    나중에 다른 내용으로 덮어써질 수 있는 경로(보정본 재업로드 등)에는 절대 넘기지
+    말 것 — 원본 사진 썸네일/프리뷰처럼 매 업로드마다 새 랜덤 key를 쓰는(즉 같은
+    key가 재사용되지 않는) 경로에서만 안전하다.
     """
     if not R2_BUCKET_NAME:
         raise ValueError("R2_BUCKET_NAME must be set in .env")
     client = get_r2_client()
+    extra: dict = {}
+    if cache_control:
+        extra["CacheControl"] = cache_control
     client.put_object(
         Bucket=R2_BUCKET_NAME,
         Key=key,
         Body=body,
         ContentType=content_type,
+        **extra,
     )
     if R2_PUBLIC_URL:
         base = R2_PUBLIC_URL.rstrip("/")

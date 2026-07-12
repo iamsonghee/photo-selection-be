@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
 
+# 원본 사진 썸네일/프리뷰는 업로드마다 새 랜덤 UUID를 key로 써서 같은 key가 절대
+# 재사용되지 않는다 — 그래서만 안전하게 영구 캐싱 가능 (photo_versions 등 같은 key가
+# 재업로드로 덮어써질 수 있는 경로에는 절대 쓰지 말 것).
+IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
 # 원본 썸네일 (갤러리) — OPT-01: 300px로 축소 (갤러리 카드 크기 기준 충분)
 THUMB_MAX_SIZE = 300
 THUMB_JPEG_QUALITY = 75
@@ -125,9 +130,9 @@ def _infer_content_type(filename: str) -> Optional[str]:
     return None  # 알 수 없는 확장자 → 명시적 거부
 
 
-def _upload_to_r2_sync(key: str, body: bytes, content_type: str):
+def _upload_to_r2_sync(key: str, body: bytes, content_type: str, cache_control: Optional[str] = None):
     """동기 R2 업로드 (executor에서 호출)."""
-    return upload_to_r2(key, body, content_type)
+    return upload_to_r2(key, body, content_type, cache_control=cache_control)
 
 
 # ── 원본 사진: 썸네일 + 미리보기 ────────────────────────────────────────────
@@ -236,8 +241,12 @@ async def _process_one(
 
     try:
         thumb_url, preview_url = await asyncio.gather(
-            loop.run_in_executor(_executor, _upload_to_r2_sync, thumb_key, thumb_bytes, "image/jpeg"),
-            loop.run_in_executor(_executor, _upload_to_r2_sync, preview_key, preview_bytes, "image/jpeg"),
+            loop.run_in_executor(
+                _executor, _upload_to_r2_sync, thumb_key, thumb_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL
+            ),
+            loop.run_in_executor(
+                _executor, _upload_to_r2_sync, preview_key, preview_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL
+            ),
         )
     except Exception as e:
         logger.error(f"에러내용: {e}")
