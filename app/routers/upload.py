@@ -148,8 +148,8 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
         probe.close()
         del probe
         rss1 = _rss_mb()
-        logger.info("[mem] start rss=%.1fMB | file=%.0fKB size=%dx%d", rss0, file_kb, w, h)
-        logger.info("[mem] after_probe rss=%.1fMB Δ%.1fMB", rss1, rss1 - rss0)
+        print(f"[mem] start rss={rss0:.1f}MB | file={file_kb:.0f}KB size={w}x{h}", flush=True)
+        print(f"[mem] after_probe rss={rss1:.1f}MB Δ{rss1 - rss0:.1f}MB", flush=True)
 
         if w > 4000 or h > 4000:
             buf.seek(0)
@@ -165,21 +165,21 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
     except Exception:
         w, h = 0, 0
         rss1 = rss0
-        logger.info("[mem] start rss=%.1fMB | file=%.0fKB size=unknown", rss0, file_kb)
+        print(f"[mem] start rss={rss0:.1f}MB | file={file_kb:.0f}KB size=unknown", flush=True)
         buf.seek(0)
         img = Image.open(buf)
 
     rss2 = _rss_mb()
-    logger.info("[mem] after_Image_open rss=%.1fMB Δ%.1fMB mode=%s", rss2, rss2 - rss0, img.mode)
+    print(f"[mem] after_Image_open rss={rss2:.1f}MB Δ{rss2 - rss0:.1f}MB mode={img.mode}", flush=True)
 
     img = _apply_exif_orientation(img)
     rss3 = _rss_mb()
-    logger.info("[mem] after_exif_transpose rss=%.1fMB Δ%.1fMB", rss3, rss3 - rss0)
+    print(f"[mem] after_exif_transpose rss={rss3:.1f}MB Δ{rss3 - rss0:.1f}MB", flush=True)
 
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     rss4 = _rss_mb()
-    logger.info("[mem] after_convert_RGB rss=%.1fMB Δ%.1fMB size=%dx%d", rss4, rss4 - rss0, *img.size)
+    print(f"[mem] after_convert_RGB rss={rss4:.1f}MB Δ{rss4 - rss0:.1f}MB size={img.size[0]}x{img.size[1]}", flush=True)
 
     # 썸네일 (갤러리용)
     thumb = img.copy()
@@ -189,7 +189,7 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
     thumb.close()
     del thumb
     rss5 = _rss_mb()
-    logger.info("[mem] after_thumb rss=%.1fMB Δ%.1fMB", rss5, rss5 - rss0)
+    print(f"[mem] after_thumb rss={rss5:.1f}MB Δ{rss5 - rss0:.1f}MB", flush=True)
 
     # 미리보기 (뷰어용)
     preview = img.copy()
@@ -203,7 +203,7 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
     del img
     del buf
     rss6 = _rss_mb()
-    logger.info("[mem] after_preview+del rss=%.1fMB Δ%.1fMB", rss6, rss6 - rss0)
+    print(f"[mem] after_preview+del rss={rss6:.1f}MB Δ{rss6 - rss0:.1f}MB", flush=True)
 
     return thumb_buf.getvalue(), preview_buf.getvalue()
 
@@ -252,8 +252,7 @@ async def _process_one(
     del thumb_bytes, preview_bytes
     gc.collect()
     rss_gc = _rss_mb()
-    logger.info("[mem] after_r2_upload rss=%.1fMB | after_gc rss=%.1fMB Δ%.1fMB",
-                rss_r2, rss_gc, rss_gc - rss_r2)
+    print(f"[mem] after_r2_upload rss={rss_r2:.1f}MB | after_gc rss={rss_gc:.1f}MB Δ{rss_gc - rss_r2:.1f}MB", flush=True)
     return (thumb_url, preview_url, r2_stored_bytes)
 
 
