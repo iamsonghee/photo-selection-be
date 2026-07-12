@@ -1,4 +1,5 @@
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -20,16 +21,27 @@ SUPABASE_KEY = (
 # 요청이 무한 대기하지 않도록 타임아웃 설정 (초)
 POSTGREST_TIMEOUT = 15
 
+_supabase_singleton: Optional[Client] = None
+_supabase_lock = threading.Lock()
+
 
 def get_supabase() -> Client:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise ValueError(
-            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY/PUBLISHABLE_KEY) must be set in .env"
-        )
-    options = ClientOptions(postgrest_client_timeout=POSTGREST_TIMEOUT)
-    return create_client(SUPABASE_URL, SUPABASE_KEY, options)
+    """프로세스 내 Supabase client singleton — 매 요청마다 새 client를 생성하지 않는다."""
+    global _supabase_singleton
+    if _supabase_singleton is None:
+        with _supabase_lock:
+            if _supabase_singleton is None:
+                if not SUPABASE_URL or not SUPABASE_KEY:
+                    raise ValueError(
+                        "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY "
+                        "(or SUPABASE_SECRET_KEY/PUBLISHABLE_KEY) must be set in .env"
+                    )
+                options = ClientOptions(postgrest_client_timeout=POSTGREST_TIMEOUT)
+                _supabase_singleton = create_client(SUPABASE_URL, SUPABASE_KEY, options)
+    return _supabase_singleton
 
 
+# 하위 호환 — 외부에서 직접 참조하는 코드가 있을 경우를 위해 유지
 supabase: Optional[Client] = None
 
 

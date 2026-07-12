@@ -4,6 +4,7 @@ GCS + Cloudflare R2 (S3 호환) 스토리지 클라이언트.
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse as _urlparse
 from typing import Optional
@@ -47,24 +48,34 @@ def get_gcs_bucket():
     return client.bucket(GCS_BUCKET_NAME)
 
 
-def get_r2_client():
-    """Cloudflare R2용 boto3 S3 호환 클라이언트 반환."""
-    if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
-        raise ValueError(
-            "R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY must be set in .env"
-        )
-    import boto3
-    from botocore.config import Config
+_r2_client = None
+_r2_client_lock = threading.Lock()
 
-    endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(signature_version="s3v4"),
-        region_name="auto",
-    )
+
+def get_r2_client():
+    """Cloudflare R2용 boto3 S3 호환 클라이언트 — 프로세스 내 singleton.
+    boto3 S3 client는 thread-safe(concurrent put_object / generate_presigned_url 가능)."""
+    global _r2_client
+    if _r2_client is None:
+        with _r2_client_lock:
+            if _r2_client is None:
+                if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
+                    raise ValueError(
+                        "R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY must be set in .env"
+                    )
+                import boto3
+                from botocore.config import Config
+
+                endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+                _r2_client = boto3.client(
+                    "s3",
+                    endpoint_url=endpoint,
+                    aws_access_key_id=R2_ACCESS_KEY_ID,
+                    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                    config=Config(signature_version="s3v4"),
+                    region_name="auto",
+                )
+    return _r2_client
 
 
 def upload_to_r2(key: str, body: bytes, content_type: str) -> Optional[str]:

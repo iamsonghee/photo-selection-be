@@ -1,5 +1,6 @@
 """사진 업로드 라우터."""
 import asyncio
+import gc
 import io
 import logging
 import os
@@ -8,6 +9,15 @@ import uuid as uuid_module
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
 from uuid import UUID
+
+try:
+    import psutil as _psutil
+    _proc = _psutil.Process()
+    def _rss_mb() -> float:
+        return _proc.memory_info().rss / 1024 / 1024
+except ImportError:
+    def _rss_mb() -> float:
+        return -1.0
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from PIL import Image, ImageOps
@@ -126,6 +136,9 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
     """동기: 썸네일(300px/75%) + 미리보기(1200px/82%) 동시 생성.
     OPT-01: 대형 JPEG(>4000px)는 Draft 모드로 1/8 축소 후 LANCZOS 리샘플링 → 처리 속도 ~40% 향상.
     """
+    rss0 = _rss_mb()
+    file_kb = len(image_bytes) / 1024
+
     buf = io.BytesIO(image_bytes)
 
     # OPT-01: 대형 이미지 pre-shrink — JPEG Draft 모드로 디코딩 크기 줄이기
@@ -133,10 +146,14 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
         probe = Image.open(io.BytesIO(image_bytes))
         w, h = probe.size
         probe.close()
+        del probe
+        rss1 = _rss_mb()
+        logger.info("[mem] start rss=%.1fMB | file=%.0fKB size=%dx%d", rss0, file_kb, w, h)
+        logger.info("[mem] after_probe rss=%.1fMB Δ%.1fMB", rss1, rss1 - rss0)
+
         if w > 4000 or h > 4000:
             buf.seek(0)
             img = Image.open(buf)
-            # Draft는 JPEG 전용; 실패해도 무시하고 일반 로드
             try:
                 img.draft("RGB", (max(PREVIEW_MAX_SIZE, THUMB_MAX_SIZE * 2),
                                    max(PREVIEW_MAX_SIZE, THUMB_MAX_SIZE * 2)))
@@ -146,24 +163,47 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
             buf.seek(0)
             img = Image.open(buf)
     except Exception:
+        w, h = 0, 0
+        rss1 = rss0
+        logger.info("[mem] start rss=%.1fMB | file=%.0fKB size=unknown", rss0, file_kb)
         buf.seek(0)
         img = Image.open(buf)
 
+    rss2 = _rss_mb()
+    logger.info("[mem] after_Image_open rss=%.1fMB Δ%.1fMB mode=%s", rss2, rss2 - rss0, img.mode)
+
     img = _apply_exif_orientation(img)
+    rss3 = _rss_mb()
+    logger.info("[mem] after_exif_transpose rss=%.1fMB Δ%.1fMB", rss3, rss3 - rss0)
+
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
+    rss4 = _rss_mb()
+    logger.info("[mem] after_convert_RGB rss=%.1fMB Δ%.1fMB size=%dx%d", rss4, rss4 - rss0, *img.size)
 
     # 썸네일 (갤러리용)
     thumb = img.copy()
     thumb.thumbnail((THUMB_MAX_SIZE, THUMB_MAX_SIZE), Image.Resampling.LANCZOS)
     thumb_buf = io.BytesIO()
     thumb.save(thumb_buf, format="JPEG", quality=THUMB_JPEG_QUALITY)
+    thumb.close()
+    del thumb
+    rss5 = _rss_mb()
+    logger.info("[mem] after_thumb rss=%.1fMB Δ%.1fMB", rss5, rss5 - rss0)
 
     # 미리보기 (뷰어용)
     preview = img.copy()
     preview.thumbnail((PREVIEW_MAX_SIZE, PREVIEW_MAX_SIZE), Image.Resampling.LANCZOS)
     preview_buf = io.BytesIO()
     preview.save(preview_buf, format="JPEG", quality=PREVIEW_JPEG_QUALITY)
+    preview.close()
+    del preview
+
+    img.close()
+    del img
+    del buf
+    rss6 = _rss_mb()
+    logger.info("[mem] after_preview+del rss=%.1fMB Δ%.1fMB", rss6, rss6 - rss0)
 
     return thumb_buf.getvalue(), preview_buf.getvalue()
 
@@ -208,6 +248,12 @@ async def _process_one(
         return None
 
     r2_stored_bytes = len(thumb_bytes) + len(preview_bytes)
+    rss_r2 = _rss_mb()
+    del thumb_bytes, preview_bytes
+    gc.collect()
+    rss_gc = _rss_mb()
+    logger.info("[mem] after_r2_upload rss=%.1fMB | after_gc rss=%.1fMB Δ%.1fMB",
+                rss_r2, rss_gc, rss_gc - rss_r2)
     return (thumb_url, preview_url, r2_stored_bytes)
 
 

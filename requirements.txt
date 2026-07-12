@@ -7,6 +7,6 @@ python-dotenv
 pillow
 pillow-heif
 httpx
-google-cloud-storage
 boto3
 pyjwt[crypto]
+psutil
