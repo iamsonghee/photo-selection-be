@@ -379,6 +379,16 @@ async def upload_photos(
                 row["original_filename"] = original_filename
             rows.append(row)
 
+    # 파일 바이트 + 처리 결과 해제 후 OS에 힙 반환 (Python은 freed 메모리를 OS에 자동 반환 안 함)
+    del valid
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    print(f"[mem] after_batch_trim rss={_rss_mb():.1f}MB", flush=True)
+
     if not rows:
         return {"uploaded": 0, "rejected": rejected_filenames}
 
