@@ -9,3 +9,6 @@ pillow
 numpy<2
 open_clip_torch
 opencv-python-headless<4.12
+# 0.10.14로 고정: 그 이후 릴리스에서 레거시 mp.solutions.face_mesh API(모델이 wheel에
+# 내장되어 있어 런타임 다운로드/수동 모델 파일 vendoring이 불필요)가 제거됨.
+mediapipe==0.10.14

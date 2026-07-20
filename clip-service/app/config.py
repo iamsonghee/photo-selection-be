@@ -48,4 +48,9 @@ DOWNLOAD_CONCURRENCY = _env_int("DOWNLOAD_CONCURRENCY", 12, 1, 32)
 EMBEDDING_BATCH_SIZE = _env_int("EMBEDDING_BATCH_SIZE", 16, 1, 64)
 MAX_CONCURRENT_PROJECTS = _env_int("MAX_CONCURRENT_PROJECTS", 1, 1, 4)
 
+# 흔들림/눈감음 경고 배지 임계값. 둘 다 300px 썸네일(r2_thumb_url) 기준으로 계산되므로
+# 원본 해상도 튜토리얼의 통상값과 다를 수 있다 — placeholder이며 실사용 데이터로 재보정 필요.
+BLUR_VARIANCE_THRESHOLD = _env_float("BLUR_VARIANCE_THRESHOLD", 80.0, 0.0, 10000.0)
+EYE_AR_THRESHOLD = _env_float("EYE_AR_THRESHOLD", 0.21, 0.05, 0.5)
+
 POSTGREST_TIMEOUT = 15

@@ -1,7 +1,8 @@
-"""OpenCV 기반 이미지 품질 점수(블러 + 노출) 계산. 그룹 내 대표컷 자동 선정에 사용."""
+"""OpenCV 기반 이미지 품질 점수(블러 + 노출) 계산. 그룹 내 대표컷 자동 선정 및
+흔들림 경고 배지(절대 임계값 판정) 양쪽에 사용."""
 import io
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -10,14 +11,20 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+def _decode_gray(image_bytes: bytes) -> Optional[np.ndarray]:
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")
+        return np.asarray(img)
+    except Exception as e:
+        logger.warning("quality score: image decode failed: %s", e)
+        return None
+
+
 def _score_one(image_bytes: bytes) -> Optional[float]:
     """블러(라플라시안 분산)와 노출(중간 밝기 근접도)을 결합한 점수. 높을수록 좋음.
     디코딩 실패 시 None."""
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("L")
-        gray = np.asarray(img)
-    except Exception as e:
-        logger.warning("quality score: image decode failed: %s", e)
+    gray = _decode_gray(image_bytes)
+    if gray is None:
         return None
 
     blur_var = cv2.Laplacian(gray, cv2.CV_64F).var()
@@ -46,3 +53,24 @@ def pick_best_index(scores: List[Optional[float]]) -> int:
             best_score = s
             best_idx = i
     return best_idx
+
+
+def compute_blur_flags(
+    images: List[Optional[bytes]], threshold: float
+) -> List[Tuple[Optional[float], Optional[bool]]]:
+    """이미지 바이트 리스트 -> (blur_variance, is_blurry) 튜플 리스트 (순서 보존).
+    raw 라플라시안 분산(로그 압축 없음)을 절대 임계값과 비교 — _score_one의 상대/로그압축
+    점수는 그룹 내 랭킹 전용이라 절대 "흔들렸다" 판정에는 부적합하므로 별도 계산한다.
+    None(다운로드/디코딩 실패)은 (None, None)으로 반환된다."""
+    result: List[Tuple[Optional[float], Optional[bool]]] = []
+    for img in images:
+        if img is None:
+            result.append((None, None))
+            continue
+        gray = _decode_gray(img)
+        if gray is None:
+            result.append((None, None))
+            continue
+        variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        result.append((variance, variance < threshold))
+    return result
