@@ -46,12 +46,11 @@ THUMB_JPEG_QUALITY = 75
 PREVIEW_MAX_SIZE = 1200
 PREVIEW_JPEG_QUALITY = 82
 
-# 보정본
-VERSION_MAX_SIZE = 1500
-VERSION_JPEG_QUALITY = 85
-VERSION_MAX_BYTES = 2_000_000  # 2MB
-VERSION_THUMB_MAX_SIZE = 400
-VERSION_THUMB_JPEG_QUALITY = 78
+# 보정본 (원본과 동일한 사이즈·품질 기준)
+VERSION_MAX_SIZE = 1200
+VERSION_JPEG_QUALITY = 82
+VERSION_THUMB_MAX_SIZE = 300
+VERSION_THUMB_JPEG_QUALITY = 75
 
 # 프로필
 PROFILE_MAX_SIZE = 400
@@ -505,17 +504,11 @@ def _resize_version_and_thumb_sync(image_bytes: bytes) -> tuple[bytes, bytes]:
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
-    # full (1500px, 최대 2MB)
+    # full (1200px, 고정 품질 82%)
     full = img.copy()
     full.thumbnail((VERSION_MAX_SIZE, VERSION_MAX_SIZE), Image.Resampling.LANCZOS)
-    quality = VERSION_JPEG_QUALITY
     full_buf = io.BytesIO()
-    while quality >= 60:
-        full_buf = io.BytesIO()
-        full.save(full_buf, format="JPEG", quality=quality)
-        if full_buf.tell() <= VERSION_MAX_BYTES:
-            break
-        quality -= 5
+    full.save(full_buf, format="JPEG", quality=VERSION_JPEG_QUALITY)
 
     # thumb (400px, 그리드 표시용)
     thumb = img.copy()
