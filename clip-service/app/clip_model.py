@@ -9,6 +9,7 @@ import torch
 from PIL import Image
 
 from app.config import CLIP_MODEL_NAME, CLIP_MODEL_PRETRAINED, EMBEDDING_BATCH_SIZE
+from app.memlog import log_rss
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +36,7 @@ def _ensure_loaded():
         _model = model
         _preprocess = preprocess
         logger.info("CLIP model loaded.")
-
-
-def warm_up() -> None:
-    """서버 시작 시 모델을 미리 로드해 첫 분석 요청의 지연을 없앤다."""
-    _ensure_loaded()
+        log_rss("clip_loaded")
 
 
 def compute_embeddings(images: List[bytes]) -> List[np.ndarray]:

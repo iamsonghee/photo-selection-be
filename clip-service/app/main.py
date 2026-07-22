@@ -1,6 +1,10 @@
-"""유사컷(burst shot) CLIP 분석 서비스. 기존 photo-selection-be의 app/ 패키지와 완전히 독립적으로 동작한다."""
+"""유사컷(burst shot) CLIP 분석 서비스. 기존 photo-selection-be의 app/ 패키지와 완전히 독립적으로 동작한다.
+
+CLIP 모델은 서버 시작 시 미리 로드하지 않고, 분석 요청이 들어와 compute_embeddings()가
+처음 호출될 때 lazy하게 로드된다(clip_model._ensure_loaded). Railway Sleep으로 유휴 시
+컨테이너가 내려가는 걸 전제로, 깨어난 직후 아무 요청도 없으면 모델도 메모리에 올라가지
+않도록 하기 위함이다."""
 import logging
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
@@ -8,23 +12,14 @@ from pydantic import BaseModel
 
 from app import analyzer, matcher, state
 from app.auth import verify_internal_token
-from app.clip_model import warm_up
 from app.db import get_supabase
+from app.memlog import log_rss
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+log_rss("boot")
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    try:
-        warm_up()
-    except Exception as e:
-        logger.warning("CLIP model warm-up failed (will retry lazily on first request): %s", e)
-    yield
-
-
-app = FastAPI(title="photo-selection clip-service", lifespan=lifespan)
+app = FastAPI(title="photo-selection clip-service")
 
 
 class AnalyzeRequest(BaseModel):

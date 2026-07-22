@@ -18,6 +18,7 @@ from app.downloader import download_all
 from app.embeddings_store import persist_embeddings
 from app.eyes import compute_eye_flags
 from app.grouping import group_by_similarity
+from app.memlog import log_rss
 from app.quality import compute_blur_flags, compute_quality_scores, pick_best_index
 from app.quality_store import persist_quality_flags
 
@@ -64,6 +65,7 @@ async def run(project_id: str) -> None:
             )
         finally:
             state.finish(project_id)
+            log_rss(f"analyze_done:{project_id}")
 
 
 async def _run_pipeline(supabase, project_id: str) -> None:
