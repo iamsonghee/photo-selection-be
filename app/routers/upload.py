@@ -760,3 +760,256 @@ async def upload_versions(
         logger.error(f"에러내용: version_reviews 삭제 실패 {e}")
 
     return {"uploaded": len(results), "items": results}
+
+
+# ── 납품 파일 업로드 ─────────────────────────────────────────────────────────
+
+DELIVERY_MAX_BYTES = 20 * 1024 * 1024  # 20MB
+DELIVERY_UPLOAD_CONCURRENCY = _env_int("DELIVERY_UPLOAD_CONCURRENCY", 2, 1, 8)
+
+
+def _make_delivery_key_sync(project_id: str, filename: str) -> tuple[str, str]:
+    """납품 파일 R2 key + safe delivery filename 생성 (출력은 항상 .jpg)."""
+    base = filename or f"{uuid_module.uuid4()}.jpg"
+    safe = re.sub(r"[^\w\-.]", "_", base)
+    dot = safe.rfind(".")
+    safe = (safe[:dot] if dot > 0 else safe) + ".jpg"
+    file_id = str(uuid_module.uuid4())
+    key = f"originals/{project_id}/{file_id}_{safe}"
+    return key, safe
+
+
+def _process_delivery_file_sync(
+    image_bytes: bytes,
+    content_type: str,
+) -> tuple[bytes, bool]:
+    """납품 파일 JPEG 변환 + 필요 시 2단계 압축.
+    반환: (output_bytes, was_compressed)
+    was_compressed=True: 품질 하향 또는 해상도 축소 발생
+    ValueError: 3200px/85%에서도 20MB 초과 → 거부
+    """
+    is_jpeg = content_type == "image/jpeg"
+
+    # JPEG이고 20MB 이하 → 원본 바이트 그대로
+    if is_jpeg and len(image_bytes) <= DELIVERY_MAX_BYTES:
+        return image_bytes, False
+
+    img = Image.open(io.BytesIO(image_bytes))
+    img = _apply_exif_orientation(img)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    # 비JPEG → 고품질(95%) JPEG 변환 시도 (포맷 변환만, 품질 손실 없음)
+    if not is_jpeg:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=95)
+        data = buf.getvalue()
+        if len(data) <= DELIVERY_MAX_BYTES:
+            img.close()
+            return data, False
+
+    # 1단계: 해상도 유지, 품질 점진 하향
+    for quality in (90, 85, 80, 75):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        data = buf.getvalue()
+        if len(data) <= DELIVERY_MAX_BYTES:
+            img.close()
+            return data, True
+
+    # 2단계: 품질 85% 고정, 최장변 점진 축소
+    for max_edge in (6000, 5000, 4000, 3200):
+        resized = img.copy()
+        resized.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        resized.save(buf, format="JPEG", quality=85)
+        data = buf.getvalue()
+        resized.close()
+        if len(data) <= DELIVERY_MAX_BYTES:
+            img.close()
+            return data, True
+
+    img.close()
+    raise ValueError("파일이 20MB 상한을 초과하여 자동 압축 후에도 저장할 수 없습니다.")
+
+
+async def _process_one_delivery(
+    loop: asyncio.AbstractEventLoop,
+    project_id: str,
+    filename: str,
+    contents: bytes,
+    content_type: str,
+) -> dict:
+    """납품 파일 1건: JPEG 변환 + 압축 → R2 업로드.
+    성공 시 dict 반환, 거부 시 ValueError raise."""
+    original_size = len(contents)
+
+    try:
+        output_bytes, was_compressed = await loop.run_in_executor(
+            _executor,
+            _process_delivery_file_sync,
+            contents,
+            content_type,
+        )
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.warning("delivery file process failed: %s %s", filename, e)
+        raise ValueError(f"이미지 처리 실패: {filename}") from e
+
+    try:
+        key, safe_filename = await loop.run_in_executor(
+            _executor,
+            _make_delivery_key_sync,
+            project_id,
+            filename,
+        )
+    except Exception as e:
+        logger.warning("delivery key generation failed: %s %s", filename, e)
+        raise ValueError(f"파일명 처리 실패: {filename}") from e
+
+    try:
+        r2_url = await loop.run_in_executor(
+            _executor,
+            _upload_to_r2_sync,
+            key,
+            output_bytes,
+            "image/jpeg",
+        )
+    except Exception as e:
+        logger.warning("delivery R2 upload failed: %s %s", filename, e)
+        raise ValueError(f"업로드 실패: {filename}") from e
+
+    if not r2_url:
+        raise ValueError(f"R2 URL 미설정: {filename}")
+
+    return {
+        "r2_url": r2_url,
+        "original_filename": filename,
+        "delivery_filename": safe_filename,
+        "file_size": len(output_bytes),
+        "compressed": was_compressed,
+        "original_file_size": original_size if was_compressed else None,
+        "mime_type": "image/jpeg",
+    }
+
+
+@router.post("/originals")
+async def upload_originals(
+    project_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+    photographer_id: UUID = Depends(get_current_photographer),
+):
+    """
+    납품 파일 일괄 업로드 (project.status = 'delivered' 전용).
+    JPEG/PNG/HEIC/WebP 지원, RAW 거부.
+    20MB 초과 시 서버 측 2단계 자동 압축, 3200px/85%에서도 초과하면 거부.
+    R2 경로: originals/{project_id}/{uuid}_{safe_filename}
+    반환: { uploaded, compressed, rejected: [{filename, reason}] }
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file required")
+
+    try:
+        supabase = get_supabase()
+    except Exception as e:
+        logger.exception("get_supabase failed")
+        raise HTTPException(status_code=503, detail="DB 연결 실패") from e
+
+    # 프로젝트 소유 + delivered 상태 확인
+    project_r = (
+        supabase.table("projects")
+        .select("id, status")
+        .eq("id", project_id)
+        .eq("photographer_id", str(photographer_id))
+        .limit(1)
+        .execute()
+    )
+    if not project_r.data or len(project_r.data) == 0:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project_r.data[0].get("status") != "delivered":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "invalid_project_status",
+                "message": "납품 파일은 고객이 보정본을 최종 승인한 프로젝트에만 업로드할 수 있습니다.",
+            },
+        )
+
+    # 포맷 검증 및 파일 읽기
+    valid: list[tuple[bytes, str, str]] = []  # (contents, content_type, filename)
+    rejected: list[dict] = []
+
+    for f in files:
+        ct = (f.content_type or "").lower()
+        if not ct or ct not in ALLOWED_CONTENT_TYPES:
+            ct = _infer_content_type(f.filename or "") or ""
+        if ct not in ALLOWED_CONTENT_TYPES:
+            rejected.append({
+                "filename": f.filename or "(unknown)",
+                "reason": "지원하지 않는 파일 형식입니다. JPEG, PNG, WebP, HEIC만 가능합니다.",
+            })
+            logger.warning("delivery: rejected unsupported file: %r", f.filename)
+            continue
+        contents = await f.read()
+        if not contents:
+            rejected.append({"filename": f.filename or "(unknown)", "reason": "빈 파일입니다."})
+            continue
+        valid.append((contents, ct, f.filename or ""))
+
+    if not valid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "no_valid_files",
+                "message": "지원하지 않는 파일 형식입니다. JPEG, PNG, WebP, HEIC만 가능합니다.",
+                "rejected": rejected,
+            },
+        )
+
+    loop = asyncio.get_event_loop()
+    sem = asyncio.Semaphore(DELIVERY_UPLOAD_CONCURRENCY)
+
+    async def _limited_delivery(contents: bytes, content_type: str, filename: str):
+        async with sem:
+            return await _process_one_delivery(loop, project_id, filename, contents, content_type)
+
+    gathered = await asyncio.gather(
+        *[_limited_delivery(c, ct, fn) for c, ct, fn in valid],
+        return_exceptions=True,
+    )
+
+    rows: list[dict] = []
+    compressed_count = 0
+    for result, (_, __, filename) in zip(gathered, valid):
+        if isinstance(result, ValueError):
+            rejected.append({"filename": filename, "reason": str(result)})
+        elif isinstance(result, Exception):
+            logger.error("delivery upload task failed: %s", result)
+            rejected.append({"filename": filename, "reason": "업로드 중 오류가 발생했습니다."})
+        elif result is not None:
+            rows.append({
+                "project_id": project_id,
+                "r2_url": result["r2_url"],
+                "original_filename": result["original_filename"],
+                "delivery_filename": result["delivery_filename"],
+                "file_size": result["file_size"],
+                "compressed": result["compressed"],
+                "original_file_size": result["original_file_size"],
+                "mime_type": result["mime_type"],
+            })
+            if result["compressed"]:
+                compressed_count += 1
+
+    if rows:
+        try:
+            supabase.table("delivery_files").insert(rows).execute()
+        except Exception as e:
+            logger.exception("delivery_files insert failed: %s", e)
+            raise HTTPException(status_code=500, detail="납품 파일 저장 실패") from e
+
+    return {
+        "uploaded": len(rows),
+        "compressed": compressed_count,
+        "rejected": rejected,
+    }

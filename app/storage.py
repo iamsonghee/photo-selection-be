@@ -148,6 +148,7 @@ _ALLOWED_KEY_PATTERNS = [
     re.compile(rf"^photos/{_UUID}/{_UUID}/{_HEX32}_(thumb|preview)\.jpg$"),
     re.compile(rf"^versions/{_UUID}/v\d+/{_UUID}_{_SAFE}$"),
     re.compile(rf"^versions/{_UUID}/v\d+/{_UUID}_thumb\.jpg$"),
+    re.compile(rf"^originals/{_UUID}/{_UUID}_{_SAFE}$"),
 ]
 
 PRESIGN_EXPIRES_SECONDS = 3600
