@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import re
+import time
 import uuid as uuid_module
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -119,14 +120,24 @@ def _apply_exif_orientation(img: Image.Image) -> Image.Image:
 
 def _count_photos(supabase, project_id: str) -> int:
     """베타 업로드 장수 제한 체크/잔여량 계산용 — 잠금 없는 빠른 카운트.
-    실제 number 할당은 insert_photos_with_numbers RPC가 INSERT 시점에 원자적으로 처리한다."""
-    count_r = (
-        supabase.table("photos")
-        .select("id", count="exact")
-        .eq("project_id", project_id)
-        .execute()
-    )
-    return count_r.count or 0
+    실제 number 할당은 insert_photos_with_numbers RPC가 INSERT 시점에 원자적으로 처리한다.
+    동시 배치 업로드 시 Supabase 연결 일시 소진으로 간헐적 실패 가능 → 최대 3회 재시도."""
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(3):
+        if attempt > 0:
+            time.sleep(0.5 * attempt)  # 0.5s, 1.0s
+        try:
+            count_r = (
+                supabase.table("photos")
+                .select("id", count="exact")
+                .eq("project_id", project_id)
+                .execute()
+            )
+            return count_r.count or 0
+        except Exception as e:
+            last_exc = e
+            logger.warning("_count_photos attempt %d failed: %s", attempt + 1, e)
+    raise last_exc
 
 
 
