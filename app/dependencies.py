@@ -1,5 +1,6 @@
 from uuid import UUID
 
+import datetime
 import logging
 import os
 import time
@@ -71,7 +72,10 @@ def get_current_photographer(
 
         public_key = ECAlgorithm.from_jwk(json.dumps(jwk))
 
-        payload = jwt.decode(token, public_key, algorithms=["ES256"], audience="authenticated")
+        payload = jwt.decode(
+            token, public_key, algorithms=["ES256"], audience="authenticated",
+            leeway=datetime.timedelta(seconds=60),
+        )
         auth_user_id = payload.get("sub")
         if not auth_user_id:
             raise HTTPException(
