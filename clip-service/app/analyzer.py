@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 _project_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROJECTS)
 
 
+class _Cancelled(Exception):
+    pass
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -49,6 +53,8 @@ async def run(project_id: str) -> None:
                 .eq("id", project_id)
                 .execute()
             )
+        except _Cancelled:
+            logger.info("clip analysis cancelled for project_id=%s", project_id)
         except Exception as e:
             logger.exception("clip analysis failed for project_id=%s: %s", project_id, e)
             (
@@ -65,6 +71,7 @@ async def run(project_id: str) -> None:
             )
         finally:
             state.finish(project_id)
+            state.clear_cancel(project_id)
             log_rss(f"analyze_done:{project_id}")
 
 
@@ -138,6 +145,9 @@ async def _run_pipeline(supabase, project_id: str) -> None:
     loop = asyncio.get_event_loop()
     images = await download_all(urls)
 
+    if state.is_cancel_requested(project_id):
+        raise _Cancelled()
+
     # 흔들림/눈감음 경고 배지: 그룹핑 결과(싱글톤 포함 여부)와 무관하게 이번에 분석 대상이 된
     # 모든 사진에 대해 계산·저장한다. 아래 그룹핑 로직처럼 "그룹이 없으면 조기 return"에
     # 걸리지 않도록 반드시 그 이전에 실행해야 한다.
@@ -154,6 +164,9 @@ async def _run_pipeline(supabase, project_id: str) -> None:
     embeddings = await loop.run_in_executor(
         None, compute_embeddings, [img for img in images if img is not None]
     )
+
+    if state.is_cancel_requested(project_id):
+        raise _Cancelled()
 
     # download_all과 동일 순서 유지: None(다운로드 실패)을 임베딩 리스트에도 None으로 복원
     full_embeddings = []

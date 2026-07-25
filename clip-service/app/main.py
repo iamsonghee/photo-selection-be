@@ -97,6 +97,31 @@ async def match_retouch(
     return MatchRetouchResponse(matches=[MatchRetouchResult(**m) for m in matches])
 
 
+@app.delete("/analyze/{project_id}", status_code=200, dependencies=[Depends(verify_internal_token)])
+def cancel_analyze(project_id: str):
+    supabase = get_supabase()
+    project_r = (
+        supabase.table("projects")
+        .select("id, clip_analysis_status")
+        .eq("id", project_id)
+        .limit(1)
+        .execute()
+    )
+    if not project_r.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if state.is_in_flight(project_id):
+        state.request_cancel(project_id)
+
+    (
+        supabase.table("projects")
+        .update({"clip_analysis_status": None, "clip_analysis_error": None})
+        .eq("id", project_id)
+        .execute()
+    )
+    return {"status": "cancelled"}
+
+
 @app.get("/analyze/{project_id}/status", dependencies=[Depends(verify_internal_token)])
 def analyze_status(project_id: str):
     supabase = get_supabase()
