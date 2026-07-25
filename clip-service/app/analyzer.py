@@ -1,6 +1,7 @@
 """분석 파이프라인 오케스트레이션: DB 조회 -> 다운로드 -> 임베딩 -> 그룹핑 -> DB 기록."""
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -18,7 +19,7 @@ from app.downloader import download_all
 from app.embeddings_store import persist_embeddings
 from app.eyes import compute_eye_flags
 from app.grouping import group_by_similarity
-from app.memlog import log_rss
+from app.memlog import log_perf, log_rss
 from app.quality import compute_blur_flags, compute_quality_scores, pick_best_index
 from app.quality_store import persist_quality_flags
 
@@ -39,8 +40,9 @@ async def run(project_id: str) -> None:
     """백그라운드 작업 진입점. 실패해도 예외를 삼키고 DB에 상태를 기록한다."""
     async with _project_semaphore:
         supabase = get_supabase()
+        t_pipe = time.perf_counter()
         try:
-            await _run_pipeline(supabase, project_id)
+            await _run_pipeline(supabase, project_id, t_pipe)
             (
                 supabase.table("projects")
                 .update(
@@ -70,12 +72,14 @@ async def run(project_id: str) -> None:
                 .execute()
             )
         finally:
+            total = time.perf_counter() - t_pipe
             state.finish(project_id)
             state.clear_cancel(project_id)
             log_rss(f"analyze_done:{project_id}")
+            log_perf("analyze_done", elapsed_sec=total, total_sec=total)
 
 
-async def _run_pipeline(supabase, project_id: str) -> None:
+async def _run_pipeline(supabase, project_id: str, t_pipe: float) -> None:
     project_r = (
         supabase.table("projects")
         .select("clip_analysis_last_number, clip_analysis_threshold")
@@ -143,26 +147,86 @@ async def _run_pipeline(supabase, project_id: str) -> None:
 
     urls = [r["r2_thumb_url"] for r in target_rows]
     loop = asyncio.get_event_loop()
+    n_total = len(urls)
+
+    # ── 다운로드 ──────────────────────────────────────────────
+    log_perf("download_start", n=n_total, total_sec=time.perf_counter() - t_pipe)
+    t = time.perf_counter()
     images = await download_all(urls)
+    n_dl_ok = sum(1 for img in images if img is not None)
+    log_perf(
+        "download_done",
+        elapsed_sec=time.perf_counter() - t,
+        n=n_total,
+        success_count=n_dl_ok,
+        failure_count=n_total - n_dl_ok,
+        total_sec=time.perf_counter() - t_pipe,
+    )
 
     if state.is_cancel_requested(project_id):
         raise _Cancelled()
 
+    # ── 블러 분석 ──────────────────────────────────────────────
     # 흔들림/눈감음 경고 배지: 그룹핑 결과(싱글톤 포함 여부)와 무관하게 이번에 분석 대상이 된
     # 모든 사진에 대해 계산·저장한다. 아래 그룹핑 로직처럼 "그룹이 없으면 조기 return"에
     # 걸리지 않도록 반드시 그 이전에 실행해야 한다.
+    log_perf("blur_start", n=n_total, total_sec=time.perf_counter() - t_pipe)
+    t = time.perf_counter()
     blur_flags = await loop.run_in_executor(None, compute_blur_flags, images, BLUR_VARIANCE_THRESHOLD)
+    log_perf(
+        "blur_done",
+        elapsed_sec=time.perf_counter() - t,
+        n=n_total,
+        total_sec=time.perf_counter() - t_pipe,
+    )
+
+    # ── 눈감음 분석 ──────────────────────────────────────────────
+    log_perf("eyes_start", n=n_total, total_sec=time.perf_counter() - t_pipe)
+    t = time.perf_counter()
     eye_flags = await loop.run_in_executor(None, compute_eye_flags, images, EYE_AR_THRESHOLD)
+    log_perf(
+        "eyes_done",
+        elapsed_sec=time.perf_counter() - t,
+        n=n_total,
+        total_sec=time.perf_counter() - t_pipe,
+    )
+
     quality_flags = [
         (blur_variance, is_blurry, face_detected, eyes_closed)
         for (blur_variance, is_blurry), (face_detected, eyes_closed) in zip(blur_flags, eye_flags)
     ]
-    persist_quality_flags(
+
+    # ── 품질 플래그 DB 저장 ──────────────────────────────────────
+    log_perf("db_quality_start", n=n_total, total_sec=time.perf_counter() - t_pipe)
+    t = time.perf_counter()
+    q_ok, q_fail, q_batches = persist_quality_flags(
         supabase, list(zip([r["id"] for r in target_rows], quality_flags))
     )
+    log_perf(
+        "db_quality_done",
+        elapsed_sec=time.perf_counter() - t,
+        n=q_ok + q_fail,
+        success_count=q_ok,
+        failure_count=q_fail,
+        batch_count=q_batches,
+        total_sec=time.perf_counter() - t_pipe,
+    )
 
+    # ── CLIP embedding ──────────────────────────────────────────
+    n_clip_in = sum(1 for img in images if img is not None)
+    log_perf("clip_start", n=n_clip_in, total_sec=time.perf_counter() - t_pipe)
+    t = time.perf_counter()
     embeddings = await loop.run_in_executor(
         None, compute_embeddings, [img for img in images if img is not None]
+    )
+    n_emb_ok = sum(1 for e in embeddings if e is not None)
+    log_perf(
+        "clip_done",
+        elapsed_sec=time.perf_counter() - t,
+        n=n_clip_in,
+        success_count=n_emb_ok,
+        failure_count=n_clip_in - n_emb_ok,
+        total_sec=time.perf_counter() - t_pipe,
     )
 
     if state.is_cancel_requested(project_id):
@@ -174,16 +238,40 @@ async def _run_pipeline(supabase, project_id: str) -> None:
     for img in images:
         full_embeddings.append(next(emb_iter) if img is not None else None)
 
+    # ── 임베딩 DB 저장 ──────────────────────────────────────────
     # 그룹 결과와 무관하게(싱글톤 포함) 분석 대상이 된 모든 사진의 임베딩을 영속화 —
     # 추후 보정본 CLIP 매칭(matcher.py)이 재계산 없이 재사용할 수 있도록.
-    persist_embeddings(supabase, list(zip([r["id"] for r in target_rows], full_embeddings)))
+    log_perf("db_embedding_start", n=n_emb_ok, total_sec=time.perf_counter() - t_pipe)
+    t = time.perf_counter()
+    e_ok, e_fail, e_batches = persist_embeddings(
+        supabase, list(zip([r["id"] for r in target_rows], full_embeddings))
+    )
+    log_perf(
+        "db_embedding_done",
+        elapsed_sec=time.perf_counter() - t,
+        n=e_ok + e_fail,
+        success_count=e_ok,
+        failure_count=e_fail,
+        batch_count=e_batches,
+        total_sec=time.perf_counter() - t_pipe,
+    )
 
+    # ── 유사도 계산 + 그룹핑 ─────────────────────────────────────
     # 경계 사진이 있으면 인덱스 0에 붙여서 함께 그룹핑하고, 결과에서 경계가 포함된 연결
     # 요소만 따로 떼어내 병합/신규생성 케이스로 처리한다. grouping.py 자체는 변경 없음 —
     # "인덱스 0이 경계"라는 의미를 몰라도 인접 비교 + union-find 결과만 돌려주면 된다.
     boundary_offset = 1 if boundary_embedding is not None else 0
     grouping_input = ([boundary_embedding] + full_embeddings) if boundary_offset else full_embeddings
+    log_perf("grouping_start", n=len(grouping_input), total_sec=time.perf_counter() - t_pipe)
+    t = time.perf_counter()
     raw_groups = group_by_similarity(grouping_input, CLIP_SIMILARITY_THRESHOLD)
+    log_perf(
+        "grouping_done",
+        elapsed_sec=time.perf_counter() - t,
+        n=len(grouping_input),
+        success_count=len(raw_groups),
+        total_sec=time.perf_counter() - t_pipe,
+    )
 
     new_groups: list[list[int]] = []
     boundary_new_members: list[int] | None = None
