@@ -148,7 +148,8 @@ _ALLOWED_KEY_PATTERNS = [
     re.compile(rf"^photos/{_UUID}/{_UUID}/{_HEX32}_(thumb|preview)\.jpg$"),
     re.compile(rf"^versions/{_UUID}/v\d+/{_UUID}_{_SAFE}$"),
     re.compile(rf"^versions/{_UUID}/v\d+/{_UUID}_thumb\.jpg$"),
-    re.compile(rf"^originals/{_UUID}/{_UUID}_{_SAFE}$"),
+    re.compile(rf"^originals/{_UUID}/{_HEX32}\.jpg$"),
+    re.compile(rf"^originals/source/{_UUID}/{_HEX32}\.(jpg|jpeg|heic|heif|png|webp)$"),
 ]
 
 PRESIGN_EXPIRES_SECONDS = 3600
@@ -201,6 +202,60 @@ def generate_presigned_urls_batch(keys: list[str], expires: int = PRESIGN_EXPIRE
             ExpiresIn=expires,
         )
     return result
+
+
+def generate_presigned_put_url(key: str, content_type: str, expires: int = PRESIGN_EXPIRES_SECONDS) -> str:
+    """브라우저가 R2에 직접 PUT할 수 있는 presigned URL 생성.
+    content_type은 브라우저 PUT 요청의 Content-Type 헤더와 정확히 일치해야 한다.
+    """
+    if not R2_BUCKET_NAME:
+        raise ValueError("R2_BUCKET_NAME must be set in .env")
+    client = get_r2_client()
+    return client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type},
+        ExpiresIn=expires,
+    )
+
+
+def get_r2_object_bytes_sync(key: str) -> bytes:
+    """R2 object를 다운로드해 bytes로 반환. 미존재 시 KeyError 발생."""
+    if not R2_BUCKET_NAME:
+        raise ValueError("R2_BUCKET_NAME must be set in .env")
+    from botocore.exceptions import ClientError
+    client = get_r2_client()
+    try:
+        response = client.get_object(Bucket=R2_BUCKET_NAME, Key=key)
+        return response["Body"].read()
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "403"):
+            raise KeyError(f"R2 key not found: {key}")
+        raise
+    except Exception as exc:
+        err_str = str(exc)
+        if "NoSuchKey" in err_str or "404" in err_str:
+            raise KeyError(f"R2 key not found: {key}")
+        raise
+
+
+def head_r2_object_sync(key: str) -> int:
+    """R2 object의 ContentLength 반환. 미존재 또는 0-byte 시 KeyError 발생."""
+    if not R2_BUCKET_NAME:
+        raise ValueError("R2_BUCKET_NAME must be set in .env")
+    from botocore.exceptions import ClientError
+    client = get_r2_client()
+    try:
+        response = client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
+        size = response.get("ContentLength", 0)
+        if size == 0:
+            raise KeyError(f"R2 object is empty: {key}")
+        return size
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "403"):
+            raise KeyError(f"R2 key not found: {key}")
+        raise
 
 
 # ─── GCS ─────────────────────────────────────────────────────────────────────

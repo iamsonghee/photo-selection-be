@@ -1,10 +1,27 @@
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import get_supabase
 from app.routers import projects, storage, upload
+from app.routers.upload import original_compress_worker, stuck_job_sweep_worker
 
-app = FastAPI(title="photo-selection-be")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting background workers...")
+    asyncio.create_task(original_compress_worker())
+    asyncio.create_task(stuck_job_sweep_worker())
+    yield
+    logger.info("Shutting down...")
+
+
+app = FastAPI(title="photo-selection-be", lifespan=lifespan)
 
 import os
 

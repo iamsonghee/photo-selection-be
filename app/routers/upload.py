@@ -7,6 +7,7 @@ import os
 import re
 import uuid as uuid_module
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from uuid import UUID
 
@@ -26,7 +27,13 @@ register_heif_opener()
 
 from app.database import get_supabase
 from app.dependencies import get_current_photographer
-from app.storage import upload_to_r2
+from app.storage import (
+    delete_r2_objects,
+    generate_presigned_put_url,
+    get_r2_object_bytes_sync,
+    head_r2_object_sync,
+    upload_to_r2,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -74,9 +81,28 @@ def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
 
 # 요청 한 번에 여러 장 병렬 처리 시 메모리·CPU 피크 완화 (기본 5, 환경으로 조절)
 UPLOAD_PHOTOS_CONCURRENCY = _env_int("UPLOAD_PHOTOS_CONCURRENCY", 5, 1, 12)
+# 원본 포함 업로드 시 presigned PUT 방식으로 서버 부담 낮춤 (기본 3)
+UPLOAD_WITH_ORIGINAL_CONCURRENCY = _env_int("UPLOAD_WITH_ORIGINAL_CONCURRENCY", 3, 1, 8)
 VERSION_UPLOAD_CONCURRENCY = _env_int("VERSION_UPLOAD_CONCURRENCY", 3, 1, 12)
 # Pillow/R2 동기 작업 스레드 수 (동시 이미지 디코딩 상한에 맞춤, 기본 8)
 IMAGE_EXECUTOR_MAX_WORKERS = _env_int("IMAGE_EXECUTOR_MAX_WORKERS", 8, 2, 16)
+# 비동기 원본 압축 worker 동시성 (기본 1 — Railway 512MB RAM 보호)
+ORIGINAL_COMPRESS_CONCURRENCY = _env_int("ORIGINAL_COMPRESS_CONCURRENCY", 1, 1, 4)
+# presigned PUT URL 유효 시간 (초)
+ORIGINAL_PRESIGNED_EXPIRES = 3600
+
+# 원본(납품) 파일 상한 (20MB)
+ORIGINAL_MAX_BYTES = 20 * 1024 * 1024
+
+# content_type → 파일 확장자
+_CT_TO_EXT: dict[str, str] = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/heic": "heic",
+    "image/heif": "heic",
+    "image/png": "png",
+    "image/webp": "webp",
+}
 
 # Pillow / boto3 블로킹 작업용 스레드풀
 _executor = ThreadPoolExecutor(max_workers=IMAGE_EXECUTOR_MAX_WORKERS)
@@ -101,6 +127,8 @@ def _count_photos(supabase, project_id: str) -> int:
         .execute()
     )
     return count_r.count or 0
+
+
 
 
 def _insert_photos_with_numbers(supabase, project_id: str, rows: list[dict]) -> list[dict]:
@@ -212,16 +240,59 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
     return thumb_buf.getvalue(), preview_buf.getvalue()
 
 
+def _process_original_sync(image_bytes: bytes, content_type: str) -> bytes:
+    """원본 bytes → JPEG 변환 + 자동 압축. 20MB는 목표치이며 초과해도 최선 결과를 반환한다."""
+    is_jpeg = content_type == "image/jpeg"
+    if is_jpeg and len(image_bytes) <= ORIGINAL_MAX_BYTES:
+        return image_bytes
+    img = Image.open(io.BytesIO(image_bytes))
+    img = _apply_exif_orientation(img)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    if not is_jpeg:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=95)
+        data = buf.getvalue()
+        if len(data) <= ORIGINAL_MAX_BYTES:
+            img.close()
+            return data
+    for quality in (90, 85, 80, 75):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        data = buf.getvalue()
+        if len(data) <= ORIGINAL_MAX_BYTES:
+            img.close()
+            return data
+    last: bytes = b""
+    for max_edge in (6000, 5000, 4000, 3200, 2400, 1600):
+        resized = img.copy()
+        resized.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        resized.save(buf, format="JPEG", quality=90)
+        last = buf.getvalue()
+        resized.close()
+        if len(last) <= ORIGINAL_MAX_BYTES:
+            img.close()
+            return last
+    img.close()
+    return last
+
+
 async def _process_one(
     loop: asyncio.AbstractEventLoop,
     contents: bytes,
     index: int,
     project_id: str,
     photographer_id: UUID,
-) -> Optional[Tuple[str, str, int]]:
-    """파일 하나: 썸네일+미리보기 생성 → R2 병렬 업로드. (photos.number는 모든 파일 업로드가 끝난 뒤
-    insert_photos_with_numbers RPC가 한 번에 원자적으로 할당하므로 여기서는 다루지 않는다 — index는 로그 추적용.)
-    성공 시 (thumb_url, preview_url, r2_stored_bytes) — r2_stored_bytes는 썸네일+미리보기 JPEG 합계."""
+    include_original: bool = False,
+    original_content_type: str = "",  # 브라우저 원본 파일의 MIME type (presigned key 확장자 결정용)
+) -> Optional[Tuple[str, str, int, Optional[dict]]]:
+    """파일 하나: 썸네일+미리보기 생성 → R2 업로드.
+    include_original=True 시 presigned PUT 정보를 반환 (원본 압축은 worker가 비동기 처리).
+    성공 시 (thumb_url, preview_url, r2_stored_bytes, original_presigned_or_None).
+    original_presigned = {source_key, photo_hex, content_type}
+    B plan: contents는 항상 압축본(2MB JPEG), original_content_type은 원본 파일 타입.
+    """
     photo_id = uuid_module.uuid4().hex
 
     try:
@@ -240,12 +311,8 @@ async def _process_one(
 
     try:
         thumb_url, preview_url = await asyncio.gather(
-            loop.run_in_executor(
-                _executor, _upload_to_r2_sync, thumb_key, thumb_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL
-            ),
-            loop.run_in_executor(
-                _executor, _upload_to_r2_sync, preview_key, preview_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL
-            ),
+            loop.run_in_executor(_executor, _upload_to_r2_sync, thumb_key, thumb_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL),
+            loop.run_in_executor(_executor, _upload_to_r2_sync, preview_key, preview_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL),
         )
     except Exception as e:
         logger.error(f"에러내용: {e}")
@@ -261,19 +328,31 @@ async def _process_one(
     gc.collect()
     rss_gc = _rss_mb()
     print(f"[mem] after_r2_upload rss={rss_r2:.1f}MB | after_gc rss={rss_gc:.1f}MB Δ{rss_gc - rss_r2:.1f}MB", flush=True)
-    return (thumb_url, preview_url, r2_stored_bytes)
+
+    original_presigned: Optional[dict] = None
+    if include_original and original_content_type:
+        ext = _CT_TO_EXT.get(original_content_type, "jpg")
+        source_key = f"originals/source/{project_id}/{photo_id}.{ext}"
+        original_presigned = {"source_key": source_key, "photo_hex": photo_id, "content_type": original_content_type}
+
+    return (thumb_url, preview_url, r2_stored_bytes, original_presigned)
 
 
 @router.post("/photos")
 async def upload_photos(
     project_id: str = Form(...),
     files: list[UploadFile] = File(...),
+    include_original: bool = Form(False),
+    original_filenames: list[str] = Form(default=[]),
+    original_file_sizes: list[int] = Form(default=[]),
+    original_last_modifieds: list[int] = Form(default=[]),
+    original_content_types: list[str] = Form(default=[]),
     photographer_id: UUID = Depends(get_current_photographer),
 ):
     """
-    사진 일괄 업로드: 썸네일(400px/75%) + 미리보기(1200px/82%) 생성 후 R2 병렬 업로드.
-    photos.r2_thumb_url (갤러리), photos.r2_preview_url (뷰어) 저장.
-    동시 처리 상한: UPLOAD_PHOTOS_CONCURRENCY(기본 5). 스레드 풀: IMAGE_EXECUTOR_MAX_WORKERS(기본 8).
+    사진 일괄 업로드: 썸네일(300px/75%) + 미리보기(1200px/82%) 생성 후 R2 병렬 업로드.
+    include_original=true 시 원본(납품)도 R2 originals/ 경로에 함께 저장.
+    동시 처리 상한: include_original 여부에 따라 UPLOAD_WITH_ORIGINAL_CONCURRENCY(3) / UPLOAD_PHOTOS_CONCURRENCY(5).
     """
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
@@ -298,9 +377,11 @@ async def upload_photos(
         raise HTTPException(status_code=404, detail="Project not found")
 
     # 허용된 파일만 읽음 (BUG-01: 거부 파일 목록 수집 / BUG-02: 소문자 정규화)
-    valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, original_filename, file_size)
+    valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, compressed_filename, file_size)
+    # 복구 매칭용 원본 파일 메타 (valid와 1:1 대응, FE가 보낸 original_* Form 필드 기반)
+    meta: list[tuple[str, str, Optional[int], Optional[int]]] = []  # (orig_fn, orig_ct, orig_size, orig_lm)
     rejected_filenames: list[str] = []
-    for f in files:
+    for i, f in enumerate(files):
         ct = (f.content_type or "").lower()  # BUG-02: 대문자 MIME 타입 정규화
         if not ct or ct not in ALLOWED_CONTENT_TYPES:
             inferred = _infer_content_type(f.filename or "")
@@ -312,11 +393,22 @@ async def upload_photos(
         if ct not in ALLOWED_CONTENT_TYPES:
             rejected_filenames.append(f.filename or "(unknown)")
             continue
+        # HEIC 정책: include_original=True 베타에서는 JPEG/PNG/WebP만 허용 (HEIC 디코딩 실패 → raw 전송 위험)
+        if include_original and ct in ("image/heic", "image/heif"):
+            rejected_filenames.append(f.filename or "(unknown)")
+            logger.warning("rejected HEIC for include_original upload (beta policy): %r", f.filename)
+            continue
         contents = await f.read()
         if not contents:
             rejected_filenames.append(f.filename or "(unknown)")
             continue
         valid.append((contents, ct, f.filename or "", len(contents)))
+        # original_* 배열은 files와 인덱스 동기화 — 파싱 실패 시 압축 파일 정보로 fallback
+        orig_fn = original_filenames[i] if i < len(original_filenames) else (f.filename or "")
+        orig_ct = original_content_types[i] if i < len(original_content_types) else ct
+        orig_sz: Optional[int] = original_file_sizes[i] if i < len(original_file_sizes) else None
+        orig_lm: Optional[int] = original_last_modifieds[i] if i < len(original_last_modifieds) else None
+        meta.append((orig_fn, orig_ct, orig_sz, orig_lm))
 
     if not valid:
         raise HTTPException(
@@ -355,15 +447,16 @@ async def upload_photos(
         valid = valid[:remaining]
 
     loop = asyncio.get_event_loop()
-    sem = asyncio.Semaphore(UPLOAD_PHOTOS_CONCURRENCY)
+    effective_concurrency = UPLOAD_WITH_ORIGINAL_CONCURRENCY if include_original else UPLOAD_PHOTOS_CONCURRENCY
+    sem = asyncio.Semaphore(effective_concurrency)
 
-    async def _limited_process_one(contents: bytes, index: int):
+    async def _limited_process_one(contents: bytes, index: int, orig_ct: str):
         async with sem:
-            return await _process_one(loop, contents, index, project_id, photographer_id)
+            return await _process_one(loop, contents, index, project_id, photographer_id, include_original, orig_ct)
 
     results = await asyncio.gather(
         *[
-            _limited_process_one(contents, idx)
+            _limited_process_one(contents, idx, meta[idx][1])
             for idx, (contents, _, __, ___) in enumerate(valid)
         ],
         return_exceptions=True,
@@ -371,24 +464,32 @@ async def upload_photos(
 
     # asyncio.gather는 입력 순서를 보존하므로, valid의 원래 파일 순서 그대로 number가 매겨진다.
     rows: list[dict] = []
-    for r, (_, __, original_filename, _) in zip(results, valid):
+    # presigned_infos: (presigned_dict | None, orig_fn, orig_ct, orig_sz, orig_lm) — rows와 1:1 대응
+    presigned_infos: list[tuple[Optional[dict], str, str, Optional[int], Optional[int]]] = []
+    for r, (_, __, compressed_fn, ___), (orig_fn, orig_ct, orig_sz, orig_lm) in zip(results, valid, meta):
         if isinstance(r, Exception):
             logger.error(f"에러내용: {r}")
             logger.warning("process task failed: %s", r)
             continue
         if r is not None:
-            thumb_url, preview_url, r2_stored_bytes = r
+            thumb_url, preview_url, r2_stored_bytes, original_presigned = r
             row: dict = {
                 "r2_thumb_url": thumb_url,
                 "r2_preview_url": preview_url,
                 "file_size": r2_stored_bytes,
             }
-            if original_filename:
-                row["original_filename"] = original_filename
+            # include_original일 때는 브라우저 원본 파일명, 아닐 때는 압축 파일명 사용
+            display_fn = orig_fn if include_original else compressed_fn
+            if display_fn:
+                row["original_filename"] = display_fn
+            if original_presigned:
+                row["original_status"] = "awaiting_upload"
             rows.append(row)
+            presigned_infos.append((original_presigned, orig_fn, orig_ct, orig_sz, orig_lm))
 
     # 파일 바이트 + 처리 결과 해제 후 OS에 힙 반환 (Python은 freed 메모리를 OS에 자동 반환 안 함)
     del valid
+    del meta
     gc.collect()
     try:
         import ctypes
@@ -429,7 +530,429 @@ async def upload_photos(
         logger.exception("projects photo_count update failed: %s", e)
         raise HTTPException(status_code=500, detail="프로젝트 업데이트 실패") from e
 
-    return {"uploaded": len(inserted), "rejected": rejected_filenames}
+    # original_jobs 등록 + presigned PUT URL 생성
+    original_presigned_response: list[dict] = []
+    now_utc = datetime.now(timezone.utc)
+    expires_at = (now_utc + timedelta(seconds=ORIGINAL_PRESIGNED_EXPIRES)).isoformat()
+
+    for photo_row, (presigned_info, orig_fn, orig_ct, orig_sz, orig_lm) in zip(inserted, presigned_infos):
+        if not presigned_info:
+            continue
+        db_photo_id = photo_row["id"]
+        source_key = presigned_info["source_key"]
+        ct = presigned_info["content_type"]
+        try:
+            job_payload: dict = {
+                "photo_id": db_photo_id,
+                "project_id": project_id,
+                "r2_source_key": source_key,
+                "source_content_type": ct,
+                "status": "awaiting_upload",
+                "original_filename": orig_fn or None,
+                "original_content_type": orig_ct or None,
+            }
+            if orig_sz is not None:
+                job_payload["original_file_size"] = orig_sz
+            if orig_lm is not None:
+                job_payload["original_last_modified"] = orig_lm
+            job_r = supabase.table("original_jobs").insert(job_payload).execute()
+            job_id = (job_r.data or [{}])[0].get("id")
+            presigned_url = generate_presigned_put_url(source_key, ct, ORIGINAL_PRESIGNED_EXPIRES)
+            if job_id:
+                original_presigned_response.append({
+                    "job_id": job_id,
+                    "url": presigned_url,
+                    "source_key": source_key,
+                    "content_type": ct,
+                    "expires_at": expires_at,
+                })
+        except Exception as e:
+            logger.exception("original_jobs insert/presign failed for photo %s: %s", db_photo_id, e)
+
+    response: dict = {"uploaded": len(inserted), "rejected": rejected_filenames}
+    if original_presigned_response:
+        response["original_presigned"] = original_presigned_response
+    return response
+
+
+# ── 원본 압축 비동기 처리 ────────────────────────────────────────────────────
+
+@router.post("/originals/confirm")
+async def confirm_original_upload(
+    job_id: str = Form(...),
+    photographer_id: UUID = Depends(get_current_photographer),
+):
+    """presigned PUT 완료 통지: 소유권 확인 → 멱등 상태 체크 → R2 HEAD → pending 전이."""
+    supabase = get_supabase()
+    # 소유권 확인 (job → project → photographer)
+    job_r = (
+        supabase.table("original_jobs")
+        .select("id,status,r2_source_key,project_id")
+        .eq("id", job_id)
+        .limit(1)
+        .execute()
+    )
+    if not job_r.data:
+        raise HTTPException(status_code=404, detail="job not found")
+    job = job_r.data[0]
+    proj_r = (
+        supabase.table("projects")
+        .select("id")
+        .eq("id", job["project_id"])
+        .eq("photographer_id", str(photographer_id))
+        .limit(1)
+        .execute()
+    )
+    if not proj_r.data:
+        raise HTTPException(status_code=403, detail="forbidden")
+    # 멱등: 이미 pending/processing/completed이면 바로 OK 반환
+    if job["status"] in ("pending", "processing", "completed"):
+        return {"ok": True}
+    # awaiting_upload: R2 HEAD로 파일 실제 존재 확인 (서버 측 수행)
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(_executor, _head_r2_object_sync, job["r2_source_key"])
+    except KeyError:
+        raise HTTPException(status_code=409, detail="R2 object not found — upload may still be in progress")
+    except Exception as e:
+        logger.exception("R2 HEAD failed for job %s: %s", job_id, e)
+        raise HTTPException(status_code=502, detail=f"R2 HEAD 확인 실패: {e}")
+    # 조건부 UPDATE: status = 'awaiting_upload' 행만 전이 (RPC 내부에서 WHERE status='awaiting_upload')
+    try:
+        supabase.rpc("confirm_original_upload", {"p_job_id": job_id}).execute()
+    except Exception as e:
+        logger.exception("confirm_original_upload RPC failed for job %s: %s", job_id, e)
+        raise HTTPException(status_code=500, detail="confirm 처리 실패") from e
+    return {"ok": True}
+
+
+def _get_r2_object_sync(key: str) -> bytes:
+    """동기 R2 다운로드 (executor에서 호출)."""
+    return get_r2_object_bytes_sync(key)
+
+
+def _head_r2_object_sync(key: str) -> int:
+    """동기 R2 HEAD 확인 (executor에서 호출)."""
+    return head_r2_object_sync(key)
+
+
+def _delete_r2_objects_sync(keys: list[str]) -> None:
+    """동기 R2 삭제 (executor에서 호출)."""
+    delete_r2_objects(keys)
+
+
+@router.get("/originals/pending")
+async def get_pending_originals(
+    project_id: str,
+    photographer_id: UUID = Depends(get_current_photographer),
+):
+    """awaiting_upload 상태 original_jobs 목록 반환. FE 복구 배너 표시용 — 내부 필드 비노출."""
+    supabase = get_supabase()
+    proj_r = (
+        supabase.table("projects")
+        .select("id")
+        .eq("id", project_id)
+        .eq("photographer_id", str(photographer_id))
+        .limit(1)
+        .execute()
+    )
+    if not proj_r.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    jobs_r = (
+        supabase.table("original_jobs")
+        .select("id,original_filename,original_file_size,original_last_modified,created_at")
+        .eq("project_id", project_id)
+        .eq("status", "awaiting_upload")
+        .order("created_at")
+        .execute()
+    )
+    return {"jobs": jobs_r.data or []}
+
+
+@router.post("/originals/recover")
+async def recover_original(
+    job_id: str = Form(...),
+    photographer_id: UUID = Depends(get_current_photographer),
+):
+    """awaiting_upload job 복구: R2 HEAD 확인 → 이미 업로드됐으면 confirm, 없으면 새 presigned URL 발급."""
+    supabase = get_supabase()
+    job_r = (
+        supabase.table("original_jobs")
+        .select("id,status,r2_source_key,project_id,source_content_type")
+        .eq("id", job_id)
+        .limit(1)
+        .execute()
+    )
+    if not job_r.data:
+        raise HTTPException(status_code=404, detail="job not found")
+    job = job_r.data[0]
+    proj_r = (
+        supabase.table("projects")
+        .select("id")
+        .eq("id", job["project_id"])
+        .eq("photographer_id", str(photographer_id))
+        .limit(1)
+        .execute()
+    )
+    if not proj_r.data:
+        raise HTTPException(status_code=403, detail="forbidden")
+    # 이미 처리된 job이면 바로 OK
+    if job["status"] in ("pending", "processing", "completed"):
+        return {"status": "confirmed"}
+    source_key = job["r2_source_key"]
+    ct = job["source_content_type"]
+    loop = asyncio.get_event_loop()
+    # R2 HEAD: 파일이 이미 올라와 있으면 confirm으로 전이
+    r2_exists = False
+    try:
+        await loop.run_in_executor(_executor, _head_r2_object_sync, source_key)
+        r2_exists = True
+    except KeyError:
+        pass  # 파일 없음 → 새 presigned URL
+    except Exception as e:
+        logger.exception("R2 HEAD failed in recover for job %s: %s", job_id, e)
+        raise HTTPException(status_code=502, detail=f"R2 HEAD 실패: {e}")
+    if r2_exists:
+        try:
+            supabase.rpc("confirm_original_upload", {"p_job_id": job_id}).execute()
+        except Exception as e:
+            logger.exception("confirm in recover failed for job %s: %s", job_id, e)
+            raise HTTPException(status_code=500, detail="confirm 처리 실패") from e
+        return {"status": "confirmed"}
+    # 파일 없음 → 새 presigned PUT URL 발급
+    presigned_url = generate_presigned_put_url(source_key, ct, ORIGINAL_PRESIGNED_EXPIRES)
+    now_utc = datetime.now(timezone.utc)
+    expires_at = (now_utc + timedelta(seconds=ORIGINAL_PRESIGNED_EXPIRES)).isoformat()
+    return {
+        "status": "needs_upload",
+        "url": presigned_url,
+        "source_key": source_key,
+        "content_type": ct,
+        "expires_at": expires_at,
+    }
+
+
+@router.post("/originals/abandon")
+async def abandon_original(
+    job_id: str = Form(...),
+    photographer_id: UUID = Depends(get_current_photographer),
+):
+    """사용자가 원본 업로드를 포기할 때 job을 명시적으로 failed 처리."""
+    supabase = get_supabase()
+    job_r = (
+        supabase.table("original_jobs")
+        .select("id,photo_id,status,project_id")
+        .eq("id", job_id)
+        .limit(1)
+        .execute()
+    )
+    if not job_r.data:
+        raise HTTPException(status_code=404, detail="job not found")
+    job = job_r.data[0]
+    proj_r = (
+        supabase.table("projects")
+        .select("id")
+        .eq("id", job["project_id"])
+        .eq("photographer_id", str(photographer_id))
+        .limit(1)
+        .execute()
+    )
+    if not proj_r.data:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if job["status"] in ("completed", "failed"):
+        return {"ok": True}
+    try:
+        supabase.rpc("fail_original_job", {
+            "p_job_id": job_id,
+            "p_photo_id": job["photo_id"],
+            "p_last_error": "abandoned by user",
+        }).execute()
+    except Exception as e:
+        logger.exception("abandon failed for job %s: %s", job_id, e)
+        raise HTTPException(status_code=500, detail="abandon 처리 실패") from e
+    return {"ok": True}
+
+
+async def _process_original_job(job: dict) -> None:
+    """original_jobs 행 1개를 압축·업로드·DB 완료 처리한다."""
+    job_id: str = job["id"]
+    photo_id: str = job["photo_id"]
+    project_id: str = job["project_id"]
+    source_key: str = job["r2_source_key"]
+    content_type: str = job["source_content_type"]
+    attempts: int = job["attempts"]
+    max_attempts: int = job["max_attempts"]
+
+    # photo_hex: source_key 에서 추출 (originals/source/{proj}/{hex}.{ext})
+    photo_hex = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    final_key = f"originals/{project_id}/{photo_hex}.jpg"
+
+    supabase = get_supabase()
+    loop = asyncio.get_event_loop()
+
+    def _fail(reason: str) -> None:
+        try:
+            supabase.rpc("fail_original_job", {
+                "p_job_id": job_id, "p_photo_id": photo_id, "p_last_error": reason,
+            }).execute()
+        except Exception as db_err:
+            logger.exception("fail_original_job DB call failed: %s", db_err)
+
+    def _requeue(reason: str) -> None:
+        backoff_minutes = 5 if attempts <= 1 else 30
+        next_at = (datetime.now(timezone.utc) + timedelta(minutes=backoff_minutes)).isoformat()
+        try:
+            supabase.rpc("requeue_original_job", {
+                "p_job_id": job_id, "p_photo_id": photo_id,
+                "p_last_error": reason, "p_next_attempt_at": next_at,
+            }).execute()
+        except Exception as db_err:
+            logger.exception("requeue_original_job DB call failed: %s", db_err)
+
+    # 1. source 다운로드
+    try:
+        source_bytes = await loop.run_in_executor(_executor, _get_r2_object_sync, source_key)
+    except KeyError:
+        logger.warning("source not found for job %s key %s — failing immediately", job_id, source_key)
+        _fail(f"source file not found in R2: {source_key}")
+        return
+    except Exception as e:
+        logger.exception("R2 download failed for job %s: %s", job_id, e)
+        if attempts >= max_attempts:
+            _fail(f"R2 download failed after {attempts} attempts: {e}")
+        else:
+            _requeue(f"R2 download error: {e}")
+        return
+
+    rss_dl = _rss_mb()
+    logger.info("[worker] downloaded source job=%s size=%dB rss=%.1fMB", job_id, len(source_bytes), rss_dl)
+
+    # 2. 압축
+    try:
+        compressed = await loop.run_in_executor(_executor, _process_original_sync, source_bytes, content_type)
+    except Exception as e:
+        logger.exception("Pillow compress failed for job %s: %s", job_id, e)
+        _fail(f"compression error: {e}")
+        del source_bytes
+        return
+    finally:
+        del source_bytes
+        gc.collect()
+
+    rss_compress = _rss_mb()
+    logger.info("[worker] compressed job=%s final=%dB rss=%.1fMB", job_id, len(compressed), rss_compress)
+
+    # 3. 최종 파일 R2 업로드
+    try:
+        final_url = await loop.run_in_executor(
+            _executor, _upload_to_r2_sync, final_key, compressed, "image/jpeg", IMMUTABLE_CACHE_CONTROL
+        )
+    except Exception as e:
+        logger.exception("R2 upload failed for job %s: %s", job_id, e)
+        del compressed
+        if attempts >= max_attempts:
+            _fail(f"R2 upload failed after {attempts} attempts: {e}")
+        else:
+            _requeue(f"R2 upload error: {e}")
+        return
+    finally:
+        del compressed
+        gc.collect()
+
+    # 4. HEAD verify
+    try:
+        await loop.run_in_executor(_executor, _head_r2_object_sync, final_key)
+    except Exception as e:
+        logger.exception("HEAD verify failed for job %s key %s: %s", job_id, final_key, e)
+        if attempts >= max_attempts:
+            _fail(f"HEAD verify failed: {e}")
+        else:
+            _requeue(f"HEAD verify error: {e}")
+        return
+
+    # 5. DB 완료 처리 (트랜잭션)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        supabase.rpc("complete_original_job", {
+            "p_job_id": job_id,
+            "p_photo_id": photo_id,
+            "p_r2_original_url": final_url or final_key,
+            "p_completed_at": now_iso,
+        }).execute()
+    except Exception as e:
+        logger.exception("complete_original_job DB failed for job %s: %s", job_id, e)
+        if attempts >= max_attempts:
+            _fail(f"DB update failed: {e}")
+        else:
+            _requeue(f"DB update error: {e}")
+        return
+
+    logger.info("[worker] completed job=%s final_key=%s", job_id, final_key)
+
+    # 6. source 삭제 (best effort)
+    try:
+        await loop.run_in_executor(_executor, _delete_r2_objects_sync, [source_key])
+        logger.info("[worker] deleted source key=%s", source_key)
+    except Exception as e:
+        logger.warning("source delete failed for job %s key %s (non-fatal): %s", job_id, source_key, e)
+
+
+async def original_compress_worker() -> None:
+    """startup 시 실행되는 비동기 원본 압축 worker. pending job을 폴링해 처리한다."""
+    logger.info("original_compress_worker started (concurrency=%d)", ORIGINAL_COMPRESS_CONCURRENCY)
+    while True:
+        try:
+            supabase = get_supabase()
+            jobs_r = supabase.rpc("claim_original_job", {"p_limit": ORIGINAL_COMPRESS_CONCURRENCY}).execute()
+            jobs = jobs_r.data or []
+            if jobs:
+                logger.info("[worker] claimed %d job(s)", len(jobs))
+                await asyncio.gather(*[_process_original_job(j) for j in jobs], return_exceptions=True)
+        except Exception as e:
+            logger.exception("original_compress_worker cycle error: %s", e)
+        await asyncio.sleep(5)
+
+
+async def stuck_job_sweep_worker() -> None:
+    """30분마다 processing stuck job을 복구하고 awaiting_upload 24h 초과 job을 처리한다."""
+    logger.info("stuck_job_sweep_worker started")
+    while True:
+        await asyncio.sleep(1800)  # 30분
+        try:
+            supabase = get_supabase()
+            # stuck processing 복구
+            r = supabase.rpc("recover_stuck_original_jobs", {"p_stuck_minutes": 15, "p_next_attempt_minutes": 5}).execute()
+            recovered = r.data or 0
+            if recovered:
+                logger.info("[sweep] recovered %d stuck processing job(s)", recovered)
+
+            # awaiting_upload 24h 초과 → R2 HEAD 확인 후 pending or failed
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            old_awaiting_r = supabase.table("original_jobs")\
+                .select("id,photo_id,r2_source_key")\
+                .eq("status", "awaiting_upload")\
+                .lt("created_at", cutoff)\
+                .execute()
+            for job in (old_awaiting_r.data or []):
+                job_id = job["id"]
+                photo_id = job["photo_id"]
+                source_key = job["r2_source_key"]
+                try:
+                    await asyncio.get_event_loop().run_in_executor(_executor, _head_r2_object_sync, source_key)
+                    # 파일 존재 → pending 승격
+                    supabase.rpc("confirm_original_upload", {"p_job_id": job_id}).execute()
+                    logger.info("[sweep] promoted awaiting job %s to pending (R2 file found)", job_id)
+                except KeyError:
+                    # 파일 없음 → failed
+                    supabase.rpc("fail_original_job", {
+                        "p_job_id": job_id, "p_photo_id": photo_id,
+                        "p_last_error": "source file never uploaded (24h timeout)",
+                    }).execute()
+                    logger.warning("[sweep] failed awaiting job %s (R2 file not found after 24h)", job_id)
+                except Exception as e:
+                    logger.exception("[sweep] awaiting recovery error for job %s: %s", job_id, e)
+        except Exception as e:
+            logger.exception("stuck_job_sweep_worker error: %s", e)
 
 
 # ── 프로필 이미지 ────────────────────────────────────────────────────────────
@@ -762,254 +1285,3 @@ async def upload_versions(
     return {"uploaded": len(results), "items": results}
 
 
-# ── 납품 파일 업로드 ─────────────────────────────────────────────────────────
-
-DELIVERY_MAX_BYTES = 20 * 1024 * 1024  # 20MB
-DELIVERY_UPLOAD_CONCURRENCY = _env_int("DELIVERY_UPLOAD_CONCURRENCY", 2, 1, 8)
-
-
-def _make_delivery_key_sync(project_id: str, filename: str) -> tuple[str, str]:
-    """납품 파일 R2 key + safe delivery filename 생성 (출력은 항상 .jpg)."""
-    base = filename or f"{uuid_module.uuid4()}.jpg"
-    safe = re.sub(r"[^\w\-.]", "_", base)
-    dot = safe.rfind(".")
-    safe = (safe[:dot] if dot > 0 else safe) + ".jpg"
-    file_id = str(uuid_module.uuid4())
-    key = f"originals/{project_id}/{file_id}_{safe}"
-    return key, safe
-
-
-def _process_delivery_file_sync(
-    image_bytes: bytes,
-    content_type: str,
-) -> tuple[bytes, bool]:
-    """납품 파일 JPEG 변환 + 필요 시 2단계 압축.
-    반환: (output_bytes, was_compressed)
-    was_compressed=True: 품질 하향 또는 해상도 축소 발생
-    ValueError: 3200px/85%에서도 20MB 초과 → 거부
-    """
-    is_jpeg = content_type == "image/jpeg"
-
-    # JPEG이고 20MB 이하 → 원본 바이트 그대로
-    if is_jpeg and len(image_bytes) <= DELIVERY_MAX_BYTES:
-        return image_bytes, False
-
-    img = Image.open(io.BytesIO(image_bytes))
-    img = _apply_exif_orientation(img)
-    if img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
-
-    # 비JPEG → 고품질(95%) JPEG 변환 시도 (포맷 변환만, 품질 손실 없음)
-    if not is_jpeg:
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=95)
-        data = buf.getvalue()
-        if len(data) <= DELIVERY_MAX_BYTES:
-            img.close()
-            return data, False
-
-    # 1단계: 해상도 유지, 품질 점진 하향
-    for quality in (90, 85, 80, 75):
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
-        data = buf.getvalue()
-        if len(data) <= DELIVERY_MAX_BYTES:
-            img.close()
-            return data, True
-
-    # 2단계: 품질 85% 고정, 최장변 점진 축소
-    for max_edge in (6000, 5000, 4000, 3200):
-        resized = img.copy()
-        resized.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        resized.save(buf, format="JPEG", quality=85)
-        data = buf.getvalue()
-        resized.close()
-        if len(data) <= DELIVERY_MAX_BYTES:
-            img.close()
-            return data, True
-
-    img.close()
-    raise ValueError("파일이 20MB 상한을 초과하여 자동 압축 후에도 저장할 수 없습니다.")
-
-
-async def _process_one_delivery(
-    loop: asyncio.AbstractEventLoop,
-    project_id: str,
-    filename: str,
-    contents: bytes,
-    content_type: str,
-) -> dict:
-    """납품 파일 1건: JPEG 변환 + 압축 → R2 업로드.
-    성공 시 dict 반환, 거부 시 ValueError raise."""
-    original_size = len(contents)
-
-    try:
-        output_bytes, was_compressed = await loop.run_in_executor(
-            _executor,
-            _process_delivery_file_sync,
-            contents,
-            content_type,
-        )
-    except ValueError:
-        raise
-    except Exception as e:
-        logger.warning("delivery file process failed: %s %s", filename, e)
-        raise ValueError(f"이미지 처리 실패: {filename}") from e
-
-    try:
-        key, safe_filename = await loop.run_in_executor(
-            _executor,
-            _make_delivery_key_sync,
-            project_id,
-            filename,
-        )
-    except Exception as e:
-        logger.warning("delivery key generation failed: %s %s", filename, e)
-        raise ValueError(f"파일명 처리 실패: {filename}") from e
-
-    try:
-        r2_url = await loop.run_in_executor(
-            _executor,
-            _upload_to_r2_sync,
-            key,
-            output_bytes,
-            "image/jpeg",
-        )
-    except Exception as e:
-        logger.warning("delivery R2 upload failed: %s %s", filename, e)
-        raise ValueError(f"업로드 실패: {filename}") from e
-
-    if not r2_url:
-        raise ValueError(f"R2 URL 미설정: {filename}")
-
-    return {
-        "r2_url": r2_url,
-        "original_filename": filename,
-        "delivery_filename": safe_filename,
-        "file_size": len(output_bytes),
-        "compressed": was_compressed,
-        "original_file_size": original_size if was_compressed else None,
-        "mime_type": "image/jpeg",
-    }
-
-
-@router.post("/originals")
-async def upload_originals(
-    project_id: str = Form(...),
-    files: list[UploadFile] = File(...),
-    photographer_id: UUID = Depends(get_current_photographer),
-):
-    """
-    납품 파일 일괄 업로드 (project.status = 'delivered' 전용).
-    JPEG/PNG/HEIC/WebP 지원, RAW 거부.
-    20MB 초과 시 서버 측 2단계 자동 압축, 3200px/85%에서도 초과하면 거부.
-    R2 경로: originals/{project_id}/{uuid}_{safe_filename}
-    반환: { uploaded, compressed, rejected: [{filename, reason}] }
-    """
-    if not files:
-        raise HTTPException(status_code=400, detail="At least one file required")
-
-    try:
-        supabase = get_supabase()
-    except Exception as e:
-        logger.exception("get_supabase failed")
-        raise HTTPException(status_code=503, detail="DB 연결 실패") from e
-
-    # 프로젝트 소유 + delivered 상태 확인
-    project_r = (
-        supabase.table("projects")
-        .select("id, status")
-        .eq("id", project_id)
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not project_r.data or len(project_r.data) == 0:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if project_r.data[0].get("status") != "delivered":
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "invalid_project_status",
-                "message": "납품 파일은 고객이 보정본을 최종 승인한 프로젝트에만 업로드할 수 있습니다.",
-            },
-        )
-
-    # 포맷 검증 및 파일 읽기
-    valid: list[tuple[bytes, str, str]] = []  # (contents, content_type, filename)
-    rejected: list[dict] = []
-
-    for f in files:
-        ct = (f.content_type or "").lower()
-        if not ct or ct not in ALLOWED_CONTENT_TYPES:
-            ct = _infer_content_type(f.filename or "") or ""
-        if ct not in ALLOWED_CONTENT_TYPES:
-            rejected.append({
-                "filename": f.filename or "(unknown)",
-                "reason": "지원하지 않는 파일 형식입니다. JPEG, PNG, WebP, HEIC만 가능합니다.",
-            })
-            logger.warning("delivery: rejected unsupported file: %r", f.filename)
-            continue
-        contents = await f.read()
-        if not contents:
-            rejected.append({"filename": f.filename or "(unknown)", "reason": "빈 파일입니다."})
-            continue
-        valid.append((contents, ct, f.filename or ""))
-
-    if not valid:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "no_valid_files",
-                "message": "지원하지 않는 파일 형식입니다. JPEG, PNG, WebP, HEIC만 가능합니다.",
-                "rejected": rejected,
-            },
-        )
-
-    loop = asyncio.get_event_loop()
-    sem = asyncio.Semaphore(DELIVERY_UPLOAD_CONCURRENCY)
-
-    async def _limited_delivery(contents: bytes, content_type: str, filename: str):
-        async with sem:
-            return await _process_one_delivery(loop, project_id, filename, contents, content_type)
-
-    gathered = await asyncio.gather(
-        *[_limited_delivery(c, ct, fn) for c, ct, fn in valid],
-        return_exceptions=True,
-    )
-
-    rows: list[dict] = []
-    compressed_count = 0
-    for result, (_, __, filename) in zip(gathered, valid):
-        if isinstance(result, ValueError):
-            rejected.append({"filename": filename, "reason": str(result)})
-        elif isinstance(result, Exception):
-            logger.error("delivery upload task failed: %s", result)
-            rejected.append({"filename": filename, "reason": "업로드 중 오류가 발생했습니다."})
-        elif result is not None:
-            rows.append({
-                "project_id": project_id,
-                "r2_url": result["r2_url"],
-                "original_filename": result["original_filename"],
-                "delivery_filename": result["delivery_filename"],
-                "file_size": result["file_size"],
-                "compressed": result["compressed"],
-                "original_file_size": result["original_file_size"],
-                "mime_type": result["mime_type"],
-            })
-            if result["compressed"]:
-                compressed_count += 1
-
-    if rows:
-        try:
-            supabase.table("delivery_files").insert(rows).execute()
-        except Exception as e:
-            logger.exception("delivery_files insert failed: %s", e)
-            raise HTTPException(status_code=500, detail="납품 파일 저장 실패") from e
-
-    return {
-        "uploaded": len(rows),
-        "compressed": compressed_count,
-        "rejected": rejected,
-    }
