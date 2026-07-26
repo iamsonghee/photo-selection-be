@@ -28,6 +28,7 @@ register_heif_opener()
 
 from app.database import get_supabase
 from app.dependencies import get_current_photographer
+from app.beta_policy import get_max_photos_per_project
 from app.storage import (
     delete_r2_objects,
     generate_presigned_put_url,
@@ -64,8 +65,7 @@ VERSION_THUMB_JPEG_QUALITY = 75
 PROFILE_MAX_SIZE = 400
 PROFILE_JPEG_QUALITY = 85
 
-# 베타 제한
-BETA_MAX_PHOTOS_PER_PROJECT = 2000
+# 베타 제한 (프로젝트당 사진 수는 등급별로 다름 — app/beta_policy.py 참고)
 BETA_MAX_REVISION_COUNT = 2
 
 
@@ -439,23 +439,34 @@ async def upload_photos(
         logger.exception("photo count check failed: %s", e)
         raise HTTPException(status_code=500, detail="사진 수 확인 실패") from e
 
-    # 베타 제한: 사진 수 체크
-    if current_count >= BETA_MAX_PHOTOS_PER_PROJECT:
+    # 등급별 업로드 한도 체크 (관리자는 None=무제한)
+    max_photos = get_max_photos_per_project(supabase, photographer_id)
+    if max_photos is not None and current_count >= max_photos:
+        try:
+            supabase.table("admin_audit_logs").insert({
+                "photographer_id": str(photographer_id),
+                "actor": "system",
+                "action": "photo_limit_hit",
+                "detail": {"project_id": project_id, "current": current_count, "max": max_photos},
+            }).execute()
+        except Exception:
+            logger.exception("admin_audit_logs insert failed (photo_limit_hit)")
         raise HTTPException(
             status_code=403,
             detail={
                 "error": "beta_limit_exceeded",
                 "limit_type": "photos_per_project",
                 "current": current_count,
-                "max": BETA_MAX_PHOTOS_PER_PROJECT,
-                "message": f"베타 기간 중 프로젝트당 최대 {BETA_MAX_PHOTOS_PER_PROJECT}장까지 업로드할 수 있습니다.",
+                "max": max_photos,
+                "message": f"프로젝트당 최대 {max_photos}장까지 업로드할 수 있습니다.",
             },
         )
 
-    # 부분 초과 시 가능한 만큼만
-    remaining = BETA_MAX_PHOTOS_PER_PROJECT - current_count
-    if len(valid) > remaining:
-        valid = valid[:remaining]
+    # 부분 초과 시 가능한 만큼만(무제한이면 제한 없음)
+    if max_photos is not None:
+        remaining = max_photos - current_count
+        if len(valid) > remaining:
+            valid = valid[:remaining]
 
     loop = asyncio.get_event_loop()
     effective_concurrency = UPLOAD_WITH_ORIGINAL_CONCURRENCY if include_original else UPLOAD_PHOTOS_CONCURRENCY

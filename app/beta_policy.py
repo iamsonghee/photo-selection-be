@@ -1,23 +1,52 @@
 """
 클로즈드 베타 사용자 등급(관리자/베타/일반) 판정 및 이용량 한도.
 
-정책 상수의 단일 소스는 런타임(Node/Python)별로 하나씩이다 — 두 서비스가 별도 배포라
-코드 레벨로 공유할 방법이 없다. FE 쪽 단일 소스는 photo-selection-fe/src/lib/beta-limits.ts +
-src/lib/beta-policy.ts이고, 이 파일이 BE 쪽 단일 소스다. 두 파일의 값은 서로 동일하게 유지해야 한다.
+실제 유효 한도 값은 Supabase `app_settings` 테이블(id=1, 싱글턴)에서 조회한다 —
+FE의 /admin/settings에서 관리자가 값을 바꾸면 재배포 없이 즉시 반영된다.
+아래 DEFAULT_* 상수는 그 테이블 조회가 실패했을 때만 쓰는 폴백 값이다.
 
-ADMIN_EMAILS는 photo-selection-fe/src/lib/admin-auth.ts의 ADMIN_EMAILS와 반드시 같은 값을 유지할 것.
+ADMIN_EMAILS는 photo-selection-fe/src/lib/admin-emails.ts의 ADMIN_EMAILS와 반드시 같은 값을 유지할 것
+(이 값은 이번 설정 실시간화 범위에서 제외 — 여전히 하드코딩 유지).
 """
 from datetime import date
 from typing import Optional
 from uuid import UUID
 
-ADMIN_EMAILS = ["realsong88@gmail.com"]
+ADMIN_EMAILS = ["realsong88@gmail.com", "hilee6461@gmail.com"]
 
-# 베타 사용자 기본 한도(override 없음, 전원 동일)
-BETA_MAX_PHOTOS_PER_PROJECT = 2000
+# 베타 사용자 기본 한도(override 없음, 전원 동일) — app_settings 조회 실패 시 폴백
+DEFAULT_BETA_MAX_PHOTOS_PER_PROJECT = 2000
 
-# 일반(Trial) 사용자 한도
-GENERAL_MAX_PHOTOS_PER_PROJECT = 500
+# 일반(Trial) 사용자 한도 — app_settings 조회 실패 시 폴백
+DEFAULT_GENERAL_MAX_PHOTOS_PER_PROJECT = 500
+
+
+def _get_settings(supabase) -> dict:
+    """app_settings(id=1) 조회. 실패/행 없음이면 DEFAULT_* 값으로 조립해 반환(절대 raise하지 않음)."""
+    try:
+        r = (
+            supabase.table("app_settings")
+            .select("general_max_photos_per_project, beta_max_photos_per_project")
+            .eq("id", 1)
+            .limit(1)
+            .execute()
+        )
+        if r.data:
+            row = r.data[0]
+            return {
+                "general_max_photos_per_project": row.get(
+                    "general_max_photos_per_project", DEFAULT_GENERAL_MAX_PHOTOS_PER_PROJECT
+                ),
+                "beta_max_photos_per_project": row.get(
+                    "beta_max_photos_per_project", DEFAULT_BETA_MAX_PHOTOS_PER_PROJECT
+                ),
+            }
+    except Exception:
+        pass
+    return {
+        "general_max_photos_per_project": DEFAULT_GENERAL_MAX_PHOTOS_PER_PROJECT,
+        "beta_max_photos_per_project": DEFAULT_BETA_MAX_PHOTOS_PER_PROJECT,
+    }
 
 
 def _is_beta_active(beta_status: Optional[str], beta_end_date: Optional[str]) -> bool:
@@ -41,9 +70,11 @@ def get_max_photos_per_project(supabase, photographer_id: UUID) -> Optional[int]
         .limit(1)
         .execute()
     )
+    settings = _get_settings(supabase)
+
     if not r.data:
         # 조회 실패 시 가장 보수적인(일반 사용자) 한도로 폴백
-        return GENERAL_MAX_PHOTOS_PER_PROJECT
+        return settings["general_max_photos_per_project"]
 
     row = r.data[0]
     email = row.get("email")
@@ -51,6 +82,6 @@ def get_max_photos_per_project(supabase, photographer_id: UUID) -> Optional[int]
         return None
 
     if _is_beta_active(row.get("beta_status"), row.get("beta_end_date")):
-        return BETA_MAX_PHOTOS_PER_PROJECT
+        return settings["beta_max_photos_per_project"]
 
-    return GENERAL_MAX_PHOTOS_PER_PROJECT
+    return settings["general_max_photos_per_project"]
