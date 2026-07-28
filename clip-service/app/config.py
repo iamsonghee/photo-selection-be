@@ -71,3 +71,18 @@ GEMINI_TIMEOUT_SECONDS = _env_float("GEMINI_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
 # 이미지 1장당 표준 가격(USD). 배치 API(50% 할인)는 POC 범위 밖 — 실제 값은 변경될 수 있으므로
 # 이 한 곳에서만 관리하고 코드 곳곳에 하드코딩하지 않는다.
 GEMINI_IMAGE_PRICE_USD = _env_float("GEMINI_IMAGE_PRICE_USD", 0.00012, 0.0, 1.0)
+
+# ── Gemini Flash 품질 판정 POC (Embedding과도 완전히 독립, GEMINI_API_KEY만 공유) ──────
+# 2026-10-16 종료 예정인 2.5 계열은 피하고 현재 GA인 3.5 계열 중 가장 비용 효율적인 모델 채택.
+# 필요 시 코드 변경 없이 gemini-3.5-flash 등으로 교체 가능하도록 env로 분리.
+GEMINI_FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", "gemini-3.5-flash-lite")
+# 프롬프트/판정 기준이 바뀌면 이 값을 올린다 — gemini_quality_assessments의 UNIQUE 키에 포함되어
+# 기존 버전 결과를 덮어쓰지 않고 새 버전으로 나란히 쌓이게 한다.
+GEMINI_QUALITY_PROMPT_VERSION = os.getenv("GEMINI_QUALITY_PROMPT_VERSION", "v1")
+GEMINI_QUALITY_CONCURRENCY = _env_int("GEMINI_QUALITY_CONCURRENCY", 4, 1, 16)
+GEMINI_QUALITY_MAX_RETRIES = _env_int("GEMINI_QUALITY_MAX_RETRIES", 2, 0, 5)
+GEMINI_QUALITY_TIMEOUT_SECONDS = _env_float("GEMINI_QUALITY_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
+# gemini-3.5-flash-lite 표준가(1M 토큰당 USD). 실제 비용은 usage_metadata 실사용량으로 계산하므로
+# 이 값은 참고용 단가일 뿐이며, 한 곳에서만 관리해 코드 곳곳에 하드코딩하지 않는다.
+GEMINI_FLASH_INPUT_PRICE_PER_1M = _env_float("GEMINI_FLASH_INPUT_PRICE_PER_1M", 0.30, 0.0, 100.0)
+GEMINI_FLASH_OUTPUT_PRICE_PER_1M = _env_float("GEMINI_FLASH_OUTPUT_PRICE_PER_1M", 2.50, 0.0, 100.0)

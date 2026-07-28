@@ -31,7 +31,7 @@ class GeminiNotConfigured(Exception):
     pass
 
 
-async def _get_client() -> genai.Client:
+async def get_client() -> genai.Client:
     global _client
     if _client is not None:
         return _client
@@ -94,7 +94,7 @@ async def embed_images(
 ) -> tuple[List[Optional[np.ndarray]], List[dict]]:
     """순서를 보존하며 이미지별 임베딩 계산. 다운로드 실패(None) 또는 임베딩 실패 항목은 None.
     반환: (임베딩 리스트, 실제 usage_metadata 수집분 리스트)."""
-    client = await _get_client()
+    client = await get_client()
     sem = asyncio.Semaphore(GEMINI_CONCURRENCY)
     usages: List[dict] = []
 

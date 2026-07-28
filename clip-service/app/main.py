@@ -10,12 +10,14 @@ from datetime import datetime, timezone
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app import analyzer, gemini_analyzer, matcher, state
-from app import gemini_state
+from app import analyzer, gemini_analyzer, gemini_quality_analyzer, matcher, state
+from app import gemini_state, gemini_quality_state
 from app.auth import verify_internal_token
 from app.config import (
     GEMINI_EMBEDDING_DIMENSION,
     GEMINI_EMBEDDING_MODEL,
+    GEMINI_FLASH_MODEL,
+    GEMINI_QUALITY_PROMPT_VERSION,
     GEMINI_SIMILARITY_THRESHOLD,
 )
 from app.db import get_supabase
@@ -36,6 +38,12 @@ class AnalyzeGeminiRequest(BaseModel):
     project_id: str
     limit: int | None = None  # number 순 앞 N장만 분석 (POC 비용 통제용, 예: 50/100)
     force: bool = False  # True면 이미 저장된 임베딩도 재계산
+
+
+class AnalyzeGeminiQualityRequest(BaseModel):
+    project_id: str
+    limit: int | None = None
+    force: bool = False  # True면 이미 저장된 같은 model+prompt_version 판정도 재계산
 
 
 class MatchRetouchResult(BaseModel):
@@ -248,3 +256,96 @@ def analyze_gemini_groups(project_id: str, threshold: float = GEMINI_SIMILARITY_
     if result["analyzed_count"] == 0:
         raise HTTPException(status_code=400, detail="No completed Gemini analysis found for this project")
     return result
+
+
+# ── Gemini Flash 품질 판정 POC — Gemini Embedding과도 완전히 독립된 별도 엔드포인트 ──────
+# 트리거/취소/재사용은 Embedding 분석과 별개로 동작한다(둘 중 하나만 실행하거나 순서 무관하게 조합 가능).
+# 결과는 위 /analyze/gemini/{project_id}/groups 응답에 quality_by_photo/recommended_photo_id로 결합된다.
+
+
+def _latest_gemini_quality_run(supabase, project_id: str) -> dict | None:
+    r = (
+        supabase.table("gemini_quality_runs")
+        .select("*")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return (r.data or [None])[0]
+
+
+@app.post("/analyze/gemini/quality", status_code=202, dependencies=[Depends(verify_internal_token)])
+def analyze_gemini_quality(req: AnalyzeGeminiQualityRequest, background_tasks: BackgroundTasks):
+    project_id = req.project_id
+    supabase = get_supabase()
+
+    project_r = supabase.table("projects").select("id").eq("id", project_id).limit(1).execute()
+    if not project_r.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    latest = _latest_gemini_quality_run(supabase, project_id)
+    if (latest and latest.get("status") == "processing") or gemini_quality_state.is_in_flight(project_id):
+        raise HTTPException(status_code=409, detail="Gemini quality analysis already in progress")
+
+    if not gemini_quality_state.try_start(project_id):
+        raise HTTPException(status_code=409, detail="Gemini quality analysis already in progress")
+
+    run_r = (
+        supabase.table("gemini_quality_runs")
+        .insert(
+            {
+                "project_id": project_id,
+                "status": "processing",
+                "requested_image_limit": req.limit,
+                "model": GEMINI_FLASH_MODEL,
+                "prompt_version": GEMINI_QUALITY_PROMPT_VERSION,
+            }
+        )
+        .execute()
+    )
+    run_id = run_r.data[0]["id"]
+
+    background_tasks.add_task(gemini_quality_analyzer.run, run_id, project_id, req.limit, req.force)
+    return {"status": "processing", "run_id": run_id}
+
+
+@app.delete(
+    "/analyze/gemini/quality/{project_id}", status_code=200, dependencies=[Depends(verify_internal_token)]
+)
+def cancel_analyze_gemini_quality(project_id: str):
+    supabase = get_supabase()
+    latest = _latest_gemini_quality_run(supabase, project_id)
+    if not latest:
+        raise HTTPException(status_code=404, detail="No Gemini quality analysis run found")
+
+    if gemini_quality_state.is_in_flight(project_id):
+        gemini_quality_state.request_cancel(project_id)
+
+    if latest["status"] == "processing":
+        (
+            supabase.table("gemini_quality_runs")
+            .update(
+                {
+                    "status": "failed",
+                    "error": "cancelled",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            .eq("id", latest["id"])
+            .execute()
+        )
+    return {"status": "cancelled"}
+
+
+@app.get("/analyze/gemini/quality/{project_id}/status", dependencies=[Depends(verify_internal_token)])
+def analyze_gemini_quality_status(project_id: str):
+    supabase = get_supabase()
+    project_r = supabase.table("projects").select("id").eq("id", project_id).limit(1).execute()
+    if not project_r.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    latest = _latest_gemini_quality_run(supabase, project_id)
+    if not latest:
+        return {"gemini_quality_status": None}
+    return {"gemini_quality_status": latest["status"], "run": latest}
