@@ -220,17 +220,31 @@ def compute_groups(supabase, project_id: str, threshold: float) -> dict:
     for members in raw_groups:
         photo_id_list = [ordered[i][0] for i in members]
         vectors = [embeddings[i] for i in members]
+        rep_idx = _medoid_index(vectors)
         groups.append(
             {
                 "photo_ids": photo_id_list,
-                # POC 범위에서는 화질 기반 대표컷 선정을 하지 않음 — number 순 첫 사진을 대표로 표시
-                "representative_photo_id": photo_id_list[0],
+                "representative_photo_id": photo_id_list[rep_idx],
                 "photo_count": len(photo_id_list),
                 "avg_similarity": _avg_pairwise_similarity(vectors),
             }
         )
 
     return {"groups": groups, "analyzed_count": len(emb_map), "threshold": threshold}
+
+
+def _medoid_index(vectors: list[np.ndarray]) -> int:
+    """그룹 내에서 다른 이미지들과 평균 유사도가 가장 높은 이미지(medoid)의 인덱스.
+    미적 평가가 아니라 임베딩상 그룹을 가장 잘 대표하는 실제 이미지를 고르는 순수 통계적 선택.
+    동점이면 np.argmax가 가장 앞선(= number 순 가장 이른) 인덱스를 반환해 결과가 항상 안정적이다."""
+    n = len(vectors)
+    if n == 1:
+        return 0
+    mat = np.stack(vectors)  # (n, d), 이미 L2-정규화된 벡터
+    sim = mat @ mat.T  # (n, n) 코사인 유사도 행렬
+    np.fill_diagonal(sim, 0.0)
+    avg_sim = sim.sum(axis=1) / (n - 1)
+    return int(np.argmax(avg_sim))
 
 
 def _avg_pairwise_similarity(vectors) -> float:
