@@ -55,3 +55,18 @@ BLUR_VARIANCE_THRESHOLD = _env_float("BLUR_VARIANCE_THRESHOLD", 80.0, 0.0, 10000
 EYE_AR_THRESHOLD = _env_float("EYE_AR_THRESHOLD", 0.21, 0.05, 0.5)
 
 POSTGREST_TIMEOUT = 15
+
+# ── Gemini Embedding POC (OpenCLIP 파이프라인과 완전히 독립) ──────────────────
+# 서버 전용 키. 프론트엔드에는 절대 노출되지 않는다(clip-service는 내부망/서버간 호출만 받음).
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
+# 128~3072 가변(Matryoshka). 차원별 가격 차이가 없어 기본값은 최대 품질인 3072.
+GEMINI_EMBEDDING_DIMENSION = _env_int("GEMINI_EMBEDDING_DIMENSION", 3072, 128, 3072)
+# OpenCLIP(0.92)과 점수 분포가 다르므로 그대로 쓰지 않는다 — 초기값일 뿐, UI에서 재계산하며 조정.
+GEMINI_SIMILARITY_THRESHOLD = _env_float("GEMINI_SIMILARITY_THRESHOLD", 0.80, 0.5, 0.999)
+GEMINI_CONCURRENCY = _env_int("GEMINI_CONCURRENCY", 4, 1, 16)
+GEMINI_MAX_RETRIES = _env_int("GEMINI_MAX_RETRIES", 2, 0, 5)
+GEMINI_TIMEOUT_SECONDS = _env_float("GEMINI_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
+# 이미지 1장당 표준 가격(USD). 배치 API(50% 할인)는 POC 범위 밖 — 실제 값은 변경될 수 있으므로
+# 이 한 곳에서만 관리하고 코드 곳곳에 하드코딩하지 않는다.
+GEMINI_IMAGE_PRICE_USD = _env_float("GEMINI_IMAGE_PRICE_USD", 0.00012, 0.0, 1.0)
