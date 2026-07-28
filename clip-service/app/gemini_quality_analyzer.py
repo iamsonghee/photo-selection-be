@@ -24,10 +24,23 @@ from app.db import get_supabase
 from app.downloader import download_all
 from app.gemini_client import GeminiNotConfigured
 from app.gemini_quality_client import assess_images
-from app.gemini_quality_store import get_existing_photo_ids, persist_assessments
+from app.gemini_quality_store import (
+    fetch_quality_by_photo_id,
+    get_existing_photo_ids,
+    persist_assessments,
+)
 from app.memlog import log_perf, log_rss
 
 logger = logging.getLogger(__name__)
+
+# gemini_analyzer.py의 _QUALITY_AXES/_has_signal과 동일 개념 — 그룹 추천 로직과 별개로 이 모듈만
+# 단독으로 써도 되게 여기 다시 둔다(모듈 간 상호 의존을 만들지 않기 위한 의도적 소규모 중복).
+_QUALITY_AXES = ("eyes_closed", "blur_or_shake", "focus_issue", "face_occluded")
+
+
+def _has_signal(q: dict) -> bool:
+    """4축이 전부 UNKNOWN이면 실질적으로 판정된 게 없는 것 — "이상 없음"과 구분해야 한다."""
+    return any(q.get(axis) != "unknown" for axis in _QUALITY_AXES)
 
 # OpenCLIP/Gemini Embedding과는 별개의 동시성 한도 — 서로의 가드를 공유하지 않는다.
 _project_semaphore = asyncio.Semaphore(2)
@@ -216,3 +229,66 @@ def _finish_run(
         .eq("id", run_id)
         .execute()
     )
+
+
+def compute_quality_overview(supabase, project_id: str) -> dict:
+    """프로젝트 전체 사진(유사컷 그룹 소속 여부 무관)의 Flash 품질 판정을 조회 — Gemini API를
+    다시 호출하지 않고 저장된 gemini_quality_assessments만 읽는다. 그룹 API(`gemini_analyzer.py`의
+    `compute_groups`)는 union-find로 묶인(2장 이상) 사진만 대상으로 하지만, Flash 자체는 그룹과
+    무관하게 프로젝트 전체를 분석하므로 싱글톤(그룹 미형성) 사진의 결과도 이 함수로 확인할 수 있다.
+    분석이 없거나 4축 전부 UNKNOWN인 사진은 "품질 분석 실패 또는 미분석"으로만 표시되며
+    "이상 없음(clean)"으로 나오지 않는다."""
+    photos_r = (
+        supabase.table("photos")
+        .select("id, number, is_blurry, face_detected, eyes_closed")
+        .eq("project_id", project_id)
+        .order("number")
+        .execute()
+    )
+    rows = photos_r.data or []
+    photo_ids = [r["id"] for r in rows]
+    quality_map = (
+        fetch_quality_by_photo_id(
+            supabase, project_id, GEMINI_FLASH_MODEL, GEMINI_QUALITY_PROMPT_VERSION, photo_ids
+        )
+        if photo_ids
+        else {}
+    )
+
+    photos_out = []
+    quality_analyzed_count = 0
+    for r in rows:
+        pid = r["id"]
+        q = quality_map.get(pid)
+        has_signal = bool(q) and _has_signal(q)
+        if q:
+            quality_analyzed_count += 1
+        photos_out.append(
+            {
+                "photo_id": pid,
+                "gemini": (
+                    {
+                        "eyes_closed": q.get("eyes_closed"),
+                        "blur_or_shake": q.get("blur_or_shake"),
+                        "focus_issue": q.get("focus_issue"),
+                        "face_occluded": q.get("face_occluded"),
+                        "model": GEMINI_FLASH_MODEL,
+                        "prompt_version": GEMINI_QUALITY_PROMPT_VERSION,
+                    }
+                    if q
+                    else None
+                ),
+                "legacy": {
+                    "is_blurry": r.get("is_blurry"),
+                    "face_detected": r.get("face_detected"),
+                    "eyes_closed": r.get("eyes_closed"),
+                },
+                "has_signal": has_signal,
+            }
+        )
+
+    return {
+        "photos": photos_out,
+        "total_count": len(rows),
+        "quality_analyzed_count": quality_analyzed_count,
+    }

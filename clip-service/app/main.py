@@ -349,3 +349,14 @@ def analyze_gemini_quality_status(project_id: str):
     if not latest:
         return {"gemini_quality_status": None}
     return {"gemini_quality_status": latest["status"], "run": latest}
+
+
+@app.get("/analyze/gemini/quality/{project_id}/overview", dependencies=[Depends(verify_internal_token)])
+def analyze_gemini_quality_overview(project_id: str):
+    """유사컷 그룹 소속 여부와 무관하게 프로젝트 전체 사진의 Flash 품질 판정을 조회.
+    Gemini API 재호출 없음(gemini_quality_assessments만 읽음)."""
+    supabase = get_supabase()
+    project_r = supabase.table("projects").select("id").eq("id", project_id).limit(1).execute()
+    if not project_r.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return gemini_quality_analyzer.compute_quality_overview(supabase, project_id)
