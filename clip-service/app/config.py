@@ -71,6 +71,12 @@ GEMINI_TIMEOUT_SECONDS = _env_float("GEMINI_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
 # 이미지 1장당 표준 가격(USD). 배치 API(50% 할인)는 POC 범위 밖 — 실제 값은 변경될 수 있으므로
 # 이 한 곳에서만 관리하고 코드 곳곳에 하드코딩하지 않는다.
 GEMINI_IMAGE_PRICE_USD = _env_float("GEMINI_IMAGE_PRICE_USD", 0.00012, 0.0, 1.0)
+# 입력 전처리(예: 어떤 R2 파일을 쓰는지, 리사이즈 방식)가 바뀌면 이 값을 올린다 — dimension과
+# 함께 gemini_embeddings 캐시 판별에 쓰여, 설정이 바뀐 임베딩을 예전 것과 구분한다.
+GEMINI_EMBEDDING_VERSION = os.getenv("GEMINI_EMBEDDING_VERSION", "v1")
+# r2_thumb_url에서 순수 R2 object key를 추출하기 위한 접두사(읽기 전용, R2 자격증명 아님).
+# 베타 캐시 판별을 URL 문자열이 아니라 안정적인 객체 key 기준으로 하기 위한 용도일 뿐이다.
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 
 # ── Gemini Flash 품질 판정 POC (Embedding과도 완전히 독립, GEMINI_API_KEY만 공유) ──────
 # 2026-10-16 종료 예정인 2.5 계열은 피하고 현재 GA인 3.5 계열 중 가장 비용 효율적인 모델 채택.

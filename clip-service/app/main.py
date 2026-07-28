@@ -244,18 +244,37 @@ def analyze_gemini_status(project_id: str):
         raise HTTPException(status_code=404, detail="Project not found")
 
     latest = _latest_gemini_run(supabase, project_id)
+    pending = gemini_analyzer.count_pending(supabase, project_id)
     if not latest:
-        return {"gemini_analysis_status": None}
-    return {"gemini_analysis_status": latest["status"], "run": latest}
+        return {"gemini_analysis_status": None, **pending}
+    return {"gemini_analysis_status": latest["status"], "run": latest, **pending}
 
 
 @app.get("/analyze/gemini/{project_id}/groups", dependencies=[Depends(verify_internal_token)])
-def analyze_gemini_groups(project_id: str, threshold: float = GEMINI_SIMILARITY_THRESHOLD):
+def analyze_gemini_groups(
+    project_id: str, threshold: float = GEMINI_SIMILARITY_THRESHOLD, include_quality: bool = False
+):
     supabase = get_supabase()
-    result = gemini_analyzer.compute_groups(supabase, project_id, threshold)
+    result = gemini_analyzer.compute_groups(supabase, project_id, threshold, include_quality=include_quality)
     if result["analyzed_count"] == 0:
         raise HTTPException(status_code=400, detail="No completed Gemini analysis found for this project")
     return result
+
+
+@app.post(
+    "/analyze/gemini/{project_id}/sync-groups", status_code=200,
+    dependencies=[Depends(verify_internal_token)],
+)
+def sync_analyze_gemini_groups(project_id: str):
+    """사진 삭제 등으로 photo_groups/similarity_group_id가 최신 상태와 어긋났을 수 있을 때
+    Gemini API 재호출 없이 저장된 임베딩만으로 다시 동기화한다(베타 기본 threshold 고정,
+    품질 미반영). Gemini를 쓴 적 없는 프로젝트면 아무것도 하지 않는다(안전장치)."""
+    supabase = get_supabase()
+    project_r = supabase.table("projects").select("id").eq("id", project_id).limit(1).execute()
+    if not project_r.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    gemini_analyzer.sync_groups_to_db(supabase, project_id, GEMINI_SIMILARITY_THRESHOLD)
+    return {"status": "ok"}
 
 
 # ── Gemini Flash 품질 판정 POC — Gemini Embedding과도 완전히 독립된 별도 엔드포인트 ──────

@@ -17,16 +17,19 @@ from app import gemini_state as state
 from app.config import (
     GEMINI_EMBEDDING_DIMENSION,
     GEMINI_EMBEDDING_MODEL,
+    GEMINI_EMBEDDING_VERSION,
     GEMINI_FLASH_MODEL,
     GEMINI_IMAGE_PRICE_USD,
     GEMINI_QUALITY_PROMPT_VERSION,
+    GEMINI_SIMILARITY_THRESHOLD,
 )
 from app.db import get_supabase
 from app.downloader import download_all
 from app.gemini_client import GeminiNotConfigured, embed_images
 from app.gemini_embeddings_store import (
+    extract_object_key,
     fetch_embeddings_by_photo_id,
-    get_existing_photo_ids,
+    get_cached_photo_ids,
     persist_embeddings,
 )
 from app.gemini_quality_store import fetch_quality_by_photo_id
@@ -54,6 +57,10 @@ async def run(run_id: str, project_id: str, limit: Optional[int], force: bool) -
         t_pipe = time.perf_counter()
         try:
             await _run_pipeline(supabase, run_id, project_id, limit, force, t_pipe)
+            # 베타 화면(작가 그리드)과 고객 갤러리가 모두 읽는 photo_groups/similarity_group_id를
+            # 항상 베타 기본 threshold로 최신화한다 — 관리자 POC의 threshold 슬라이더 실험과는
+            # 무관(그쪽은 compute_groups()를 직접 호출할 뿐 여기로 쓰지 않는다).
+            sync_groups_to_db(supabase, project_id, GEMINI_SIMILARITY_THRESHOLD)
         except _Cancelled:
             logger.info("gemini analysis cancelled project_id=%s run_id=%s", project_id, run_id)
             (
@@ -105,12 +112,17 @@ async def _run_pipeline(
         _finish_run(supabase, run_id, image_count=len(rows), processed=0, failed=0, cost=0.0, t_pipe=t_pipe)
         return
 
-    photo_ids_all = [r["id"] for r in rows]
+    photo_id_to_key = {r["id"]: extract_object_key(r.get("r2_thumb_url")) for r in rows}
 
-    # 동일 이미지에 대한 불필요한 중복 호출 방지 — force가 아니면 이미 저장된 임베딩은 재사용
+    # 동일 이미지에 대한 불필요한 중복 호출 방지 — force가 아니면 이미 저장된 임베딩은 재사용.
+    # model+dimension+embedding_version이 전부 일치하고(설정 변경 시 자동으로 재분석 대상이 됨),
+    # object key까지 확인 가능하면 실제 파일이 같은지도 함께 검증한다.
     already: set[str] = set()
     if not force:
-        already = get_existing_photo_ids(supabase, project_id, GEMINI_EMBEDDING_MODEL, photo_ids_all)
+        already = get_cached_photo_ids(
+            supabase, project_id, GEMINI_EMBEDDING_MODEL, GEMINI_EMBEDDING_DIMENSION,
+            GEMINI_EMBEDDING_VERSION, photo_id_to_key,
+        )
     target_rows = [r for r in rows if r["id"] not in already]
 
     if state.is_cancel_requested(project_id):
@@ -153,7 +165,11 @@ async def _run_pipeline(
         t = time.perf_counter()
         e_ok, e_fail, _ = persist_embeddings(
             supabase, project_id, GEMINI_EMBEDDING_MODEL, GEMINI_EMBEDDING_DIMENSION,
-            list(zip([r["id"] for r in target_rows], embeddings)),
+            GEMINI_EMBEDDING_VERSION,
+            [
+                (r["id"], vec, photo_id_to_key.get(r["id"]))
+                for r, vec in zip(target_rows, embeddings)
+            ],
         )
         log_perf(
             "gemini_db_done", elapsed_sec=time.perf_counter() - t,
@@ -199,14 +215,18 @@ def _finish_run(
     )
 
 
-def compute_groups(supabase, project_id: str, threshold: float) -> dict:
+def compute_groups(supabase, project_id: str, threshold: float, include_quality: bool = False) -> dict:
     """저장된 임베딩으로 그룹핑만 재계산 — Gemini API를 다시 호출하지 않는다.
     threshold를 바꿔가며 여러 번 호출해도 추가 비용이 발생하지 않는다.
 
-    그룹핑이 끝난 뒤 저장된 Gemini Flash 품질 판정(있으면)을 곁들여 품질 반영 추천 이미지
-    (recommended_photo_id)를 함께 계산한다 — 이 결합도 순수 조회+계산이라 Flash API를 호출하지
-    않으며, 품질 분석이 아직 없으면 recommended_photo_id는 기존 대표 이미지(representative_photo_id,
-    medoid)와 동일하게 나와 이전과 동일하게 동작한다(회귀 없음)."""
+    include_quality=True일 때만 저장된 Gemini Flash 품질 판정을 곁들여 품질 반영 추천 이미지
+    (recommended_photo_id)를 계산한다 — 이 결합도 순수 조회+계산이라 Flash API를 호출하지 않는다.
+    기본값 False: 베타 경로(작가 화면/고객 갤러리에 반영되는 sync_groups_to_db 등)는 이 값을 넘기지
+    않아 품질 데이터를 아예 조회하지 않으며, recommended_photo_id는 항상 medoid 대표 이미지
+    (representative_photo_id)와 동일하게 나온다 — "품질 분석 결과를 대표 이미지 선정에 반영하지
+    않는다"는 베타 요구사항을 코드 구조로 보장한다. 관리자 POC(GeminiAnalysisPanel)만
+    include_quality=True를 명시적으로 넘기며, 그 경로는 Next.js 프록시 라우트의 isAdminEmail
+    세션 검증을 통과해야만 도달 가능하다(clip-service 자체는 사용자 신원 개념이 없음)."""
     photos_r = (
         supabase.table("photos")
         .select("id, number, is_blurry, face_detected, eyes_closed")
@@ -216,7 +236,10 @@ def compute_groups(supabase, project_id: str, threshold: float) -> dict:
     )
     rows = photos_r.data or []
     photo_ids = [r["id"] for r in rows]
-    emb_map = fetch_embeddings_by_photo_id(supabase, project_id, GEMINI_EMBEDDING_MODEL, photo_ids)
+    emb_map = fetch_embeddings_by_photo_id(
+        supabase, project_id, GEMINI_EMBEDDING_MODEL, GEMINI_EMBEDDING_DIMENSION,
+        GEMINI_EMBEDDING_VERSION, photo_ids,
+    )
     if not emb_map:
         return {"groups": [], "analyzed_count": 0, "quality_analyzed_count": 0, "threshold": threshold}
 
@@ -230,7 +253,7 @@ def compute_groups(supabase, project_id: str, threshold: float) -> dict:
         fetch_quality_by_photo_id(
             supabase, project_id, GEMINI_FLASH_MODEL, GEMINI_QUALITY_PROMPT_VERSION, grouped_photo_ids
         )
-        if grouped_photo_ids
+        if include_quality and grouped_photo_ids
         else {}
     )
 
@@ -409,3 +432,65 @@ def _recommend_with_quality(
         reason = "그룹 내 모든 이미지에 확인 항목이 있어 상대적으로 안정적인 이미지를 추천했습니다 · 확인 필요"
 
     return best_photo_id, tier, reason, quality_by_photo
+
+
+def count_pending(supabase, project_id: str) -> dict:
+    """베타 [AI 유사도 분석] 버튼의 상태 문구를 결정하기 위한 라이브 카운트.
+    현재 활성(=photos 테이블에 남아있는) 사진 중 현재 설정(model+dimension+version)으로
+    이미 분석된 수/대기 중인 수를 그 자리에서 계산한다 — Gemini API 호출 없음, 순수 조회."""
+    photos_r = (
+        supabase.table("photos")
+        .select("id, r2_thumb_url")
+        .eq("project_id", project_id)
+        .execute()
+    )
+    rows = [r for r in (photos_r.data or []) if r.get("r2_thumb_url")]
+    photo_id_to_key = {r["id"]: extract_object_key(r.get("r2_thumb_url")) for r in rows}
+    cached = get_cached_photo_ids(
+        supabase, project_id, GEMINI_EMBEDDING_MODEL, GEMINI_EMBEDDING_DIMENSION,
+        GEMINI_EMBEDDING_VERSION, photo_id_to_key,
+    )
+    active = len(rows)
+    return {
+        "active_photo_count": active,
+        "already_analyzed_count": len(cached),
+        "pending_count": active - len(cached),
+    }
+
+
+def sync_groups_to_db(supabase, project_id: str, threshold: float) -> None:
+    """작가 화면(업로드 그리드)과 고객 갤러리가 그대로 읽는 photo_groups/photos.similarity_group_id를
+    Gemini 그룹핑 결과로 최신화한다. OpenCLIP처럼 배치 경계를 넘나드는 증분 스티칭 없이, 저장된
+    임베딩으로 매번 전체를 다시 계산해(compute_groups, include_quality=False 고정) 통째로
+    교체하는 방식 — Gemini는 이 재계산이 가벼워 항상 정합적인 스냅샷을 유지할 수 있다.
+
+    이 프로젝트에 Gemini 임베딩이 하나도 없으면(OpenCLIP만 쓴 레거시 프로젝트) 아무것도 하지
+    않고 즉시 반환한다 — 실수로 OpenCLIP의 photo_groups를 지우지 않기 위한 안전장치."""
+    result = compute_groups(supabase, project_id, threshold, include_quality=False)
+    if result["analyzed_count"] == 0:
+        return
+
+    # 1) 이 프로젝트의 similarity_group_id를 전부 NULL — 과거 OpenCLIP 그룹이 섞이지 않게 한다.
+    supabase.table("photos").update({"similarity_group_id": None}).eq(
+        "project_id", project_id
+    ).execute()
+    # 2) 기존 photo_groups 행 전부 삭제 후
+    supabase.table("photo_groups").delete().eq("project_id", project_id).execute()
+    # 3) 계산된 그룹으로 다시 채운다.
+    for g in result["groups"]:
+        group_r = (
+            supabase.table("photo_groups")
+            .insert(
+                {
+                    "project_id": project_id,
+                    "representative_photo_id": g["representative_photo_id"],
+                    "photo_count": g["photo_count"],
+                    "avg_similarity": g["avg_similarity"],
+                }
+            )
+            .execute()
+        )
+        group_id = group_r.data[0]["id"]
+        supabase.table("photos").update({"similarity_group_id": group_id}).in_(
+            "id", g["photo_ids"]
+        ).execute()
