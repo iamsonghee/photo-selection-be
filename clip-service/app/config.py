@@ -62,8 +62,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
 # 128~3072 가변(Matryoshka). 차원별 가격 차이가 없어 기본값은 최대 품질인 3072.
 GEMINI_EMBEDDING_DIMENSION = _env_int("GEMINI_EMBEDDING_DIMENSION", 3072, 128, 3072)
-# OpenCLIP(0.92)과 점수 분포가 다르므로 그대로 쓰지 않는다 — 초기값일 뿐, UI에서 재계산하며 조정.
-GEMINI_SIMILARITY_THRESHOLD = _env_float("GEMINI_SIMILARITY_THRESHOLD", 0.80, 0.5, 0.999)
+# OpenCLIP(0.92)과 점수 분포가 다르므로 그대로 쓰지 않는다 — 실사용 테스트로 0.96에서 적당한
+# 그룹핑을 확인(2026-07-28). 초기값일 뿐, UI 슬라이더에서 API 재호출 없이 재조정 가능.
+GEMINI_SIMILARITY_THRESHOLD = _env_float("GEMINI_SIMILARITY_THRESHOLD", 0.96, 0.5, 0.999)
 GEMINI_CONCURRENCY = _env_int("GEMINI_CONCURRENCY", 4, 1, 16)
 GEMINI_MAX_RETRIES = _env_int("GEMINI_MAX_RETRIES", 2, 0, 5)
 GEMINI_TIMEOUT_SECONDS = _env_float("GEMINI_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
