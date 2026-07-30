@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app import analyzer, gemini_analyzer, gemini_quality_analyzer, matcher, state
+from app import analyzer, gemini_analyzer, gemini_matcher, gemini_quality_analyzer, state
 from app import gemini_state, gemini_quality_state
 from app.auth import verify_internal_token
 from app.config import (
@@ -50,7 +50,7 @@ class MatchRetouchResult(BaseModel):
     photo_id: str
     filename: str
     similarity: float
-    type: str  # "clip" | "clip_low"
+    type: str  # "gemini" | "gemini_low" (2026-07-30부터 OpenCLIP "clip"/"clip_low" 대체)
 
 
 class MatchRetouchResponse(BaseModel):
@@ -113,7 +113,7 @@ async def match_retouch(
 
     retouch_files = [(f.filename or f"file_{i}", await f.read()) for i, f in enumerate(files)]
     supabase = get_supabase()
-    matches = await matcher.match_retouch(supabase, project_id, pid_list, retouch_files)
+    matches = await gemini_matcher.match_retouch_gemini(supabase, project_id, pid_list, retouch_files)
     return MatchRetouchResponse(matches=[MatchRetouchResult(**m) for m in matches])
 
 

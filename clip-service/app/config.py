@@ -78,6 +78,15 @@ GEMINI_EMBEDDING_VERSION = os.getenv("GEMINI_EMBEDDING_VERSION", "v1")
 # 베타 캐시 판별을 URL 문자열이 아니라 안정적인 객체 key 기준으로 하기 위한 용도일 뿐이다.
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 
+# ── 보정본↔원본 매칭 (Gemini 임베딩, matcher.py의 OpenCLIP AUTO/LOW를 대체) ──────
+# GEMINI_SIMILARITY_THRESHOLD(그룹핑용, 같은 프레임 연속컷 판별)와는 별개 값 —
+# "같은 사진의 보정 전/후"는 픽셀이 크게 바뀌어도 동일 사진이라는 다른 판별 과제라
+# 실측(2026-07-30, wedding/lomography 실제 프로젝트 10쌍 + 합성 편집 20건)으로 별도 산정했다.
+# 실측 결과: AUTO=0.96에서 고신뢰 구간 오답 0건(11건 전부 정답), 기존 OpenCLIP 값 0.85/0.60을
+# 그대로 쓰면 연속컷 간 우연한 유사도(같은 프로젝트 내 최대 0.98)와 구분이 안 돼 위험함을 확인.
+GEMINI_MATCH_AUTO_THRESHOLD = _env_float("GEMINI_MATCH_AUTO_THRESHOLD", 0.96, 0.5, 0.999)
+GEMINI_MATCH_LOW_THRESHOLD = _env_float("GEMINI_MATCH_LOW_THRESHOLD", 0.85, 0.5, 0.999)
+
 # ── Gemini Flash 품질 판정 POC (Embedding과도 완전히 독립, GEMINI_API_KEY만 공유) ──────
 # 2026-10-16 종료 예정인 2.5 계열은 피하고 현재 GA인 3.5 계열 중 가장 비용 효율적인 모델 채택.
 # 필요 시 코드 변경 없이 gemini-3.5-flash 등으로 교체 가능하도록 env로 분리.
