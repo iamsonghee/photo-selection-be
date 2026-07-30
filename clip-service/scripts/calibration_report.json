@@ -1,0 +1,346 @@
+{
+  "positive_pairs": [
+    {
+      "project": "wedding",
+      "version_filename": "122A0309-보정.jpg",
+      "true_photo_filename": "122A0309.jpg",
+      "true_sim": 0.976,
+      "true_rank": 0,
+      "top1_photo_filename": "122A0309.jpg",
+      "top1_sim": 0.976,
+      "top1_is_correct": true,
+      "top1_top2_margin": 0.0193,
+      "pool_size": 20
+    },
+    {
+      "project": "wedding",
+      "version_filename": "122A0079-보정.jpg",
+      "true_photo_filename": "122A0079.jpg",
+      "true_sim": 0.9708,
+      "true_rank": 0,
+      "top1_photo_filename": "122A0079.jpg",
+      "top1_sim": 0.9708,
+      "top1_is_correct": true,
+      "top1_top2_margin": 0.095,
+      "pool_size": 20
+    },
+    {
+      "project": "wedding",
+      "version_filename": "122A9824-보정.jpg",
+      "true_photo_filename": "122A0031.jpg",
+      "true_sim": 0.8839,
+      "true_rank": 1,
+      "top1_photo_filename": "122A9876.jpg",
+      "top1_sim": 0.9375,
+      "top1_is_correct": false,
+      "top1_top2_margin": 0.0536,
+      "pool_size": 20
+    },
+    {
+      "project": "wedding",
+      "version_filename": "122A9876-보정.jpg",
+      "true_photo_filename": "122A9876.jpg",
+      "true_sim": 0.9601,
+      "true_rank": 0,
+      "top1_photo_filename": "122A9876.jpg",
+      "top1_sim": 0.9601,
+      "top1_is_correct": true,
+      "top1_top2_margin": 0.0726,
+      "pool_size": 20
+    },
+    {
+      "project": "lomography",
+      "version_filename": "v1",
+      "true_photo_filename": "img003.jpg",
+      "true_sim": 0.9685,
+      "true_rank": 0,
+      "top1_photo_filename": "img003.jpg",
+      "top1_sim": 0.9685,
+      "top1_is_correct": true,
+      "top1_top2_margin": 0.1196,
+      "pool_size": 8
+    },
+    {
+      "project": "lomography",
+      "version_filename": "v1",
+      "true_photo_filename": "img014.jpg",
+      "true_sim": 0.958,
+      "true_rank": 0,
+      "top1_photo_filename": "img014.jpg",
+      "top1_sim": 0.958,
+      "top1_is_correct": true,
+      "top1_top2_margin": 0.1206,
+      "pool_size": 8
+    },
+    {
+      "project": "lomography",
+      "version_filename": "v1",
+      "true_photo_filename": "img006.jpg",
+      "true_sim": 0.9573,
+      "true_rank": 0,
+      "top1_photo_filename": "img006.jpg",
+      "top1_sim": 0.9573,
+      "top1_is_correct": true,
+      "top1_top2_margin": 0.1544,
+      "pool_size": 8
+    },
+    {
+      "project": "lomography",
+      "version_filename": "v1",
+      "true_photo_filename": "img147.jpg",
+      "true_sim": 0.9664,
+      "true_rank": 0,
+      "top1_photo_filename": "img147.jpg",
+      "top1_sim": 0.9664,
+      "top1_is_correct": true,
+      "top1_top2_margin": 0.1042,
+      "pool_size": 8
+    },
+    {
+      "project": "lomography",
+      "version_filename": "v2",
+      "true_photo_filename": "img014.jpg",
+      "true_sim": 0.841,
+      "true_rank": 2,
+      "top1_photo_filename": "img013.jpg",
+      "top1_sim": 0.9638,
+      "top1_is_correct": false,
+      "top1_top2_margin": 0.1128,
+      "pool_size": 8
+    },
+    {
+      "project": "lomography",
+      "version_filename": "v2",
+      "true_photo_filename": "img147.jpg",
+      "true_sim": 0.8635,
+      "true_rank": 1,
+      "top1_photo_filename": "img148.jpg",
+      "top1_sim": 0.9812,
+      "top1_is_correct": false,
+      "top1_top2_margin": 0.1177,
+      "pool_size": 8
+    }
+  ],
+  "burst_cross_similarity": [
+    {
+      "project": "wedding",
+      "pair_count": 190,
+      "mean": 0.8001,
+      "p50": 0.7965,
+      "p90": 0.8892,
+      "p99": 0.951,
+      "max": 0.9801
+    },
+    {
+      "project": "lomography",
+      "pair_count": 28,
+      "mean": 0.7818,
+      "p50": 0.7819,
+      "p90": 0.8515,
+      "p99": 0.8624,
+      "max": 0.8631
+    }
+  ],
+  "synthetic_edits": [
+    {
+      "project": "wedding",
+      "edit_type": "strong_color_grade",
+      "true_photo_filename": "122A9513.jpg",
+      "true_sim": 0.9726,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9726,
+      "top1_top2_margin": 0.0383
+    },
+    {
+      "project": "wedding",
+      "edit_type": "grayscale",
+      "true_photo_filename": "122A9513.jpg",
+      "true_sim": 0.9365,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9365,
+      "top1_top2_margin": 0.0232
+    },
+    {
+      "project": "wedding",
+      "edit_type": "crop",
+      "true_photo_filename": "122A9513.jpg",
+      "true_sim": 0.9212,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9212,
+      "top1_top2_margin": 0.0117
+    },
+    {
+      "project": "wedding",
+      "edit_type": "skin_smooth_approx",
+      "true_photo_filename": "122A9513.jpg",
+      "true_sim": 0.7744,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.7744,
+      "top1_top2_margin": 0.0024
+    },
+    {
+      "project": "wedding",
+      "edit_type": "strong_color_grade",
+      "true_photo_filename": "122A9461.jpg",
+      "true_sim": 0.9691,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9691,
+      "top1_top2_margin": 0.0451
+    },
+    {
+      "project": "wedding",
+      "edit_type": "grayscale",
+      "true_photo_filename": "122A9461.jpg",
+      "true_sim": 0.9513,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9513,
+      "top1_top2_margin": 0.0525
+    },
+    {
+      "project": "wedding",
+      "edit_type": "crop",
+      "true_photo_filename": "122A9461.jpg",
+      "true_sim": 0.9217,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9217,
+      "top1_top2_margin": 0.0512
+    },
+    {
+      "project": "wedding",
+      "edit_type": "skin_smooth_approx",
+      "true_photo_filename": "122A9461.jpg",
+      "true_sim": 0.8917,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.8917,
+      "top1_top2_margin": 0.0351
+    },
+    {
+      "project": "wedding",
+      "edit_type": "strong_color_grade",
+      "true_photo_filename": "122A9876.jpg",
+      "true_sim": 0.9752,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9752,
+      "top1_top2_margin": 0.0917
+    },
+    {
+      "project": "wedding",
+      "edit_type": "grayscale",
+      "true_photo_filename": "122A9876.jpg",
+      "true_sim": 0.9535,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9535,
+      "top1_top2_margin": 0.0628
+    },
+    {
+      "project": "wedding",
+      "edit_type": "crop",
+      "true_photo_filename": "122A9876.jpg",
+      "true_sim": 0.9398,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9398,
+      "top1_top2_margin": 0.0445
+    },
+    {
+      "project": "wedding",
+      "edit_type": "skin_smooth_approx",
+      "true_photo_filename": "122A9876.jpg",
+      "true_sim": 0.8387,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.8387,
+      "top1_top2_margin": 0.0315
+    },
+    {
+      "project": "wedding",
+      "edit_type": "strong_color_grade",
+      "true_photo_filename": "122A9734.jpg",
+      "true_sim": 0.9715,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9715,
+      "top1_top2_margin": 0.0863
+    },
+    {
+      "project": "wedding",
+      "edit_type": "grayscale",
+      "true_photo_filename": "122A9734.jpg",
+      "true_sim": 0.9625,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9625,
+      "top1_top2_margin": 0.0916
+    },
+    {
+      "project": "wedding",
+      "edit_type": "crop",
+      "true_photo_filename": "122A9734.jpg",
+      "true_sim": 0.935,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.935,
+      "top1_top2_margin": 0.0695
+    },
+    {
+      "project": "wedding",
+      "edit_type": "skin_smooth_approx",
+      "true_photo_filename": "122A9734.jpg",
+      "true_sim": 0.8487,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.8487,
+      "top1_top2_margin": 0.0299
+    },
+    {
+      "project": "wedding",
+      "edit_type": "strong_color_grade",
+      "true_photo_filename": "122A9677.jpg",
+      "true_sim": 0.9654,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9654,
+      "top1_top2_margin": 0.1083
+    },
+    {
+      "project": "wedding",
+      "edit_type": "grayscale",
+      "true_photo_filename": "122A9677.jpg",
+      "true_sim": 0.9464,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9464,
+      "top1_top2_margin": 0.0793
+    },
+    {
+      "project": "wedding",
+      "edit_type": "crop",
+      "true_photo_filename": "122A9677.jpg",
+      "true_sim": 0.9437,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.9437,
+      "top1_top2_margin": 0.0836
+    },
+    {
+      "project": "wedding",
+      "edit_type": "skin_smooth_approx",
+      "true_photo_filename": "122A9677.jpg",
+      "true_sim": 0.8613,
+      "true_rank": 0,
+      "top1_is_correct": true,
+      "top1_sim": 0.8613,
+      "top1_top2_margin": 0.0181
+    }
+  ]
+}
