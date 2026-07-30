@@ -14,7 +14,7 @@ async def download_all(urls: List[str]) -> List[Optional[bytes]]:
     """순서를 보존하며 다운로드. 실패한 항목은 None."""
     sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
 
         async def _fetch(url: str) -> Optional[bytes]:
             async with sem:
