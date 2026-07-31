@@ -36,6 +36,7 @@ from app.storage import (
     head_r2_object_sync,
     upload_to_r2,
 )
+from app.archive import _maybe_enqueue_archive_build
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -378,7 +379,7 @@ async def upload_photos(
     # 프로젝트 소유 확인
     project_r = (
         supabase.table("projects")
-        .select("id")
+        .select("id, status")
         .eq("id", project_id)
         .eq("photographer_id", str(photographer_id))
         .limit(1)
@@ -386,6 +387,14 @@ async def upload_photos(
     )
     if not project_r.data or len(project_r.data) == 0:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # 초대 링크 활성화(preparing 이탈) 이후에는 납품용 원본 추가 업로드를 금지 —
+    # 이미 생성됐거나 생성 중인 아카이브와 실제 사진 구성이 어긋나는 것을 원천 차단한다.
+    if include_original and project_r.data[0].get("status") != "preparing":
+        raise HTTPException(
+            status_code=403,
+            detail="초대 링크 활성화 이후에는 납품용 원본을 추가할 수 없습니다.",
+        )
 
     # 허용된 파일만 읽음 (BUG-01: 거부 파일 목록 수집 / BUG-02: 소문자 정규화)
     valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, compressed_filename, file_size)
@@ -819,6 +828,9 @@ async def _process_original_job(job: dict) -> None:
             }).execute()
         except Exception as db_err:
             logger.exception("fail_original_job DB call failed: %s", db_err)
+        # 실패도 "전부 완료 또는 하나라도 실패" 판정에 영향을 주므로 재확인 트리거
+        # (failed가 하나라도 있으면 enqueue 조건 자체가 막으므로 안전하게 no-op됨)
+        _maybe_enqueue_archive_build(project_id)
 
     def _requeue(reason: str) -> None:
         backoff_minutes = 5 if attempts <= 1 else 30
@@ -862,7 +874,8 @@ async def _process_original_job(job: dict) -> None:
         gc.collect()
 
     rss_compress = _rss_mb()
-    logger.info("[worker] compressed job=%s final=%dB rss=%.1fMB", job_id, len(compressed), rss_compress)
+    compressed_size = len(compressed)
+    logger.info("[worker] compressed job=%s final=%dB rss=%.1fMB", job_id, compressed_size, rss_compress)
 
     # 3. 최종 파일 R2 업로드
     try:
@@ -900,6 +913,7 @@ async def _process_original_job(job: dict) -> None:
             "p_photo_id": photo_id,
             "p_r2_original_url": final_url or final_key,
             "p_completed_at": now_iso,
+            "p_file_size": compressed_size,
         }).execute()
     except Exception as e:
         logger.exception("complete_original_job DB failed for job %s: %s", job_id, e)
@@ -917,6 +931,9 @@ async def _process_original_job(job: dict) -> None:
         logger.info("[worker] deleted source key=%s", source_key)
     except Exception as e:
         logger.warning("source delete failed for job %s key %s (non-fatal): %s", job_id, source_key, e)
+
+    # 7. 이 사진 완료로 프로젝트의 원본 전체가 완료됐을 수 있으므로 아카이브 enqueue 재확인
+    _maybe_enqueue_archive_build(project_id)
 
 
 async def original_compress_worker() -> None:
