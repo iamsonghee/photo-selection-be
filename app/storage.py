@@ -108,6 +108,19 @@ def upload_to_r2(
     return None
 
 
+def upload_local_file_to_r2(key: str, file_path: str, content_type: str) -> Optional[str]:
+    """로컬 파일 경로에서 R2로 업로드(boto3 upload_file — 내부적으로 청크 단위 전송,
+    zip 아카이브처럼 큰 파일을 메모리에 통째로 올리지 않고 업로드할 때 사용)."""
+    if not R2_BUCKET_NAME:
+        raise ValueError("R2_BUCKET_NAME must be set in .env")
+    client = get_r2_client()
+    client.upload_file(file_path, R2_BUCKET_NAME, key, ExtraArgs={"ContentType": content_type})
+    if R2_PUBLIC_URL:
+        base = R2_PUBLIC_URL.rstrip("/")
+        return f"{base}/{key}"
+    return None
+
+
 def delete_r2_objects(keys: list[str]) -> int:
     """R2 버킷에서 지정한 key 목록 삭제. 삭제한 객체 수 반환."""
     if not R2_BUCKET_NAME or not keys:
@@ -150,6 +163,7 @@ _ALLOWED_KEY_PATTERNS = [
     re.compile(rf"^versions/{_UUID}/v\d+/{_UUID}_thumb\.jpg$"),
     re.compile(rf"^originals/{_UUID}/{_HEX32}\.jpg$"),
     re.compile(rf"^originals/source/{_UUID}/{_HEX32}\.(jpg|jpeg|heic|heif|png|webp)$"),
+    re.compile(rf"^originals/archives/{_UUID}/part-\d+\.zip$"),
 ]
 
 PRESIGN_EXPIRES_SECONDS = 3600
@@ -187,21 +201,56 @@ def validate_r2_key(key: str) -> bool:
     return any(p.match(key) for p in _ALLOWED_KEY_PATTERNS)
 
 
-def generate_presigned_urls_batch(keys: list[str], expires: int = PRESIGN_EXPIRES_SECONDS) -> dict[str, str]:
+def generate_presigned_urls_batch(
+    keys: list[str],
+    expires: int = PRESIGN_EXPIRES_SECONDS,
+    dispositions: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
     """key 목록에 대해 presigned GET URL을 일괄 생성합니다.
+    dispositions: {key: Content-Disposition 헤더 문자열} — 지정된 key만 다운로드 시
+    표시/저장 파일명을 강제한다(R2 객체 key 자체는 변경하지 않음).
     반환: { key: presigned_url }
     """
     if not R2_BUCKET_NAME:
         raise ValueError("R2_BUCKET_NAME must be set in .env")
     client = get_r2_client()
+    dispositions = dispositions or {}
     result: dict[str, str] = {}
     for key in keys:
+        params: dict = {"Bucket": R2_BUCKET_NAME, "Key": key}
+        disposition = dispositions.get(key)
+        if disposition:
+            params["ResponseContentDisposition"] = disposition
         result[key] = client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": R2_BUCKET_NAME, "Key": key},
+            Params=params,
             ExpiresIn=expires,
         )
     return result
+
+
+# ─── 다운로드 파일명(Content-Disposition) 안전 처리 ──────────────────────────
+
+_FILENAME_UNSAFE_RE = re.compile(r'[/\\\x00-\x1f"]')
+_FILENAME_MAX_LEN = 80
+
+
+def sanitize_filename_component(raw: str) -> str:
+    """Content-Disposition에 안전하게 넣을 수 있도록 파일명 구성요소를 정리한다.
+    슬래시/백슬래시/제어문자/따옴표 제거, 연속 공백 축소, 길이 제한."""
+    cleaned = _FILENAME_UNSAFE_RE.sub("", raw or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        cleaned = "download"
+    return cleaned[:_FILENAME_MAX_LEN]
+
+
+def build_content_disposition(display_name: str) -> str:
+    """RFC 5987 filename*(UTF-8, 한글 등 유지) + ASCII fallback filename 둘 다 포함하는
+    Content-Disposition 헤더 값을 만든다."""
+    safe = sanitize_filename_component(display_name)
+    encoded = _urlparse.quote(safe, safe="")
+    return f'attachment; filename="download.zip"; filename*=UTF-8\'\'{encoded}'
 
 
 def generate_presigned_put_url(key: str, content_type: str, expires: int = PRESIGN_EXPIRES_SECONDS) -> str:

@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.database import get_supabase
 from app.routers import projects, storage, upload
 from app.routers.upload import original_compress_worker, stuck_job_sweep_worker
+from app.archive import original_archive_worker, archive_sweep_worker
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,8 @@ async def lifespan(app: FastAPI):
     logger.info("Starting background workers...")
     asyncio.create_task(original_compress_worker())
     asyncio.create_task(stuck_job_sweep_worker())
+    asyncio.create_task(original_archive_worker())
+    asyncio.create_task(archive_sweep_worker())
     yield
     logger.info("Shutting down...")
 

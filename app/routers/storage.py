@@ -1,6 +1,7 @@
 """R2 스토리지 삭제 / Presign API."""
 import os
 import time
+from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
@@ -24,6 +25,7 @@ class DeleteKeysBody(BaseModel):
 
 class PresignBatchBody(BaseModel):
     keys: list[str]
+    dispositions: Optional[dict[str, str]] = None
 
 
 @router.post("/delete")
@@ -66,7 +68,7 @@ def presign_batch(body: PresignBatchBody, authorization: str = Header(None)):
         )
 
     try:
-        urls = generate_presigned_urls_batch(body.keys)
+        urls = generate_presigned_urls_batch(body.keys, dispositions=body.dispositions)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Presign 실패: {e!s}") from e
 

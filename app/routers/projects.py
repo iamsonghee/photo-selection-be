@@ -121,6 +121,7 @@ def delete_project_r2(
     try:
         total += delete_r2_objects_by_prefix(f"photos/{photographer_id_str}/{pid}/")
         total += delete_r2_objects_by_prefix(f"versions/{pid}/")
+        total += delete_r2_objects_by_prefix(f"originals/archives/{pid}/")
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
