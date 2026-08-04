@@ -100,7 +100,7 @@ def delete_project_r2(
     project_id: UUID,
     photographer_id: UUID = Depends(get_current_photographer),
 ):
-    """프로젝트에 속한 R2 객체 삭제 (photos/..., versions/...). 프로젝트 DB 삭제 전 호출."""
+    """프로젝트에 속한 R2 객체 삭제 (사진·버전·보존 원본·ZIP). 프로젝트 DB 삭제 전 호출."""
     client = get_supabase()
     r = (
         client.table("projects")
@@ -121,6 +121,7 @@ def delete_project_r2(
     try:
         total += delete_r2_objects_by_prefix(f"photos/{photographer_id_str}/{pid}/")
         total += delete_r2_objects_by_prefix(f"versions/{pid}/")
+        total += delete_r2_objects_by_prefix(f"originals/source/{pid}/")
         total += delete_r2_objects_by_prefix(f"originals/archives/{pid}/")
     except Exception as e:
         raise HTTPException(

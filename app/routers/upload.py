@@ -838,18 +838,18 @@ async def abandon_original(
 
 
 async def _process_original_job(job: dict) -> None:
-    """original_jobs 행 1개를 압축·업로드·DB 완료 처리한다."""
+    """original_jobs 행 1개를 원본 객체 검증 후 완료 처리한다.
+
+    브라우저가 presigned PUT으로 올린 바이트가 납품 원본이다. 이 객체를 다시 JPEG로
+    압축하거나 삭제하면 고객 ZIP이 원본이 아니게 되므로, 존재·크기만 검증해 그대로
+    photos.r2_original_url에 연결한다.
+    """
     job_id: str = job["id"]
     photo_id: str = job["photo_id"]
     project_id: str = job["project_id"]
     source_key: str = job["r2_source_key"]
-    content_type: str = job["source_content_type"]
     attempts: int = job["attempts"]
     max_attempts: int = job["max_attempts"]
-
-    # photo_hex: source_key 에서 추출 (originals/source/{proj}/{hex}.{ext})
-    photo_hex = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-    final_key = f"originals/{project_id}/{photo_hex}.jpg"
 
     supabase = get_supabase()
     loop = asyncio.get_event_loop()
@@ -876,77 +876,30 @@ async def _process_original_job(job: dict) -> None:
         except Exception as db_err:
             logger.exception("requeue_original_job DB call failed: %s", db_err)
 
-    # 1. source 다운로드
+    # R2에 브라우저 원본이 존재하는지만 확인한다. 다운로드/재압축/재업로드는 하지 않는다.
     try:
-        source_bytes = await loop.run_in_executor(_executor, _get_r2_object_sync, source_key)
+        original_size = await loop.run_in_executor(_executor, _head_r2_object_sync, source_key)
     except KeyError:
         logger.warning("source not found for job %s key %s — failing immediately", job_id, source_key)
         _fail(f"source file not found in R2: {source_key}")
         return
     except Exception as e:
-        logger.exception("R2 download failed for job %s: %s", job_id, e)
+        logger.exception("R2 HEAD failed for job %s: %s", job_id, e)
         if attempts >= max_attempts:
             _fail(f"R2 download failed after {attempts} attempts: {e}")
         else:
-            _requeue(f"R2 download error: {e}")
+            _requeue(f"R2 HEAD error: {e}")
         return
 
-    rss_dl = _rss_mb()
-    logger.info("[worker] downloaded source job=%s size=%dB rss=%.1fMB", job_id, len(source_bytes), rss_dl)
-
-    # 2. 압축
-    try:
-        compressed = await loop.run_in_executor(_executor, _process_original_sync, source_bytes, content_type)
-    except Exception as e:
-        logger.exception("Pillow compress failed for job %s: %s", job_id, e)
-        _fail(f"compression error: {e}")
-        del source_bytes
-        return
-    finally:
-        del source_bytes
-        gc.collect()
-
-    rss_compress = _rss_mb()
-    compressed_size = len(compressed)
-    logger.info("[worker] compressed job=%s final=%dB rss=%.1fMB", job_id, compressed_size, rss_compress)
-
-    # 3. 최종 파일 R2 업로드
-    try:
-        final_url = await loop.run_in_executor(
-            _executor, _upload_to_r2_sync, final_key, compressed, "image/jpeg", IMMUTABLE_CACHE_CONTROL
-        )
-    except Exception as e:
-        logger.exception("R2 upload failed for job %s: %s", job_id, e)
-        del compressed
-        if attempts >= max_attempts:
-            _fail(f"R2 upload failed after {attempts} attempts: {e}")
-        else:
-            _requeue(f"R2 upload error: {e}")
-        return
-    finally:
-        del compressed
-        gc.collect()
-
-    # 4. HEAD verify
-    try:
-        await loop.run_in_executor(_executor, _head_r2_object_sync, final_key)
-    except Exception as e:
-        logger.exception("HEAD verify failed for job %s key %s: %s", job_id, final_key, e)
-        if attempts >= max_attempts:
-            _fail(f"HEAD verify failed: {e}")
-        else:
-            _requeue(f"HEAD verify error: {e}")
-        return
-
-    # 5. DB 완료 처리 (트랜잭션)
+    # DB 완료 처리: source_key 자체가 보존 대상 원본이다.
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         supabase.rpc("complete_original_job", {
             "p_job_id": job_id,
             "p_photo_id": photo_id,
-            "p_r2_original_url": final_url or final_key,
+            "p_r2_original_url": source_key,
             "p_completed_at": now_iso,
-            "p_file_size": compressed_size,
+            "p_file_size": original_size,
         }).execute()
     except Exception as e:
         logger.exception("complete_original_job DB failed for job %s: %s", job_id, e)
@@ -956,16 +909,9 @@ async def _process_original_job(job: dict) -> None:
             _requeue(f"DB update error: {e}")
         return
 
-    logger.info("[worker] completed job=%s final_key=%s", job_id, final_key)
+    logger.info("[worker] completed original job=%s source_key=%s size=%d", job_id, source_key, original_size)
 
-    # 6. source 삭제 (best effort)
-    try:
-        await loop.run_in_executor(_executor, _delete_r2_objects_sync, [source_key])
-        logger.info("[worker] deleted source key=%s", source_key)
-    except Exception as e:
-        logger.warning("source delete failed for job %s key %s (non-fatal): %s", job_id, source_key, e)
-
-    # 7. 이 사진 완료로 프로젝트의 원본 전체가 완료됐을 수 있으므로 아카이브 enqueue 재확인
+    # 이 사진 완료로 프로젝트의 원본 전체가 완료됐을 수 있으므로 아카이브 enqueue 재확인
     _maybe_enqueue_archive_build(project_id)
 
 
@@ -1355,5 +1301,4 @@ async def upload_versions(
         logger.error(f"에러내용: version_reviews 삭제 실패 {e}")
 
     return {"uploaded": len(results), "items": results}
-
 

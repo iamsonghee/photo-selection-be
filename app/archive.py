@@ -69,12 +69,12 @@ def _maybe_enqueue_archive_build(project_id: str) -> None:
         logger.exception("enqueue_original_archive_build failed for project %s: %s", project_id, e)
 
 
-def _sanitize_arcname(number: int, filename: str) -> str:
-    """ZIP 내부 파일명: {number:04d}_{원본파일명} — 번호가 프로젝트 내 유일하므로 충돌 없음."""
+def _sanitize_arcname(filename: str) -> str:
+    """ZIP 내부 파일명: 작가가 올린 원본 파일명을 유지한다."""
     base = re.sub(r'[/\\\x00-\x1f]', "_", filename or "photo.jpg").strip()
     if not base:
         base = "photo.jpg"
-    return f"{number:04d}_{base}"
+    return base
 
 
 def _fetch_completed_originals_sync(project_id: str) -> list[dict]:
@@ -180,15 +180,30 @@ def _download_and_zip_sync(manifest_photo_ids: list[str]) -> tuple[str, int]:
     os.close(fd)
     count = 0
     try:
+        used_names: set[str] = set()
         with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
             for pid in manifest_photo_ids:
                 row = by_id.get(pid)
                 if not row or not row.get("r2_original_url"):
                     logger.warning("[archive] photo %s missing/no original — skipped from zip", pid)
                     continue
-                key = r2_key_from_url(row["r2_original_url"])
+                original_ref = row["r2_original_url"]
+                # 신규 원본 보존 경로는 DB에 R2 key를 직접 저장한다. 레거시 압축본은
+                # 공개 URL로 저장돼 있어 두 형태를 모두 읽는다.
+                key = original_ref if original_ref.startswith("originals/") else r2_key_from_url(original_ref)
                 data = get_r2_object_bytes_sync(key)
-                arcname = _sanitize_arcname(row["number"], row.get("original_filename") or "photo.jpg")
+                arcname = _sanitize_arcname(row.get("original_filename") or "photo.jpg")
+                # 같은 파일명이 여러 장이면 ZIP 엔트리 충돌을 막되, 일반적인 경우에는
+                # 작가가 등록한 파일명을 한 글자도 바꾸지 않는다.
+                if arcname in used_names:
+                    stem, ext = os.path.splitext(arcname)
+                    suffix = 2
+                    candidate = f"{stem} ({suffix}){ext}"
+                    while candidate in used_names:
+                        suffix += 1
+                        candidate = f"{stem} ({suffix}){ext}"
+                    arcname = candidate
+                used_names.add(arcname)
                 zf.writestr(arcname, data)
                 count += 1
                 del data
