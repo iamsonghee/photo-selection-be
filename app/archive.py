@@ -260,6 +260,21 @@ async def _process_archive_part(part: dict) -> None:
         except Exception as db_err:
             logger.exception("fail_archive_part RPC failed for part %s: %s", part_id, db_err)
 
+    def _part_is_still_processing_sync() -> bool:
+        """전체 삭제로 취소된 파트는 ZIP 업로드/완료 처리 전에 중단한다."""
+        result = (
+            supabase.table("original_archive_parts")
+            .select("id")
+            .eq("id", part_id)
+            .eq("status", "processing")
+            .limit(1)
+            .execute()
+        )
+        return bool(result.data)
+
+    async def _part_is_still_processing() -> bool:
+        return await loop.run_in_executor(_executor, _part_is_still_processing_sync)
+
     tmp_path: Optional[str] = None
     try:
         tmp_path, count = await loop.run_in_executor(_executor, _download_and_zip_sync, manifest)
@@ -270,10 +285,26 @@ async def _process_archive_part(part: dict) -> None:
         return
 
     try:
-        await loop.run_in_executor(_executor, upload_local_file_to_r2, r2_key, tmp_path, "application/zip")
+        # 작가가 preparing 단계에서 전체 삭제한 경우, 이미 내려받은 ZIP도 업로드하지 않는다.
+        if not await _part_is_still_processing():
+            logger.info("[archive] part=%s cancelled before upload", part_id)
+            return
+
+        try:
+            await loop.run_in_executor(_executor, upload_local_file_to_r2, r2_key, tmp_path, "application/zip")
+        except Exception as e:
+            logger.exception("[archive] R2 upload failed for part %s: %s", part_id, e)
+            _fail(f"R2 upload failed: {e}")
+            return
+
+        # 업로드 중 취소된 아주 짧은 경합도 R2 ZIP을 바로 회수한다.
+        if not await _part_is_still_processing():
+            logger.info("[archive] part=%s cancelled after upload", part_id)
+            await loop.run_in_executor(_executor, delete_r2_objects, [r2_key])
+            return
     except Exception as e:
-        logger.exception("[archive] R2 upload failed for part %s: %s", part_id, e)
-        _fail(f"R2 upload failed: {e}")
+        logger.exception("[archive] cancellation check failed for part %s: %s", part_id, e)
+        _fail(f"cancellation check failed: {e}")
         return
     finally:
         try:
@@ -287,6 +318,16 @@ async def _process_archive_part(part: dict) -> None:
     except Exception as e:
         logger.exception("[archive] HEAD verify failed for part %s key %s: %s", part_id, r2_key, e)
         _fail(f"HEAD verify failed: {e}")
+        return
+
+    try:
+        if not await _part_is_still_processing():
+            logger.info("[archive] part=%s cancelled before completion", part_id)
+            await loop.run_in_executor(_executor, delete_r2_objects, [r2_key])
+            return
+    except Exception as e:
+        logger.exception("[archive] cancellation check failed for part %s: %s", part_id, e)
+        _fail(f"cancellation check failed: {e}")
         return
 
     now_iso = datetime.now(timezone.utc).isoformat()

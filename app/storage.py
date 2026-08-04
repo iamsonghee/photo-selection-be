@@ -126,9 +126,12 @@ def delete_r2_objects(keys: list[str]) -> int:
     if not R2_BUCKET_NAME or not keys:
         return 0
     client = get_r2_client()
-    objects = [{"Key": k} for k in keys]
-    client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": objects})
-    return len(objects)
+    # S3/R2 DeleteObjects API는 요청 하나당 최대 1,000개 key만 받는다. 프로젝트 전체
+    # 삭제(썸네일·미리보기·납품 원본 포함)는 이보다 많을 수 있으므로 안전하게 나눈다.
+    for start in range(0, len(keys), 1000):
+        objects = [{"Key": k} for k in keys[start : start + 1000]]
+        client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": objects})
+    return len(keys)
 
 
 def delete_r2_objects_by_prefix(prefix: str) -> int:
