@@ -96,8 +96,10 @@ IMAGE_EXECUTOR_MAX_WORKERS = _env_int("IMAGE_EXECUTOR_MAX_WORKERS", 8, 2, 16)
 # 메모리 부담이 적어 조금 더 크게 기본값을 잡는다.
 PILLOW_EXECUTOR_MAX_WORKERS = _env_int("PILLOW_EXECUTOR_MAX_WORKERS", 4, 2, 12)
 R2_EXECUTOR_MAX_WORKERS = _env_int("R2_EXECUTOR_MAX_WORKERS", 6, 2, 16)
-# 비동기 원본 압축 worker 동시성 (기본 1 — Railway 512MB RAM 보호)
-ORIGINAL_COMPRESS_CONCURRENCY = _env_int("ORIGINAL_COMPRESS_CONCURRENCY", 1, 1, 4)
+# 비동기 납품 원본 검증 worker 동시성. 현재 작업은 R2 객체 HEAD와 DB 상태 전이만 수행하며
+# 이미지 디코딩/재압축을 하지 않으므로, 전역 대기열을 한 장씩 막지 않도록 기본 4개로 처리한다.
+# 환경변수로 더 보수적으로 낮출 수 있고, 공유 I/O executor(기본 8)를 넘지 않게 상한을 둔다.
+ORIGINAL_COMPRESS_CONCURRENCY = _env_int("ORIGINAL_COMPRESS_CONCURRENCY", 4, 1, 8)
 # presigned PUT URL 유효 시간 (초)
 ORIGINAL_PRESIGNED_EXPIRES = 3600
 
@@ -1301,4 +1303,3 @@ async def upload_versions(
         logger.error(f"에러내용: version_reviews 삭제 실패 {e}")
 
     return {"uploaded": len(results), "items": results}
-
