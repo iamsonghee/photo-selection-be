@@ -707,7 +707,10 @@ async def get_pending_originals(
     project_id: str,
     photographer_id: UUID = Depends(get_current_photographer),
 ):
-    """awaiting_upload 상태 original_jobs 목록 반환. FE 복구 배너 표시용 — 내부 필드 비노출."""
+    """awaiting_upload/failed 상태 original_jobs 목록 반환. FE 복구 배너 표시용 — 내부 필드 비노출.
+    failed도 포함하는 이유: presigned PUT이 조용히 실패하면 job이 awaiting_upload에 머물다
+    24h sweep(stuck_job_sweep_worker)에서 failed로 전환되는데, 이 상태를 배너에서 빼면
+    사용자가 복구할 방법이 전혀 없어 원본 아카이브 enqueue가 영구히 막힌다(재업로드로만 복구 가능)."""
     supabase = get_supabase()
     proj_r = (
         supabase.table("projects")
@@ -723,7 +726,7 @@ async def get_pending_originals(
         supabase.table("original_jobs")
         .select("id,original_filename,original_file_size,original_last_modified,created_at")
         .eq("project_id", project_id)
-        .eq("status", "awaiting_upload")
+        .in_("status", ["awaiting_upload", "failed"])
         .order("created_at")
         .execute()
     )
