@@ -86,8 +86,16 @@ UPLOAD_PHOTOS_CONCURRENCY = _env_int("UPLOAD_PHOTOS_CONCURRENCY", 5, 1, 12)
 # 원본 포함 업로드 시 presigned PUT 방식으로 서버 부담 낮춤 (기본 3)
 UPLOAD_WITH_ORIGINAL_CONCURRENCY = _env_int("UPLOAD_WITH_ORIGINAL_CONCURRENCY", 3, 1, 8)
 VERSION_UPLOAD_CONCURRENCY = _env_int("VERSION_UPLOAD_CONCURRENCY", 3, 1, 12)
-# Pillow/R2 동기 작업 스레드 수 (동시 이미지 디코딩 상한에 맞춤, 기본 8)
+# Pillow/R2 동기 작업 스레드 수 (동시 이미지 디코딩 상한에 맞춤, 기본 8) — /photos 외 다른
+# 엔드포인트(보정본 업로드, 원본 압축, R2 head/get/delete, 프로필 이미지)가 공유해서 쓴다.
 IMAGE_EXECUTOR_MAX_WORKERS = _env_int("IMAGE_EXECUTOR_MAX_WORKERS", 8, 2, 16)
+# 후보 C: /photos 파이프라인(_process_one) 전용 CPU(Pillow)/I/O(R2 PUT) 분리 풀.
+# 동시 2요청 실측(큐 대기: 단일 요청 ~0ms → 동시 2요청 시 Pillow/R2 모두 수백ms)에서 공유
+# executor 경쟁이 확인되어 적용. 위 IMAGE_EXECUTOR_MAX_WORKERS(다른 엔드포인트용)는 그대로 두고
+# 이 파이프라인만 별도 풀로 분리 — CPU 풀은 코어 낭비 방지 위해 작게, I/O 풀은 네트워크 대기라
+# 메모리 부담이 적어 조금 더 크게 기본값을 잡는다.
+PILLOW_EXECUTOR_MAX_WORKERS = _env_int("PILLOW_EXECUTOR_MAX_WORKERS", 4, 2, 12)
+R2_EXECUTOR_MAX_WORKERS = _env_int("R2_EXECUTOR_MAX_WORKERS", 6, 2, 16)
 # 비동기 원본 압축 worker 동시성 (기본 1 — Railway 512MB RAM 보호)
 ORIGINAL_COMPRESS_CONCURRENCY = _env_int("ORIGINAL_COMPRESS_CONCURRENCY", 1, 1, 4)
 # presigned PUT URL 유효 시간 (초)
@@ -106,8 +114,19 @@ _CT_TO_EXT: dict[str, str] = {
     "image/webp": "webp",
 }
 
-# Pillow / boto3 블로킹 작업용 스레드풀
+# Pillow / boto3 블로킹 작업용 스레드풀 (/photos 외 엔드포인트 공용)
 _executor = ThreadPoolExecutor(max_workers=IMAGE_EXECUTOR_MAX_WORKERS)
+# 후보 C: /photos 파이프라인 전용 — CPU(Pillow 생성) / I/O(R2 PUT) 분리
+_cpu_executor = ThreadPoolExecutor(max_workers=PILLOW_EXECUTOR_MAX_WORKERS)
+_r2_executor = ThreadPoolExecutor(max_workers=R2_EXECUTOR_MAX_WORKERS)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+# 후보 A: 상시 [mem] 디버그 로그(psutil RSS 조회 포함)를 기본 OFF로 — OOM 디버깅 시에만 켠다.
+UPLOAD_MEM_LOG = _env_flag("UPLOAD_MEM_LOG")
 
 
 def _apply_exif_orientation(img: Image.Image) -> Image.Image:
@@ -180,7 +199,7 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
     """동기: 썸네일(300px/75%) + 미리보기(1200px/82%) 동시 생성.
     OPT-01: 대형 JPEG(>4000px)는 Draft 모드로 1/8 축소 후 LANCZOS 리샘플링 → 처리 속도 ~40% 향상.
     """
-    rss0 = _rss_mb()
+    rss0 = _rss_mb() if UPLOAD_MEM_LOG else 0.0
     file_kb = len(image_bytes) / 1024
 
     buf = io.BytesIO(image_bytes)
@@ -191,9 +210,10 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
         w, h = probe.size
         probe.close()
         del probe
-        rss1 = _rss_mb()
-        print(f"[mem] start rss={rss0:.1f}MB | file={file_kb:.0f}KB size={w}x{h}", flush=True)
-        print(f"[mem] after_probe rss={rss1:.1f}MB Δ{rss1 - rss0:.1f}MB", flush=True)
+        if UPLOAD_MEM_LOG:
+            rss1 = _rss_mb()
+            print(f"[mem] start rss={rss0:.1f}MB | file={file_kb:.0f}KB size={w}x{h}", flush=True)
+            print(f"[mem] after_probe rss={rss1:.1f}MB Δ{rss1 - rss0:.1f}MB", flush=True)
 
         if w > 4000 or h > 4000:
             buf.seek(0)
@@ -208,22 +228,25 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
             img = Image.open(buf)
     except Exception:
         w, h = 0, 0
-        rss1 = rss0
-        print(f"[mem] start rss={rss0:.1f}MB | file={file_kb:.0f}KB size=unknown", flush=True)
+        if UPLOAD_MEM_LOG:
+            print(f"[mem] start rss={rss0:.1f}MB | file={file_kb:.0f}KB size=unknown", flush=True)
         buf.seek(0)
         img = Image.open(buf)
 
-    rss2 = _rss_mb()
-    print(f"[mem] after_Image_open rss={rss2:.1f}MB Δ{rss2 - rss0:.1f}MB mode={img.mode}", flush=True)
+    if UPLOAD_MEM_LOG:
+        rss2 = _rss_mb()
+        print(f"[mem] after_Image_open rss={rss2:.1f}MB Δ{rss2 - rss0:.1f}MB mode={img.mode}", flush=True)
 
     img = _apply_exif_orientation(img)
-    rss3 = _rss_mb()
-    print(f"[mem] after_exif_transpose rss={rss3:.1f}MB Δ{rss3 - rss0:.1f}MB", flush=True)
+    if UPLOAD_MEM_LOG:
+        rss3 = _rss_mb()
+        print(f"[mem] after_exif_transpose rss={rss3:.1f}MB Δ{rss3 - rss0:.1f}MB", flush=True)
 
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
-    rss4 = _rss_mb()
-    print(f"[mem] after_convert_RGB rss={rss4:.1f}MB Δ{rss4 - rss0:.1f}MB size={img.size[0]}x{img.size[1]}", flush=True)
+    if UPLOAD_MEM_LOG:
+        rss4 = _rss_mb()
+        print(f"[mem] after_convert_RGB rss={rss4:.1f}MB Δ{rss4 - rss0:.1f}MB size={img.size[0]}x{img.size[1]}", flush=True)
 
     # 썸네일 (갤러리용)
     thumb = img.copy()
@@ -232,8 +255,9 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
     thumb.save(thumb_buf, format="JPEG", quality=THUMB_JPEG_QUALITY)
     thumb.close()
     del thumb
-    rss5 = _rss_mb()
-    print(f"[mem] after_thumb rss={rss5:.1f}MB Δ{rss5 - rss0:.1f}MB", flush=True)
+    if UPLOAD_MEM_LOG:
+        rss5 = _rss_mb()
+        print(f"[mem] after_thumb rss={rss5:.1f}MB Δ{rss5 - rss0:.1f}MB", flush=True)
 
     # 미리보기 (뷰어용)
     preview = img.copy()
@@ -246,8 +270,9 @@ def _make_thumb_and_preview_sync(image_bytes: bytes) -> Tuple[bytes, bytes]:
     img.close()
     del img
     del buf
-    rss6 = _rss_mb()
-    print(f"[mem] after_preview+del rss={rss6:.1f}MB Δ{rss6 - rss0:.1f}MB", flush=True)
+    if UPLOAD_MEM_LOG:
+        rss6 = _rss_mb()
+        print(f"[mem] after_preview+del rss={rss6:.1f}MB Δ{rss6 - rss0:.1f}MB", flush=True)
 
     return thumb_buf.getvalue(), preview_buf.getvalue()
 
@@ -304,12 +329,14 @@ async def _process_one(
     성공 시 (thumb_url, preview_url, r2_stored_bytes, original_presigned_or_None).
     original_presigned = {source_key, photo_hex, content_type}
     B plan: contents는 항상 압축본(2MB JPEG), original_content_type은 원본 파일 타입.
+    썸네일/프리뷰 생성(CPU)과 R2 PUT(I/O)은 별도 스레드풀(_cpu_executor/_r2_executor)에서
+    실행한다 — 동시 요청 실측에서 공유 풀 경쟁이 확인되어 분리함(OPT-02).
     """
     photo_id = uuid_module.uuid4().hex
 
     try:
         thumb_bytes, preview_bytes = await loop.run_in_executor(
-            _executor,
+            _cpu_executor,
             _make_thumb_and_preview_sync,
             contents,
         )
@@ -323,8 +350,8 @@ async def _process_one(
 
     try:
         thumb_url, preview_url = await asyncio.gather(
-            loop.run_in_executor(_executor, _upload_to_r2_sync, thumb_key, thumb_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL),
-            loop.run_in_executor(_executor, _upload_to_r2_sync, preview_key, preview_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL),
+            loop.run_in_executor(_r2_executor, _upload_to_r2_sync, thumb_key, thumb_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL),
+            loop.run_in_executor(_r2_executor, _upload_to_r2_sync, preview_key, preview_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL),
         )
     except Exception as e:
         logger.error(f"에러내용: {e}")
@@ -335,11 +362,13 @@ async def _process_one(
         return None
 
     r2_stored_bytes = len(thumb_bytes) + len(preview_bytes)
-    rss_r2 = _rss_mb()
+    if UPLOAD_MEM_LOG:
+        rss_r2 = _rss_mb()
     del thumb_bytes, preview_bytes
     gc.collect()
-    rss_gc = _rss_mb()
-    print(f"[mem] after_r2_upload rss={rss_r2:.1f}MB | after_gc rss={rss_gc:.1f}MB Δ{rss_gc - rss_r2:.1f}MB", flush=True)
+    if UPLOAD_MEM_LOG:
+        rss_gc = _rss_mb()
+        print(f"[mem] after_r2_upload rss={rss_r2:.1f}MB | after_gc rss={rss_gc:.1f}MB Δ{rss_gc - rss_r2:.1f}MB", flush=True)
 
     original_presigned: Optional[dict] = None
     if include_original and original_content_type:
@@ -527,7 +556,8 @@ async def upload_photos(
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
-    print(f"[mem] after_batch_trim rss={_rss_mb():.1f}MB", flush=True)
+    if UPLOAD_MEM_LOG:
+        print(f"[mem] after_batch_trim rss={_rss_mb():.1f}MB", flush=True)
 
     if not rows:
         return {"uploaded": 0, "rejected": rejected_filenames}
