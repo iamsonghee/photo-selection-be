@@ -16,7 +16,7 @@ import os
 import re
 import tempfile
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -52,6 +52,9 @@ ARCHIVE_PART_MAX_BYTES = _env_int(
 _FALLBACK_PHOTO_BYTES = 20 * 1024 * 1024
 # 프로젝트/파트 claim 동시성 (기본 1 — Railway 512MB RAM 보호, 원본 압축 워커와 동일 기준)
 ARCHIVE_BUILD_CONCURRENCY = _env_int("ARCHIVE_BUILD_CONCURRENCY", 1, 1, 4)
+# ZIP은 파일을 순서대로 써야 하지만, R2 객체 요청 대기는 겹칠 수 있다. 기본 2개만
+# 미리 받아 Railway 메모리를 과도하게 쓰지 않으면서 네트워크 왕복 대기를 줄인다.
+ARCHIVE_DOWNLOAD_CONCURRENCY = _env_int("ARCHIVE_DOWNLOAD_CONCURRENCY", 2, 1, 4)
 
 # 다운로드 만료(30일) + 유예(7일) 후 R2 아카이브 ZIP 삭제
 ARCHIVE_RETENTION_DAYS = 30
@@ -160,9 +163,12 @@ async def _create_parts_for_claimed_project(project: dict) -> None:
 
 
 def _download_and_zip_sync(manifest_photo_ids: list[str]) -> tuple[str, int]:
-    """동기: manifest의 photo_id들을 재조회해 R2 원본을 1장씩 받아 로컬 임시 zip에 append.
-    한 번에 메모리에 올리는 건 사진 1장(최대 약 20MB)뿐 — 전체 zip은 디스크에 스트리밍된다.
-    반환: (임시파일 경로, 실제 담긴 파일 수)."""
+    """동기: manifest의 photo_id들을 재조회해 원본을 ZIP으로 기록한다.
+
+    ZIP 기록 순서는 manifest 그대로 유지하고, 제한된 개수의 다음 R2 다운로드만 미리
+    시작한다. 전체 ZIP은 디스크에 스트리밍되며, 메모리에 머무는 원본은 최대
+    ARCHIVE_DOWNLOAD_CONCURRENCY개다. 반환: (임시파일 경로, 실제 담긴 파일 수).
+    """
     supabase = get_supabase()
     rows: list[dict] = []
     for i in range(0, len(manifest_photo_ids), 500):
@@ -176,22 +182,36 @@ def _download_and_zip_sync(manifest_photo_ids: list[str]) -> tuple[str, int]:
         rows.extend(res.data or [])
     by_id = {r["id"]: r for r in rows}
 
+    entries: list[tuple[dict, str]] = []
+    for pid in manifest_photo_ids:
+        row = by_id.get(pid)
+        if not row or not row.get("r2_original_url"):
+            logger.warning("[archive] photo %s missing/no original — skipped from zip", pid)
+            continue
+        original_ref = row["r2_original_url"]
+        # 신규 원본 보존 경로는 DB에 R2 key를 직접 저장한다. 레거시 압축본은
+        # 공개 URL로 저장돼 있어 두 형태를 모두 읽는다.
+        key = original_ref if original_ref.startswith("originals/") else r2_key_from_url(original_ref)
+        entries.append((row, key))
+
     fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="archive_part_")
     os.close(fd)
     count = 0
     try:
         used_names: set[str] = set()
-        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
-            for pid in manifest_photo_ids:
-                row = by_id.get(pid)
-                if not row or not row.get("r2_original_url"):
-                    logger.warning("[archive] photo %s missing/no original — skipped from zip", pid)
-                    continue
-                original_ref = row["r2_original_url"]
-                # 신규 원본 보존 경로는 DB에 R2 key를 직접 저장한다. 레거시 압축본은
-                # 공개 URL로 저장돼 있어 두 형태를 모두 읽는다.
-                key = original_ref if original_ref.startswith("originals/") else r2_key_from_url(original_ref)
-                data = get_r2_object_bytes_sync(key)
+        # 다음 몇 장을 미리 요청하되, ZIP 기록은 entries 순서를 지켜 기존 결과와 동일하다.
+        with ThreadPoolExecutor(max_workers=ARCHIVE_DOWNLOAD_CONCURRENCY) as prefetch, \
+             zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            futures: dict[int, Future[bytes]] = {}
+            next_to_schedule = 0
+            while next_to_schedule < min(ARCHIVE_DOWNLOAD_CONCURRENCY, len(entries)):
+                futures[next_to_schedule] = prefetch.submit(get_r2_object_bytes_sync, entries[next_to_schedule][1])
+                next_to_schedule += 1
+            for index, (row, _key) in enumerate(entries):
+                data = futures.pop(index).result()
+                if next_to_schedule < len(entries):
+                    futures[next_to_schedule] = prefetch.submit(get_r2_object_bytes_sync, entries[next_to_schedule][1])
+                    next_to_schedule += 1
                 arcname = _sanitize_arcname(row.get("original_filename") or "photo.jpg")
                 # 같은 파일명이 여러 장이면 ZIP 엔트리 충돌을 막되, 일반적인 경우에는
                 # 작가가 등록한 파일명을 한 글자도 바꾸지 않는다.
