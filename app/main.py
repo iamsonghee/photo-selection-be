@@ -18,6 +18,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting background workers...")
     asyncio.create_task(original_compress_worker())
     asyncio.create_task(stuck_job_sweep_worker())
+    # 고객 링크 활성화 뒤에만 ZIP 작업이 enqueue된다. 개별 원본 다운로드는 이 작업을 기다리지 않는다.
     asyncio.create_task(original_archive_worker())
     asyncio.create_task(archive_sweep_worker())
     yield

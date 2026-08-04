@@ -48,11 +48,6 @@ def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
 ARCHIVE_PART_MAX_BYTES = _env_int(
     "ARCHIVE_PART_MAX_BYTES", 500 * 1024 * 1024, 50 * 1024 * 1024, 5 * 1024 * 1024 * 1024
 )
-# 업로드 중 미리 만들 ZIP의 목표 크기. 최종 500MB 상한보다 작게 잡아, 남은 원본을
-# 마지막 파트로 만들 때도 메모리/디스크 여유를 유지한다.
-ARCHIVE_STAGING_TARGET_BYTES = _env_int(
-    "ARCHIVE_STAGING_TARGET_BYTES", 400 * 1024 * 1024, 50 * 1024 * 1024, 450 * 1024 * 1024
-)
 # original_compressed_size가 없는(레거시) 사진의 빈-패킹용 추정치
 _FALLBACK_PHOTO_BYTES = 20 * 1024 * 1024
 # 프로젝트/파트 claim 동시성 (기본 1 — Railway 512MB RAM 보호, 원본 압축 워커와 동일 기준)
@@ -75,23 +70,6 @@ def _maybe_enqueue_archive_build(project_id: str) -> None:
         supabase.rpc("enqueue_original_archive_build", {"p_project_id": project_id}).execute()
     except Exception as e:
         logger.exception("enqueue_original_archive_build failed for project %s: %s", project_id, e)
-
-
-def _maybe_enqueue_staging_archive_part(project_id: str) -> None:
-    """업로드 중 충분히 쌓인 완료 원본을 임시 ZIP 작업으로 예약한다.
-
-    이 ZIP은 고객에게 바로 노출하지 않는다. 최종 아카이브 생성 시 완료된 임시 ZIP만
-    재사용하므로, 업로드 중 사진 추가/중단/삭제가 고객 다운로드 구성에 영향을 주지 않는다.
-    """
-    try:
-        get_supabase().rpc("enqueue_original_archive_staging_part", {
-            "p_project_id": project_id,
-            "p_target_bytes": ARCHIVE_STAGING_TARGET_BYTES,
-        }).execute()
-    except Exception as e:
-        # 사전 생성 실패는 최종 아카이브의 실패가 아니다. 최종 단계가 기존 전체 빌드로
-        # 안전하게 fallback하므로 관측만 남긴다.
-        logger.exception("enqueue_original_archive_staging_part failed for project %s: %s", project_id, e)
 
 
 def _sanitize_arcname(filename: str) -> str:
@@ -123,19 +101,6 @@ def _fetch_completed_originals_sync(project_id: str) -> list[dict]:
     return rows
 
 
-def _fetch_completed_staging_parts_sync(project_id: str) -> list[dict]:
-    """최종 아카이브에서 그대로 재사용 가능한, 검증 완료된 임시 ZIP 목록."""
-    result = (
-        get_supabase().table("original_archive_staging_parts")
-        .select("id, part_number, r2_key, file_count, byte_size, manifest, completed_at")
-        .eq("project_id", project_id)
-        .eq("status", "completed")
-        .order("part_number")
-        .execute()
-    )
-    return result.data or []
-
-
 def _bin_pack(photos: list[dict]) -> list[list[dict]]:
     """누적 크기 기준 그룹핑 — 한 그룹이 ARCHIVE_PART_MAX_BYTES를 넘지 않게(사진 1장은
     항상 자기 그룹에 담아 무한루프 없이 최소 1장씩은 진행됨)."""
@@ -163,9 +128,6 @@ async def _create_parts_for_claimed_project(project: dict) -> None:
     supabase = get_supabase()
     loop = asyncio.get_event_loop()
     photos = await loop.run_in_executor(_executor, _fetch_completed_originals_sync, project_id)
-    completed_staging = await loop.run_in_executor(
-        _executor, _fetch_completed_staging_parts_sync, project_id
-    )
 
     if not photos:
         # enqueue 조건(EXISTS completed)이 이미 걸러내므로 이례적인 경우 — 방어적으로 실패 확정
@@ -176,28 +138,9 @@ async def _create_parts_for_claimed_project(project: dict) -> None:
         }).eq("id", project_id).eq("original_archive_status", "processing").execute()
         return
 
-    # 완료된 임시 ZIP에 이미 포함된 사진은 다시 내려받아 ZIP으로 만들지 않는다. 아직
-    # processing/pending인 임시 ZIP은 신뢰하지 않고 이번 최종 ZIP에 포함한다(안전 fallback).
-    staged_photo_ids = {
-        photo_id
-        for staging in completed_staging
-        for photo_id in (staging.get("manifest") or [])
-    }
-    remaining_photos = [p for p in photos if p["id"] not in staged_photo_ids]
-    groups = _bin_pack(remaining_photos)
+    groups = _bin_pack(photos)
     rows = []
-    for idx, staging in enumerate(completed_staging, start=1):
-        rows.append({
-            "project_id": project_id,
-            "part_number": idx,
-            "r2_key": staging["r2_key"],
-            "file_count": staging["file_count"],
-            "byte_size": staging["byte_size"],
-            "manifest": staging["manifest"],
-            "status": "completed",
-            "completed_at": staging.get("completed_at") or datetime.now(timezone.utc).isoformat(),
-        })
-    for idx, group in enumerate(groups, start=len(rows) + 1):
+    for idx, group in enumerate(groups, start=1):
         byte_size = sum((p.get("original_compressed_size") or _FALLBACK_PHOTO_BYTES) for p in group)
         rows.append({
             "project_id": project_id,
@@ -210,24 +153,7 @@ async def _create_parts_for_claimed_project(project: dict) -> None:
         })
     try:
         supabase.table("original_archive_parts").insert(rows).execute()
-        logger.info(
-            "[archive] created %d part(s), reused %d prebuilt part(s) for project %s (%d photos)",
-            len(rows), len(completed_staging), project_id, len(photos),
-        )
-        # 모든 원본이 임시 ZIP으로 이미 준비된 경우 pending 파트가 없으므로, 여기서
-        # 최종 완료 RPC를 한 번 호출해 프로젝트 상태와 다운로드 기산을 갱신한다.
-        if rows and not groups:
-            now_iso = datetime.now(timezone.utc).isoformat()
-            supabase.table("projects").update({
-                "original_archive_status": "ready",
-                "original_archive_processing_started_at": None,
-            }).eq("id", project_id).eq("original_archive_status", "processing").execute()
-            # 고객 링크가 먼저 열려 있었다면 이 시점부터 30일을 계산한다.
-            supabase.table("projects").update({
-                "original_download_started_at": now_iso,
-            }).eq("id", project_id).eq("status", "selecting").eq(
-                "original_archive_status", "ready"
-            ).is_("original_download_started_at", "null").execute()
+        logger.info("[archive] created %d part(s) for project %s (%d photos)", len(rows), project_id, len(photos))
     except Exception as e:
         logger.exception("[archive] part insert failed for project %s: %s", project_id, e)
         supabase.table("projects").update({
@@ -308,76 +234,6 @@ def _download_and_zip_sync(manifest_photo_ids: list[str]) -> tuple[str, int]:
             pass
         raise
     return tmp_path, count
-
-
-async def _process_staging_archive_part(part: dict) -> None:
-    """임시 ZIP 1개를 만든다. 실패해도 고객용 아카이브를 실패시키지 않는다.
-
-    최종 단계는 completed 상태만 재사용하고 나머지는 원본에서 다시 만들기 때문에,
-    이 경로는 순수 성능 최적화이며 데이터 정확성의 단일 의존점이 아니다.
-    """
-    part_id: str = part["id"]
-    attempts: int = part["attempts"]
-    max_attempts: int = part["max_attempts"]
-    manifest: list[str] = part.get("manifest") or []
-    r2_key: str = part["r2_key"]
-    supabase = get_supabase()
-    loop = asyncio.get_event_loop()
-    tmp_path: Optional[str] = None
-
-    def _fail(reason: str) -> None:
-        try:
-            supabase.rpc("fail_original_archive_staging_part", {
-                "p_part_id": part_id,
-                "p_last_error": reason,
-                "p_permanent": attempts >= max_attempts,
-            }).execute()
-        except Exception as db_err:
-            logger.exception("fail staging archive part DB call failed: %s", db_err)
-
-    def _still_processing_sync() -> bool:
-        result = (
-            supabase.table("original_archive_staging_parts").select("id")
-            .eq("id", part_id).eq("status", "processing").limit(1).execute()
-        )
-        return bool(result.data)
-
-    try:
-        tmp_path, count = await loop.run_in_executor(_executor, _download_and_zip_sync, manifest)
-        if not await loop.run_in_executor(_executor, _still_processing_sync):
-            logger.info("[archive] staging part=%s cancelled before upload", part_id)
-            return
-        await loop.run_in_executor(_executor, upload_local_file_to_r2, r2_key, tmp_path, "application/zip")
-        if not await loop.run_in_executor(_executor, _still_processing_sync):
-            await loop.run_in_executor(_executor, delete_r2_objects, [r2_key])
-            logger.info("[archive] staging part=%s cancelled after upload", part_id)
-            return
-        await loop.run_in_executor(_executor, head_r2_object_sync, r2_key)
-        if not await loop.run_in_executor(_executor, _still_processing_sync):
-            await loop.run_in_executor(_executor, delete_r2_objects, [r2_key])
-            logger.info("[archive] staging part=%s cancelled before completion", part_id)
-            return
-    except Exception as e:
-        logger.exception("[archive] prebuild failed for staging part %s: %s", part_id, e)
-        _fail(str(e))
-        return
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        gc.collect()
-
-    try:
-        supabase.rpc("complete_original_archive_staging_part", {
-            "p_part_id": part_id,
-            "p_completed_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
-        logger.info("[archive] prebuilt staging part=%s files=%d", part_id, count)
-    except Exception as e:
-        logger.exception("[archive] staging completion DB call failed for part %s: %s", part_id, e)
-        _fail(f"DB completion failed: {e}")
 
 
 async def _process_archive_part(part: dict) -> None:
@@ -511,21 +367,6 @@ async def original_archive_worker() -> None:
     while True:
         try:
             supabase = get_supabase()
-
-            # 사전 생성도 같은 ZIP/디스크 자원을 쓰므로 한 사이클에는 한 종류만 처리한다.
-            # 이렇게 하면 기존 Railway 메모리 상한을 넘기지 않는다.
-            staging_r = supabase.rpc(
-                "claim_original_archive_staging_parts", {"p_limit": ARCHIVE_BUILD_CONCURRENCY}
-            ).execute()
-            staging_parts = staging_r.data or []
-            if staging_parts:
-                logger.info("[archive] claimed %d staging part(s)", len(staging_parts))
-                await asyncio.gather(
-                    *[_process_staging_archive_part(p) for p in staging_parts],
-                    return_exceptions=True,
-                )
-                await asyncio.sleep(5)
-                continue
 
             claimed_r = supabase.rpc(
                 "claim_original_archive_builds", {"p_limit": ARCHIVE_BUILD_CONCURRENCY}
