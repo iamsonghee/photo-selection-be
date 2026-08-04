@@ -2,6 +2,7 @@
 import hashlib
 import os
 import tempfile
+import threading
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -48,6 +49,50 @@ class OriginalArchiveIntegrityTest(unittest.TestCase):
                 self.assertEqual(zf.namelist(), ["first.nef", "second.JPG"])
                 for name, expected in (("first.nef", originals["originals/source/project/first.nef"]), ("second.JPG", originals["originals/source/project/second.JPG"])):
                     self.assertEqual(hashlib.sha256(zf.read(name)).digest(), hashlib.sha256(expected).digest())
+        finally:
+            os.remove(path)
+
+    def test_prefetch_keeps_manifest_order_with_bounded_parallel_downloads(self):
+        originals = {
+            "originals/source/project/one.jpg": b"one",
+            "originals/source/project/two.jpg": b"two",
+            "originals/source/project/three.jpg": b"three",
+        }
+        rows = [
+            {"id": "1", "number": 1, "r2_original_url": "originals/source/project/one.jpg", "original_filename": "one.jpg"},
+            {"id": "2", "number": 2, "r2_original_url": "originals/source/project/two.jpg", "original_filename": "two.jpg"},
+            {"id": "3", "number": 3, "r2_original_url": "originals/source/project/three.jpg", "original_filename": "three.jpg"},
+        ]
+        first_two_started = threading.Barrier(2, timeout=1)
+        active = 0
+        peak_active = 0
+        active_lock = threading.Lock()
+
+        def download(key):
+            nonlocal active, peak_active
+            with active_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                if key.endswith(("one.jpg", "two.jpg")):
+                    first_two_started.wait()
+                return originals[key]
+            finally:
+                with active_lock:
+                    active -= 1
+
+        with patch.object(archive, "get_supabase", return_value=_Supabase(rows)), patch.object(
+            archive, "get_r2_object_bytes_sync", side_effect=download
+        ), patch.object(archive, "ARCHIVE_DOWNLOAD_CONCURRENCY", 2):
+            path, count = archive._download_and_zip_sync(["1", "2", "3"])
+        try:
+            self.assertEqual(count, 3)
+            self.assertGreaterEqual(peak_active, 2)
+            with zipfile.ZipFile(path) as zf:
+                self.assertEqual(zf.namelist(), ["one.jpg", "two.jpg", "three.jpg"])
+                self.assertEqual(zf.read("one.jpg"), b"one")
+                self.assertEqual(zf.read("two.jpg"), b"two")
+                self.assertEqual(zf.read("three.jpg"), b"three")
         finally:
             os.remove(path)
 
