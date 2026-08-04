@@ -167,6 +167,7 @@ _ALLOWED_KEY_PATTERNS = [
     re.compile(rf"^originals/{_UUID}/{_HEX32}\.jpg$"),
     re.compile(rf"^originals/source/{_UUID}/{_HEX32}\.(jpg|jpeg|heic|heif|png|webp)$"),
     re.compile(rf"^originals/archives/{_UUID}/part-\d+\.zip$"),
+    re.compile(rf"^originals/archives/{_UUID}/prebuilt-{_UUID}\.zip$"),
 ]
 
 PRESIGN_EXPIRES_SECONDS = 3600

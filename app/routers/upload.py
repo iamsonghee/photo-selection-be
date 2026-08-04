@@ -36,7 +36,7 @@ from app.storage import (
     head_r2_object_sync,
     upload_to_r2,
 )
-from app.archive import _maybe_enqueue_archive_build
+from app.archive import _maybe_enqueue_archive_build, _maybe_enqueue_staging_archive_part
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -912,6 +912,10 @@ async def _process_original_job(job: dict) -> None:
         return
 
     logger.info("[worker] completed original job=%s source_key=%s size=%d", job_id, source_key, original_size)
+
+    # 400MB 정도의 완료 원본은 업로드가 계속되는 동안 임시 ZIP으로 미리 준비한다.
+    # 최종 ZIP과 분리되어 있으므로 이 호출 실패는 기존 업로드/다운로드 흐름을 바꾸지 않는다.
+    _maybe_enqueue_staging_archive_part(project_id)
 
     # 이 사진 완료로 프로젝트의 원본 전체가 완료됐을 수 있으므로 아카이브 enqueue 재확인
     _maybe_enqueue_archive_build(project_id)
