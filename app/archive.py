@@ -342,6 +342,17 @@ async def _process_archive_part(part: dict) -> None:
         _fail(f"DB completion failed: {e}")
         return
 
+    # 고객 링크가 ZIP 완료 전 먼저 열렸다면, 다운로드 30일 기산은 실제 원본 준비 완료
+    # 시점부터 시작한다. DB 마이그레이션 적용 전에도 이 보완 경로로 누락을 막는다.
+    try:
+        supabase.table("projects").update({
+            "original_download_started_at": now_iso,
+        }).eq("id", project_id).eq("status", "selecting").eq(
+            "original_archive_status", "ready"
+        ).is_("original_download_started_at", "null").execute()
+    except Exception as e:
+        logger.exception("[archive] download window start failed for project %s: %s", project_id, e)
+
     logger.info("[archive] completed part=%s project=%s key=%s", part_id, project_id, r2_key)
 
 
