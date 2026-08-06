@@ -909,7 +909,18 @@ async def _process_original_job(job: dict) -> None:
 
     logger.info("[worker] completed original job=%s source_key=%s size=%d", job_id, source_key, original_size)
 
-    # 원본은 고객 다운로드 시 R2에서 직접 제공한다. ZIP/임시 ZIP을 생성하지 않는다.
+    # 고객 링크가 이미 열린 프로젝트라면 마지막 원본 완료 시점에도 ZIP 작업 등록을 다시
+    # 시도한다. 링크 활성화 시점에는 일부 원본이 아직 처리 중일 수 있으므로, 그 한 번의
+    # 시도만으로는 ZIP 작업이 영구히 누락될 수 있다. RPC는 모든 원본 완료 여부와 NULL →
+    # pending 전환을 원자적으로 검사하므로 사진마다 호출해도 안전하다.
+    try:
+        supabase.rpc("enqueue_original_archive_build", {
+            "p_project_id": project_id,
+        }).execute()
+    except Exception as e:
+        # 원본 보존 완료 자체는 성공 처리한다. 아카이브 워커의 주기적 복구와 다음 원본 완료
+        # 이벤트가 재시도할 수 있도록 오류만 기록한다.
+        logger.exception("enqueue_original_archive_build failed for project %s: %s", project_id, e)
 
 
 async def original_compress_worker() -> None:
