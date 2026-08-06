@@ -253,7 +253,13 @@ def build_content_disposition(display_name: str) -> str:
     Content-Disposition 헤더 값을 만든다."""
     safe = sanitize_filename_component(display_name)
     encoded = _urlparse.quote(safe, safe="")
-    return f'attachment; filename="download.zip"; filename*=UTF-8\'\'{encoded}'
+    # 일부 모바일 브라우저는 filename*보다 ASCII filename을 우선한다. 원본 사진에도
+    # download.zip을 넣으면 JPEG가 ZIP으로 저장되므로 fallback의 확장자를 보존한다.
+    match = re.search(r"\.[A-Za-z0-9]{1,10}$", safe)
+    extension = match.group(0) if match else ""
+    ascii_base = re.sub(r"[^\x20-\x7E]", "", safe[:len(safe) - len(extension)]).strip()
+    fallback = f"{ascii_base}{extension}" if ascii_base else f"download{extension}"
+    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
 
 
 def generate_presigned_put_url(key: str, content_type: str, expires: int = PRESIGN_EXPIRES_SECONDS) -> str:
