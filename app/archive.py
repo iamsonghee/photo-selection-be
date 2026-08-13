@@ -440,7 +440,9 @@ async def archive_sweep_worker() -> None:
             r1 = supabase.rpc("recover_stuck_original_archive_builds", {"p_stuck_minutes": 15}).execute()
             if r1.data:
                 logger.info("[archive sweep] recovered %d stuck build(s) (no parts yet)", r1.data)
-            r2 = supabase.rpc("recover_stuck_original_archive_parts", {"p_stuck_minutes": 15}).execute()
+            # part 하나의 다운로드+ZIP+업로드는 파트 크기(ARCHIVE_PART_MAX_BYTES)에 비례해
+            # 길어질 수 있어, 빌드 claim(15분)보다 여유 있는 임계값을 둔다.
+            r2 = supabase.rpc("recover_stuck_original_archive_parts", {"p_stuck_minutes": 45}).execute()
             if r2.data:
                 logger.info("[archive sweep] recovered %d stuck part(s)", r2.data)
         except Exception as e:

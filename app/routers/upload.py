@@ -545,6 +545,19 @@ async def upload_photos(
                 row["original_filename"] = display_fn
             if original_presigned:
                 row["original_status"] = "awaiting_upload"
+                # photo와 original_job을 insert_photos_with_numbers RPC의 같은 트랜잭션에서
+                # 생성해, photo INSERT 뒤 job INSERT 실패로 생기는 고아 행을 막는다.
+                original_job: dict = {
+                    "r2_source_key": original_presigned["source_key"],
+                    "source_content_type": original_presigned["content_type"],
+                    "original_filename": orig_fn or None,
+                    "original_content_type": orig_ct or None,
+                }
+                if orig_sz is not None:
+                    original_job["original_file_size"] = orig_sz
+                if orig_lm is not None:
+                    original_job["original_last_modified"] = orig_lm
+                row["_original_job"] = original_job
             rows.append(row)
             presigned_infos.append((original_presigned, orig_fn, orig_ct, orig_sz, orig_lm))
 
@@ -592,44 +605,72 @@ async def upload_photos(
         logger.exception("projects photo_count update failed: %s", e)
         raise HTTPException(status_code=500, detail="프로젝트 업데이트 실패") from e
 
-    # original_jobs 등록 + presigned PUT URL 생성
+    # original_jobs는 위 RPC 트랜잭션에서 이미 생성됐다. 생성된 job을 조회해 URL만 발급한다.
     original_presigned_response: list[dict] = []
     now_utc = datetime.now(timezone.utc)
     expires_at = (now_utc + timedelta(seconds=ORIGINAL_PRESIGNED_EXPIRES)).isoformat()
 
-    for photo_row, (presigned_info, orig_fn, orig_ct, orig_sz, orig_lm) in zip(inserted, presigned_infos):
+    original_photo_ids = [
+        photo_row["id"]
+        for photo_row, (presigned_info, *_rest) in zip(inserted, presigned_infos)
+        if presigned_info
+    ]
+    jobs_by_photo: dict[str, dict] = {}
+    if original_photo_ids:
+        try:
+            jobs_r = (
+                supabase.table("original_jobs")
+                .select("id,photo_id,r2_source_key,source_content_type")
+                .in_("photo_id", original_photo_ids)
+                .execute()
+            )
+            jobs_by_photo = {str(job["photo_id"]): job for job in (jobs_r.data or [])}
+        except Exception as e:
+            # job은 이미 저장됐다. 다음 페이지 진입 시 복구 배너가 다시 조회할 수 있다.
+            logger.exception("created original_jobs lookup failed: %s", e)
+
+    for photo_row, (presigned_info, _orig_fn, _orig_ct, _orig_sz, _orig_lm) in zip(inserted, presigned_infos):
         if not presigned_info:
             continue
-        db_photo_id = photo_row["id"]
-        source_key = presigned_info["source_key"]
-        ct = presigned_info["content_type"]
+        job = jobs_by_photo.get(str(photo_row["id"]))
+        if not job:
+            # DB 마이그레이션보다 BE가 먼저 배포된 짧은 구간의 하위 호환. 신규 RPC가
+            # 적용된 뒤에는 도달하지 않으며, 적용 전에도 원본 업로드 자체는 중단하지 않는다.
+            try:
+                fallback_payload: dict = {
+                    "photo_id": photo_row["id"],
+                    "project_id": project_id,
+                    "r2_source_key": presigned_info["source_key"],
+                    "source_content_type": presigned_info["content_type"],
+                    "status": "awaiting_upload",
+                    "original_filename": _orig_fn or None,
+                    "original_content_type": _orig_ct or None,
+                }
+                if _orig_sz is not None:
+                    fallback_payload["original_file_size"] = _orig_sz
+                if _orig_lm is not None:
+                    fallback_payload["original_last_modified"] = _orig_lm
+                fallback_r = supabase.table("original_jobs").insert(fallback_payload).execute()
+                job = (fallback_r.data or [None])[0]
+            except Exception as e:
+                logger.exception("fallback original_job insert failed for photo %s: %s", photo_row["id"], e)
+                continue
+        if not job:
+            logger.error("original_job not found for photo %s", photo_row["id"])
+            continue
         try:
-            job_payload: dict = {
-                "photo_id": db_photo_id,
-                "project_id": project_id,
-                "r2_source_key": source_key,
-                "source_content_type": ct,
-                "status": "awaiting_upload",
-                "original_filename": orig_fn or None,
-                "original_content_type": orig_ct or None,
-            }
-            if orig_sz is not None:
-                job_payload["original_file_size"] = orig_sz
-            if orig_lm is not None:
-                job_payload["original_last_modified"] = orig_lm
-            job_r = supabase.table("original_jobs").insert(job_payload).execute()
-            job_id = (job_r.data or [{}])[0].get("id")
+            source_key = job["r2_source_key"]
+            ct = job["source_content_type"]
             presigned_url = generate_presigned_put_url(source_key, ct, ORIGINAL_PRESIGNED_EXPIRES)
-            if job_id:
-                original_presigned_response.append({
-                    "job_id": job_id,
-                    "url": presigned_url,
-                    "source_key": source_key,
-                    "content_type": ct,
-                    "expires_at": expires_at,
-                })
+            original_presigned_response.append({
+                "job_id": job["id"],
+                "url": presigned_url,
+                "source_key": source_key,
+                "content_type": ct,
+                "expires_at": expires_at,
+            })
         except Exception as e:
-            logger.exception("original_jobs insert/presign failed for photo %s: %s", db_photo_id, e)
+            logger.exception("original presign failed for photo %s: %s", photo_row["id"], e)
 
     response: dict = {"uploaded": len(inserted), "rejected": rejected_filenames}
     if original_presigned_response:
@@ -686,6 +727,75 @@ async def confirm_original_upload(
         logger.exception("confirm_original_upload RPC failed for job %s: %s", job_id, e)
         raise HTTPException(status_code=500, detail="confirm 처리 실패") from e
     return {"ok": True}
+
+
+@router.post("/originals/finalize")
+async def finalize_original_upload(
+    project_id: str = Form(...),
+    photographer_id: UUID = Depends(get_current_photographer),
+):
+    """업로드 세션 종료 시 DB 상태만 집계한다.
+
+    R2 HEAD나 worker 완료를 기다리지 않고, confirm을 통과한 pending/processing/completed를
+    수락 상태로 본다. 따라서 정상 업로드 경로에는 작은 DB count 쿼리만 추가된다.
+    """
+    supabase = get_supabase()
+    proj_r = (
+        supabase.table("projects")
+        .select("id")
+        .eq("id", project_id)
+        .eq("photographer_id", str(photographer_id))
+        .limit(1)
+        .execute()
+    )
+    if not proj_r.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    def result_count(result) -> int:
+        count = getattr(result, "count", None)
+        return int(count) if count is not None else len(result.data or [])
+
+    try:
+        total = result_count(
+            supabase.table("photos")
+            .select("id", count="exact")
+            .eq("project_id", project_id)
+            .execute()
+        )
+        accepted = result_count(
+            supabase.table("photos")
+            .select("id", count="exact")
+            .eq("project_id", project_id)
+            .in_("original_status", ["pending", "processing", "completed"])
+            .execute()
+        )
+        completed = result_count(
+            supabase.table("photos")
+            .select("id", count="exact")
+            .eq("project_id", project_id)
+            .eq("original_status", "completed")
+            .execute()
+        )
+        jobs = result_count(
+            supabase.table("original_jobs")
+            .select("id", count="exact")
+            .eq("project_id", project_id)
+            .execute()
+        )
+    except Exception as e:
+        logger.exception("original upload finalize failed for project %s: %s", project_id, e)
+        raise HTTPException(status_code=500, detail="원본 업로드 상태 확인 실패") from e
+
+    incomplete = max(0, total - accepted)
+    missing_jobs = max(0, total - jobs)
+    return {
+        "ok": total > 0 and incomplete == 0 and missing_jobs == 0,
+        "total": total,
+        "accepted": accepted,
+        "completed": completed,
+        "incomplete": incomplete,
+        "missing_jobs": missing_jobs,
+    }
 
 
 def _get_r2_object_sync(key: str) -> bytes:
