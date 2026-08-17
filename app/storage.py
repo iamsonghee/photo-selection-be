@@ -164,9 +164,11 @@ _ALLOWED_KEY_PATTERNS = [
     re.compile(rf"^photos/{_UUID}/{_UUID}/{_HEX32}_(thumb|preview)\.jpg$"),
     re.compile(rf"^versions/{_UUID}/v\d+/{_UUID}_{_SAFE}$"),
     re.compile(rf"^versions/{_UUID}/v\d+/{_UUID}_thumb\.jpg$"),
+    re.compile(rf"^versions/{_UUID}/delivery/v[12]/{_UUID}_{_HEX32}\.(jpg|jpeg|png|webp|heic|heif)$"),
     re.compile(rf"^originals/{_UUID}/{_HEX32}\.jpg$"),
     re.compile(rf"^originals/source/{_UUID}/{_HEX32}\.(jpg|jpeg|heic|heif|png|webp)$"),
     re.compile(rf"^originals/archives/{_UUID}/part-\d+\.zip$"),
+    re.compile(rf"^versions/delivery-archives/{_UUID}/{_UUID}/part-\d+\.zip$"),
 ]
 
 PRESIGN_EXPIRES_SECONDS = 3600

@@ -2,6 +2,7 @@
 import asyncio
 import gc
 import io
+import json
 import logging
 import os
 import re
@@ -22,6 +23,7 @@ except ImportError:
         return -1.0
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 register_heif_opener()
@@ -34,6 +36,7 @@ from app.storage import (
     generate_presigned_put_url,
     get_r2_object_bytes_sync,
     head_r2_object_sync,
+    r2_key_from_url,
     upload_to_r2,
 )
 
@@ -55,7 +58,7 @@ THUMB_JPEG_QUALITY = 75
 PREVIEW_MAX_SIZE = 1200
 PREVIEW_JPEG_QUALITY = 82
 
-# 보정본 (원본과 동일한 사이즈·품질 기준)
+# 보정본 고객 검토용 프리뷰(최종 납품 원본은 delivery direct PUT 경로로 별도 보존)
 VERSION_MAX_SIZE = 1200
 VERSION_JPEG_QUALITY = 82
 VERSION_THUMB_MAX_SIZE = 300
@@ -105,6 +108,10 @@ ORIGINAL_PRESIGNED_EXPIRES = 3600
 # 원본(납품) 파일 상한 (20MB)
 ORIGINAL_MAX_BYTES = 20 * 1024 * 1024
 
+# 최종 납품용 보정본은 변환 없이 보존한다. 브라우저가 R2로 직접 PUT하므로 FastAPI
+# 메모리에는 올라오지 않으며, 비정상적으로 큰 단일 파일만 방어한다.
+DELIVERY_VERSION_MAX_BYTES = 100 * 1024 * 1024
+
 # content_type → 파일 확장자
 _CT_TO_EXT: dict[str, str] = {
     "image/jpeg": "jpg",
@@ -114,6 +121,25 @@ _CT_TO_EXT: dict[str, str] = {
     "image/png": "png",
     "image/webp": "webp",
 }
+
+
+class DeliveryVersionPresignItem(BaseModel):
+    photo_id: UUID
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(min_length=1, max_length=100)
+    byte_size: int = Field(gt=0, le=DELIVERY_VERSION_MAX_BYTES)
+
+
+class DeliveryVersionPresignRequest(BaseModel):
+    project_id: UUID
+    version: int
+    items: list[DeliveryVersionPresignItem] = Field(min_length=1, max_length=100)
+
+
+class DeliveryVersionAbandonRequest(BaseModel):
+    project_id: UUID
+    version: int
+    keys: list[str] = Field(min_length=1, max_length=100)
 
 # Pillow / boto3 블로킹 작업용 스레드풀 (/photos 외 엔드포인트 공용)
 _executor = ThreadPoolExecutor(max_workers=IMAGE_EXECUTOR_MAX_WORKERS)
@@ -1240,17 +1266,110 @@ async def _process_one_version(
     return (r2_url, r2_thumb_url or "", photo_id, len(full_bytes), filename)
 
 
+@router.post("/versions/delivery/presign")
+async def presign_delivery_versions(
+    payload: DeliveryVersionPresignRequest,
+    photographer_id: UUID = Depends(get_current_photographer),
+):
+    """최종 납품용 보정본을 R2에 직접 PUT할 URL을 발급한다.
+
+    이 파일은 리사이즈/재인코딩하지 않는다. 검토용 1200px 이미지는 기존
+    ``POST /versions``에서 별도로 생성한다.
+    """
+    if payload.version not in (1, 2):
+        raise HTTPException(status_code=400, detail="version must be 1 or 2")
+
+    supabase = get_supabase()
+    project_id = str(payload.project_id)
+    project_r = (
+        supabase.table("projects")
+        .select("id,status")
+        .eq("id", project_id)
+        .eq("photographer_id", str(photographer_id))
+        .limit(1)
+        .execute()
+    )
+    if not project_r.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    expected_status = "editing" if payload.version == 1 else "editing_v2"
+    if project_r.data[0].get("status") != expected_status:
+        raise HTTPException(status_code=409, detail="검토 중에는 보정본을 교체할 수 없습니다.")
+
+    requested_ids = [str(item.photo_id) for item in payload.items]
+    if len(set(requested_ids)) != len(requested_ids):
+        raise HTTPException(status_code=400, detail="Duplicate photo_id")
+    photos_r = (
+        supabase.table("photos")
+        .select("id")
+        .eq("project_id", project_id)
+        .in_("id", requested_ids)
+        .execute()
+    )
+    owned_ids = {str(row["id"]) for row in (photos_r.data or [])}
+    if owned_ids != set(requested_ids):
+        raise HTTPException(status_code=400, detail="일부 사진이 프로젝트와 일치하지 않습니다.")
+
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ORIGINAL_PRESIGNED_EXPIRES)).isoformat()
+    response_items: list[dict] = []
+    for item in payload.items:
+        content_type = item.content_type.lower().split(";", 1)[0].strip()
+        if content_type not in ALLOWED_CONTENT_TYPES:
+            content_type = _infer_content_type(item.filename) or ""
+        if content_type not in ALLOWED_CONTENT_TYPES:
+            raise HTTPException(status_code=400, detail=f"지원하지 않는 이미지 형식입니다: {item.filename}")
+        ext = _CT_TO_EXT.get(content_type, "jpg")
+        key = f"versions/{project_id}/delivery/v{payload.version}/{item.photo_id}_{uuid_module.uuid4().hex}.{ext}"
+        response_items.append({
+            "photo_id": str(item.photo_id),
+            "key": key,
+            "url": generate_presigned_put_url(key, content_type, ORIGINAL_PRESIGNED_EXPIRES),
+            "content_type": content_type,
+            "filename": item.filename,
+            "byte_size": item.byte_size,
+            "expires_at": expires_at,
+        })
+    return {"items": response_items}
+
+
+@router.post("/versions/delivery/abandon")
+async def abandon_delivery_versions(
+    payload: DeliveryVersionAbandonRequest,
+    photographer_id: UUID = Depends(get_current_photographer),
+):
+    """검토용 업로드까지 완료되지 못한 direct PUT 객체를 best-effort로 정리한다."""
+    if payload.version not in (1, 2):
+        raise HTTPException(status_code=400, detail="version must be 1 or 2")
+    supabase = get_supabase()
+    project_id = str(payload.project_id)
+    owner = (supabase.table("projects").select("id").eq("id", project_id)
+             .eq("photographer_id", str(photographer_id)).limit(1).execute())
+    if not owner.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    prefix = f"versions/{project_id}/delivery/v{payload.version}/"
+    if any(not key.startswith(prefix) for key in payload.keys):
+        raise HTTPException(status_code=400, detail="Invalid delivery key")
+    linked_r = supabase.table("photo_versions").select("r2_delivery_url").in_(
+        "r2_delivery_url", list(set(payload.keys))
+    ).execute()
+    linked = {str(row["r2_delivery_url"]) for row in (linked_r.data or []) if row.get("r2_delivery_url")}
+    deletable = [key for key in set(payload.keys) if key not in linked]
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_executor, _delete_r2_objects_sync, deletable)
+    return {"deleted": len(deletable)}
+
+
 @router.post("/versions")
 async def upload_versions(
     project_id: str = Form(...),
     version: int = Form(...),
     photo_ids: str = Form(..., description="comma-separated photo_id list, order matches files"),
+    delivery_metadata: str = Form(..., description="JSON array with original-size delivery R2 metadata"),
     files: list[UploadFile] = File(...),
     photographer_id: UUID = Depends(get_current_photographer),
 ):
     """
-    보정본 일괄 업로드: 리사이즈(최장변 1500px, JPEG 85%, 2MB 제한) 후 R2 업로드, photo_versions INSERT.
-    form: project_id, version (1 or 2), photo_ids (id1,id2,id3), files (multipart).
+    보정본 일괄 업로드: 검토용 1200px JPEG를 생성하고, 이미 direct PUT된 원본 크기
+    납품 파일을 HEAD 검증한 뒤 두 자산을 photo_versions 한 행에 함께 UPSERT한다.
     """
     if version not in (1, 2):
         raise HTTPException(status_code=400, detail="version must be 1 or 2")
@@ -1266,7 +1385,7 @@ async def upload_versions(
 
     project_r = (
         supabase.table("projects")
-        .select("id")
+        .select("id,status")
         .eq("id", project_id)
         .eq("photographer_id", str(photographer_id))
         .limit(1)
@@ -1274,6 +1393,9 @@ async def upload_versions(
     )
     if not project_r.data or len(project_r.data) == 0:
         raise HTTPException(status_code=404, detail="Project not found")
+    expected_status = "editing" if version == 1 else "editing_v2"
+    if project_r.data[0].get("status") != expected_status:
+        raise HTTPException(status_code=409, detail="검토 중에는 보정본을 교체할 수 없습니다.")
 
     # 베타 제한: 보정본 횟수 체크
     try:
@@ -1316,6 +1438,41 @@ async def upload_versions(
             detail="photo_ids count must match files count",
         )
 
+    try:
+        delivery_items = json.loads(delivery_metadata)
+        if not isinstance(delivery_items, list):
+            raise ValueError
+        delivery_by_photo = {str(item["photo_id"]): item for item in delivery_items}
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="delivery_metadata 형식이 올바르지 않습니다.")
+    if set(delivery_by_photo) != set(pid_list):
+        raise HTTPException(status_code=400, detail="모든 보정본의 납품용 원본 파일이 필요합니다.")
+
+    verified_delivery: dict[str, dict] = {}
+    loop = asyncio.get_event_loop()
+    for photo_id in pid_list:
+        item = delivery_by_photo[photo_id]
+        key = str(item.get("key") or "")
+        expected_prefix = f"versions/{project_id}/delivery/v{version}/{photo_id}_"
+        if not key.startswith(expected_prefix):
+            raise HTTPException(status_code=400, detail="납품용 보정본 경로가 올바르지 않습니다.")
+        try:
+            actual_size = await loop.run_in_executor(_executor, _head_r2_object_sync, key)
+        except Exception as e:
+            logger.warning("delivery version HEAD failed key=%s: %s", key, e)
+            raise HTTPException(status_code=409, detail="납품용 보정본 업로드를 확인하지 못했습니다. 다시 시도해주세요.") from e
+        if actual_size > DELIVERY_VERSION_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="보정본 한 장은 최대 100MB까지 업로드할 수 있습니다.")
+        declared_size = int(item.get("byte_size") or 0)
+        if declared_size <= 0 or declared_size != actual_size:
+            raise HTTPException(status_code=409, detail="납품용 보정본 파일 크기가 일치하지 않습니다.")
+        verified_delivery[photo_id] = {
+            "key": key,
+            "filename": str(item.get("filename") or "photo.jpg")[:255],
+            "content_type": str(item.get("content_type") or "application/octet-stream")[:100],
+            "byte_size": actual_size,
+        }
+
     valid: list[tuple[str, bytes, str, str]] = []  # (photo_id, contents, content_type, filename)
     for photo_id, upload_file in zip(pid_list, files):
         content_type = upload_file.content_type
@@ -1333,7 +1490,6 @@ async def upload_versions(
     if not valid:
         return {"uploaded": 0, "items": [], "message": "처리된 파일이 없습니다. JPEG/PNG/WebP 형식과 파일 크기를 확인하세요."}
 
-    loop = asyncio.get_event_loop()
     sem = asyncio.Semaphore(VERSION_UPLOAD_CONCURRENCY)
 
     async def _limited_version(
@@ -1373,6 +1529,33 @@ async def upload_versions(
             status_code=503,
             detail="스토리지 업로드 실패. R2 설정을 확인하세요.",
         )
+    if len(results) != len(valid):
+        preview_keys: list[str] = []
+        for item in results:
+            for url in (item.get("r2_url"), item.get("r2_thumb_url")):
+                if url:
+                    try: preview_keys.append(r2_key_from_url(url))
+                    except ValueError: pass
+        if preview_keys:
+            await loop.run_in_executor(_executor, _delete_r2_objects_sync, preview_keys)
+        raise HTTPException(status_code=503, detail="일부 보정본 처리에 실패했습니다. 전체 파일을 다시 시도해주세요.")
+
+    old_delivery_keys: list[str] = []
+    try:
+        old_r = (
+            supabase.table("photo_versions")
+            .select("photo_id,r2_delivery_url")
+            .in_("photo_id", [item["photo_id"] for item in results])
+            .eq("version", version)
+            .execute()
+        )
+        old_delivery_keys = [
+            str(row["r2_delivery_url"])
+            for row in (old_r.data or [])
+            if row.get("r2_delivery_url")
+        ]
+    except Exception as e:
+        logger.warning("old delivery version lookup failed: %s", e)
 
     rows = [
         {
@@ -1383,6 +1566,11 @@ async def upload_versions(
             "photographer_memo": None,
             "file_size": item["file_size"],
             "filename": item.get("filename") or None,
+            "r2_delivery_url": verified_delivery[item["photo_id"]]["key"],
+            "delivery_filename": verified_delivery[item["photo_id"]]["filename"],
+            "delivery_file_size": verified_delivery[item["photo_id"]]["byte_size"],
+            "delivery_content_type": verified_delivery[item["photo_id"]]["content_type"],
+            "delivery_ready_at": datetime.now(timezone.utc).isoformat(),
         }
         for item in results
     ]
@@ -1392,10 +1580,29 @@ async def upload_versions(
             on_conflict="photo_id,version",
         ).execute()
     except Exception as e:
+        preview_keys: list[str] = []
+        for item in results:
+            for url in (item.get("r2_url"), item.get("r2_thumb_url")):
+                if url:
+                    try: preview_keys.append(r2_key_from_url(url))
+                    except ValueError: pass
+        if preview_keys:
+            try: await loop.run_in_executor(_executor, _delete_r2_objects_sync, preview_keys)
+            except Exception: logger.exception("failed preview cleanup after DB upsert error")
         logger.error(f"에러내용: {e}")
         logger.exception("photo_versions upsert failed: %s", e)
         err_msg = str(e).strip() or "사진 버전 저장 실패"
         raise HTTPException(status_code=500, detail=err_msg) from e
+
+    # 새 행이 DB에 안전하게 연결된 뒤에만 교체 전 원본을 정리한다.
+    # 삭제 실패는 다음 프로젝트 삭제에서 prefix 정리된다.
+    linked_keys = {verified_delivery[item["photo_id"]]["key"] for item in results}
+    cleanup_keys = [key for key in set(old_delivery_keys) if key not in linked_keys]
+    if cleanup_keys:
+        try:
+            await loop.run_in_executor(_executor, _delete_r2_objects_sync, cleanup_keys)
+        except Exception as e:
+            logger.warning("delivery version cleanup failed: %s", e)
 
     # 교체된 보정본의 기존 version_reviews 삭제 (재보정 요청 상태 초기화)
     # → editing_v2 재진입 시 교체 전에 CTA가 활성화되는 문제 방지

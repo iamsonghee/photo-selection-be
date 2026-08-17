@@ -387,6 +387,155 @@ async def original_archive_worker() -> None:
         await asyncio.sleep(5)
 
 
+def _bin_pack_delivery(entries: list[dict]) -> list[list[dict]]:
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    current_size = 0
+    for entry in entries:
+        size = int(entry.get("byte_size") or _FALLBACK_PHOTO_BYTES)
+        if current and current_size + size > ARCHIVE_PART_MAX_BYTES:
+            groups.append(current)
+            current, current_size = [], 0
+        current.append(entry)
+        current_size += size
+    if current:
+        groups.append(current)
+    return groups
+
+
+async def _create_final_delivery_parts(archive: dict) -> None:
+    """검토 시작 시 고정된 manifest를 파트로 나눈다. 이후 V2 업로드/교체와 무관하다."""
+    archive_id = archive["id"]
+    project_id = archive["project_id"]
+    manifest = archive.get("manifest") or []
+    supabase = get_supabase()
+    if not manifest:
+        supabase.table("final_delivery_archives").update({
+            "status": "failed", "last_error": "empty manifest", "processing_started_at": None,
+        }).eq("id", archive_id).eq("status", "processing").execute()
+        return
+    rows = []
+    for idx, group in enumerate(_bin_pack_delivery(manifest), start=1):
+        rows.append({
+            "archive_id": archive_id,
+            "project_id": project_id,
+            "part_number": idx,
+            "r2_key": f"versions/delivery-archives/{project_id}/{archive_id}/part-{idx}.zip",
+            "manifest": group,
+            "file_count": len(group),
+            "byte_size": sum(int(item.get("byte_size") or 0) for item in group),
+            "status": "pending",
+        })
+    try:
+        supabase.table("final_delivery_archive_parts").insert(rows).execute()
+    except Exception as e:
+        logger.exception("[final archive] part insert failed archive=%s: %s", archive_id, e)
+        supabase.table("final_delivery_archives").update({
+            "status": "failed", "last_error": str(e), "processing_started_at": None,
+        }).eq("id", archive_id).eq("status", "processing").execute()
+
+
+def _download_and_zip_delivery_sync(manifest: list[dict]) -> tuple[str, int]:
+    entries = [(entry, str(entry.get("key") or "")) for entry in manifest if entry.get("key")]
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="final_delivery_")
+    os.close(fd)
+    count = 0
+    try:
+        used_names: set[str] = set()
+        with ThreadPoolExecutor(max_workers=ARCHIVE_DOWNLOAD_CONCURRENCY) as prefetch, \
+             zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            futures: dict[int, Future[bytes]] = {}
+            next_to_schedule = 0
+            while next_to_schedule < min(ARCHIVE_DOWNLOAD_CONCURRENCY, len(entries)):
+                futures[next_to_schedule] = prefetch.submit(get_r2_object_bytes_sync, entries[next_to_schedule][1])
+                next_to_schedule += 1
+            for index, (entry, _key) in enumerate(entries):
+                data = futures.pop(index).result()
+                if next_to_schedule < len(entries):
+                    futures[next_to_schedule] = prefetch.submit(get_r2_object_bytes_sync, entries[next_to_schedule][1])
+                    next_to_schedule += 1
+                arcname = _sanitize_arcname(entry.get("filename") or "photo.jpg")
+                if arcname in used_names:
+                    stem, ext = os.path.splitext(arcname)
+                    suffix = 2
+                    while f"{stem} ({suffix}){ext}" in used_names:
+                        suffix += 1
+                    arcname = f"{stem} ({suffix}){ext}"
+                used_names.add(arcname)
+                zf.writestr(arcname, data)
+                count += 1
+                del data
+    except Exception:
+        try: os.remove(tmp_path)
+        except OSError: pass
+        raise
+    return tmp_path, count
+
+
+async def _process_final_delivery_part(part: dict) -> None:
+    part_id, archive_id = part["id"], part["archive_id"]
+    r2_key = part["r2_key"]
+    supabase = get_supabase()
+    loop = asyncio.get_event_loop()
+
+    def fail(reason: str) -> None:
+        supabase.rpc("fail_final_delivery_archive_part", {
+            "p_part_id": part_id, "p_archive_id": archive_id,
+            "p_last_error": reason, "p_permanent": part["attempts"] >= part["max_attempts"],
+        }).execute()
+
+    def active() -> bool:
+        result = (supabase.table("final_delivery_archive_parts").select("id,final_delivery_archives!inner(status)")
+                  .eq("id", part_id).eq("status", "processing")
+                  .eq("final_delivery_archives.status", "processing").limit(1).execute())
+        return bool(result.data)
+
+    tmp_path: Optional[str] = None
+    try:
+        tmp_path, count = await loop.run_in_executor(_executor, _download_and_zip_delivery_sync, part.get("manifest") or [])
+        if count != int(part.get("file_count") or 0) or not await loop.run_in_executor(_executor, active):
+            if count != int(part.get("file_count") or 0): fail("manifest file count mismatch")
+            return
+        await loop.run_in_executor(_executor, upload_local_file_to_r2, r2_key, tmp_path, "application/zip")
+        await loop.run_in_executor(_executor, head_r2_object_sync, r2_key)
+        if not await loop.run_in_executor(_executor, active):
+            await loop.run_in_executor(_executor, delete_r2_objects, [r2_key])
+            return
+        supabase.rpc("complete_final_delivery_archive_part", {
+            "p_part_id": part_id, "p_archive_id": archive_id,
+        }).execute()
+    except Exception as e:
+        logger.exception("[final archive] part failed id=%s: %s", part_id, e)
+        try: fail(str(e))
+        except Exception: logger.exception("[final archive] failure update failed id=%s", part_id)
+    finally:
+        if tmp_path:
+            try: os.remove(tmp_path)
+            except OSError: pass
+        gc.collect()
+
+
+async def final_delivery_archive_worker() -> None:
+    logger.info("final_delivery_archive_worker started")
+    while True:
+        try:
+            supabase = get_supabase()
+            archives = supabase.rpc("claim_final_delivery_archives", {
+                "p_limit": ARCHIVE_BUILD_CONCURRENCY,
+            }).execute().data or []
+            for archive in archives:
+                await _create_final_delivery_parts(archive)
+            parts = supabase.rpc("claim_final_delivery_archive_parts", {
+                "p_limit": ARCHIVE_BUILD_CONCURRENCY,
+            }).execute().data or []
+            if parts:
+                await asyncio.gather(*[_process_final_delivery_part(part) for part in parts], return_exceptions=True)
+        except Exception as e:
+            # DB migration보다 BE가 먼저 배포된 짧은 구간도 기존 워커를 방해하지 않는다.
+            logger.debug("final_delivery_archive_worker cycle skipped: %s", e)
+        await asyncio.sleep(5)
+
+
 async def _cleanup_expired_archive_parts() -> None:
     """다운로드 만료(30일) + 유예(7일) = 37일 경과한 프로젝트의 완료된 아카이브 ZIP을 R2에서 삭제.
     삭제는 멱등(존재하지 않는 key 삭제도 에러 없이 통과) — 실패 시 deleted_at을 남기지 않아
@@ -430,6 +579,35 @@ async def _cleanup_expired_archive_parts() -> None:
         logger.info("[archive cleanup] deleted %d expired archive part(s)", deleted_total)
 
 
+async def _cleanup_final_delivery_archives() -> None:
+    """재보정으로 폐기된 후보와 최종 납품 37일 경과 ZIP을 정리한다."""
+    supabase = get_supabase()
+    obsolete_r = supabase.table("final_delivery_archives").select("id").eq("status", "obsolete").execute()
+    archive_ids = {row["id"] for row in (obsolete_r.data or [])}
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=ARCHIVE_RETENTION_DAYS + ARCHIVE_GRACE_DAYS)).isoformat()
+    projects_r = (supabase.table("projects").select("active_final_delivery_archive_id")
+                  .lt("delivered_at", cutoff).execute())
+    archive_ids.update(
+        row["active_final_delivery_archive_id"] for row in (projects_r.data or [])
+        if row.get("active_final_delivery_archive_id")
+    )
+    if not archive_ids:
+        return
+    loop = asyncio.get_event_loop()
+    for start in range(0, len(archive_ids), 100):
+        chunk = list(archive_ids)[start:start + 100]
+        parts_r = (supabase.table("final_delivery_archive_parts").select("id,r2_key")
+                   .in_("archive_id", chunk).eq("status", "completed").is_("deleted_at", "null").execute())
+        for part in (parts_r.data or []):
+            try:
+                await loop.run_in_executor(_executor, delete_r2_objects, [part["r2_key"]])
+                supabase.table("final_delivery_archive_parts").update({
+                    "deleted_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", part["id"]).execute()
+            except Exception as e:
+                logger.warning("[final archive cleanup] part=%s: %s", part["id"], e)
+
+
 async def archive_sweep_worker() -> None:
     """30분마다: 아카이브 고착 복구(프로젝트 단위 + 파트 단위) + 만료 아카이브 정리."""
     logger.info("archive_sweep_worker started")
@@ -445,10 +623,13 @@ async def archive_sweep_worker() -> None:
             r2 = supabase.rpc("recover_stuck_original_archive_parts", {"p_stuck_minutes": 45}).execute()
             if r2.data:
                 logger.info("[archive sweep] recovered %d stuck part(s)", r2.data)
+            supabase.rpc("recover_stuck_final_delivery_archives", {"p_stuck_minutes": 15}).execute()
+            supabase.rpc("recover_stuck_final_delivery_parts", {"p_stuck_minutes": 45}).execute()
         except Exception as e:
             logger.exception("archive_sweep_worker recovery error: %s", e)
 
         try:
             await _cleanup_expired_archive_parts()
+            await _cleanup_final_delivery_archives()
         except Exception as e:
             logger.exception("archive_sweep_worker cleanup error: %s", e)
