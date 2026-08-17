@@ -45,9 +45,9 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
 
-# 원본 사진 썸네일/프리뷰는 업로드마다 새 랜덤 UUID를 key로 써서 같은 key가 절대
-# 재사용되지 않는다 — 그래서만 안전하게 영구 캐싱 가능 (photo_versions 등 같은 key가
-# 재업로드로 덮어써질 수 있는 경로에는 절대 쓰지 말 것).
+# 원본 사진 썸네일/프리뷰는 논리 업로드 항목마다 고유한 client_upload_id를 key로 쓴다.
+# 네트워크 응답 유실 재시도만 같은 바이트로 같은 key를 덮어쓰므로 영구 캐싱이 안전하다.
+# (photo_versions처럼 사용자가 다른 바이트를 재업로드하는 경로에는 적용하지 말 것.)
 IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 # 원본 썸네일 (갤러리) — OPT-01: 300px로 축소 (갤러리 카드 크기 기준 충분)
@@ -350,6 +350,7 @@ async def _process_one(
     photographer_id: UUID,
     include_original: bool = False,
     original_content_type: str = "",  # 브라우저 원본 파일의 MIME type (presigned key 확장자 결정용)
+    client_upload_id: Optional[str] = None,
 ) -> Optional[Tuple[str, str, int, Optional[dict]]]:
     """파일 하나: 썸네일+미리보기 생성 → R2 업로드.
     include_original=True 시 presigned PUT 정보를 반환 (원본 압축은 worker가 비동기 처리).
@@ -359,7 +360,9 @@ async def _process_one(
     썸네일/프리뷰 생성(CPU)과 R2 PUT(I/O)은 별도 스레드풀(_cpu_executor/_r2_executor)에서
     실행한다 — 동시 요청 실측에서 공유 풀 경쟁이 확인되어 분리함(OPT-02).
     """
-    photo_id = uuid_module.uuid4().hex
+    # 같은 브라우저 업로드 요청의 재시도는 같은 key를 덮어쓴다. 응답 유실 뒤
+    # direct API -> Next proxy로 fallback해도 R2 고아 객체가 새로 생기지 않는다.
+    photo_id = uuid_module.UUID(client_upload_id).hex if client_upload_id else uuid_module.uuid4().hex
 
     try:
         thumb_bytes, preview_bytes = await loop.run_in_executor(
@@ -415,6 +418,7 @@ async def upload_photos(
     original_file_sizes: list[int] = Form(default=[]),
     original_last_modifieds: list[int] = Form(default=[]),
     original_content_types: list[str] = Form(default=[]),
+    client_upload_ids: list[str] = Form(default=[]),
     photographer_id: UUID = Depends(get_current_photographer),
 ):
     """
@@ -455,7 +459,7 @@ async def upload_photos(
     # 허용된 파일만 읽음 (BUG-01: 거부 파일 목록 수집 / BUG-02: 소문자 정규화)
     valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, compressed_filename, file_size)
     # 복구 매칭용 원본 파일 메타 (valid와 1:1 대응, FE가 보낸 original_* Form 필드 기반)
-    meta: list[tuple[str, str, Optional[int], Optional[int]]] = []  # (orig_fn, orig_ct, orig_size, orig_lm)
+    meta: list[tuple[str, str, Optional[int], Optional[int], Optional[str]]] = []  # + client_upload_id
     rejected_filenames: list[str] = []
     for i, f in enumerate(files):
         ct = (f.content_type or "").lower()  # BUG-02: 대문자 MIME 타입 정규화
@@ -484,7 +488,13 @@ async def upload_photos(
         orig_ct = original_content_types[i] if i < len(original_content_types) else ct
         orig_sz: Optional[int] = original_file_sizes[i] if i < len(original_file_sizes) else None
         orig_lm: Optional[int] = original_last_modifieds[i] if i < len(original_last_modifieds) else None
-        meta.append((orig_fn, orig_ct, orig_sz, orig_lm))
+        client_upload_id: Optional[str] = None
+        if i < len(client_upload_ids) and client_upload_ids[i]:
+            try:
+                client_upload_id = str(uuid_module.UUID(client_upload_ids[i]))
+            except (ValueError, AttributeError):
+                raise HTTPException(status_code=400, detail="invalid client_upload_id")
+        meta.append((orig_fn, orig_ct, orig_sz, orig_lm, client_upload_id))
 
     if not valid:
         raise HTTPException(
@@ -504,9 +514,32 @@ async def upload_photos(
         logger.exception("photo count check failed: %s", e)
         raise HTTPException(status_code=500, detail="사진 수 확인 실패") from e
 
+    # 응답 유실 재시도는 이미 생성된 사진이므로 업로드 한도를 다시 소비하지 않는다.
+    request_client_ids = [item[4] for item in meta if item[4]]
+    existing_client_ids: set[str] = set()
+    if request_client_ids:
+        try:
+            existing_r = (
+                supabase.table("photos")
+                .select("client_upload_id")
+                .eq("project_id", project_id)
+                .in_("client_upload_id", request_client_ids)
+                .execute()
+            )
+            existing_client_ids = {
+                str(row["client_upload_id"])
+                for row in (existing_r.data or [])
+                if row.get("client_upload_id")
+            }
+        except Exception as e:
+            logger.exception("idempotency lookup failed: %s", e)
+            raise HTTPException(status_code=500, detail="업로드 재시도 상태 확인 실패") from e
+
+    new_item_count = sum(1 for item in meta if not item[4] or item[4] not in existing_client_ids)
+
     # 등급별 업로드 한도 체크 (관리자는 None=무제한)
     max_photos = get_max_photos_per_project(supabase, photographer_id)
-    if max_photos is not None and current_count >= max_photos:
+    if max_photos is not None and current_count >= max_photos and new_item_count > 0:
         try:
             supabase.table("admin_audit_logs").insert({
                 "photographer_id": str(photographer_id),
@@ -528,22 +561,34 @@ async def upload_photos(
         )
 
     # 부분 초과 시 가능한 만큼만(무제한이면 제한 없음)
-    if max_photos is not None:
+    if max_photos is not None and new_item_count > 0:
         remaining = max_photos - current_count
-        if len(valid) > remaining:
-            valid = valid[:remaining]
+        if new_item_count > remaining:
+            accepted_indices: list[int] = []
+            accepted_new = 0
+            for index, item in enumerate(meta):
+                is_replay = bool(item[4] and item[4] in existing_client_ids)
+                if is_replay or accepted_new < remaining:
+                    accepted_indices.append(index)
+                    if not is_replay:
+                        accepted_new += 1
+            valid = [valid[index] for index in accepted_indices]
+            meta = [meta[index] for index in accepted_indices]
 
     loop = asyncio.get_event_loop()
     effective_concurrency = UPLOAD_WITH_ORIGINAL_CONCURRENCY if include_original else UPLOAD_PHOTOS_CONCURRENCY
     sem = asyncio.Semaphore(effective_concurrency)
 
-    async def _limited_process_one(contents: bytes, index: int, orig_ct: str):
+    async def _limited_process_one(contents: bytes, index: int, orig_ct: str, client_upload_id: Optional[str]):
         async with sem:
-            return await _process_one(loop, contents, index, project_id, photographer_id, include_original, orig_ct)
+            return await _process_one(
+                loop, contents, index, project_id, photographer_id,
+                include_original, orig_ct, client_upload_id,
+            )
 
     results = await asyncio.gather(
         *[
-            _limited_process_one(contents, idx, meta[idx][1])
+            _limited_process_one(contents, idx, meta[idx][1], meta[idx][4])
             for idx, (contents, _, __, ___) in enumerate(valid)
         ],
         return_exceptions=True,
@@ -551,9 +596,9 @@ async def upload_photos(
 
     # asyncio.gather는 입력 순서를 보존하므로, valid의 원래 파일 순서 그대로 number가 매겨진다.
     rows: list[dict] = []
-    # presigned_infos: (presigned_dict | None, orig_fn, orig_ct, orig_sz, orig_lm) — rows와 1:1 대응
-    presigned_infos: list[tuple[Optional[dict], str, str, Optional[int], Optional[int]]] = []
-    for r, (_, __, compressed_fn, ___), (orig_fn, orig_ct, orig_sz, orig_lm) in zip(results, valid, meta):
+    # presigned_infos는 rows와 1:1 대응한다.
+    presigned_infos: list[tuple[Optional[dict], str, str, Optional[int], Optional[int], Optional[str]]] = []
+    for r, (_, __, compressed_fn, ___), (orig_fn, orig_ct, orig_sz, orig_lm, client_upload_id) in zip(results, valid, meta):
         if isinstance(r, Exception):
             logger.error(f"에러내용: {r}")
             logger.warning("process task failed: %s", r)
@@ -565,6 +610,8 @@ async def upload_photos(
                 "r2_preview_url": preview_url,
                 "file_size": r2_stored_bytes,
             }
+            if client_upload_id:
+                row["client_upload_id"] = client_upload_id
             # include_original일 때는 브라우저 원본 파일명, 아닐 때는 압축 파일명 사용
             display_fn = orig_fn if include_original else compressed_fn
             if display_fn:
@@ -585,7 +632,7 @@ async def upload_photos(
                     original_job["original_last_modified"] = orig_lm
                 row["_original_job"] = original_job
             rows.append(row)
-            presigned_infos.append((original_presigned, orig_fn, orig_ct, orig_sz, orig_lm))
+            presigned_infos.append((original_presigned, orig_fn, orig_ct, orig_sz, orig_lm, client_upload_id))
 
     # 파일 바이트 + 처리 결과 해제 후 OS에 힙 반환 (Python은 freed 메모리를 OS에 자동 반환 안 함)
     del valid
@@ -655,7 +702,7 @@ async def upload_photos(
             # job은 이미 저장됐다. 다음 페이지 진입 시 복구 배너가 다시 조회할 수 있다.
             logger.exception("created original_jobs lookup failed: %s", e)
 
-    for photo_row, (presigned_info, _orig_fn, _orig_ct, _orig_sz, _orig_lm) in zip(inserted, presigned_infos):
+    for photo_row, (presigned_info, _orig_fn, _orig_ct, _orig_sz, _orig_lm, _client_upload_id) in zip(inserted, presigned_infos):
         if not presigned_info:
             continue
         job = jobs_by_photo.get(str(photo_row["id"]))
@@ -698,7 +745,26 @@ async def upload_photos(
         except Exception as e:
             logger.exception("original presign failed for photo %s: %s", photo_row["id"], e)
 
-    response: dict = {"uploaded": len(inserted), "rejected": rejected_filenames}
+    replayed = sum(1 for item in presigned_infos if item[5] and item[5] in existing_client_ids)
+    if replayed:
+        logger.warning(
+            "idempotent photo upload replay: project=%s count=%s client_upload_ids=%s",
+            project_id, replayed, [item[5] for item in presigned_infos if item[5] in existing_client_ids],
+        )
+        try:
+            supabase.table("admin_audit_logs").insert({
+                "photographer_id": str(photographer_id),
+                "actor": "system",
+                "action": "upload_idempotency_replay",
+                "detail": {"project_id": project_id, "count": replayed},
+            }).execute()
+        except Exception:
+            logger.exception("admin_audit_logs insert failed (upload_idempotency_replay)")
+    response: dict = {
+        "uploaded": len(inserted),
+        "rejected": rejected_filenames,
+        "idempotency_replayed": replayed,
+    }
     if original_presigned_response:
         response["original_presigned"] = original_presigned_response
     return response
@@ -971,6 +1037,55 @@ async def abandon_original(
     except Exception as e:
         logger.exception("abandon failed for job %s: %s", job_id, e)
         raise HTTPException(status_code=500, detail="abandon 처리 실패") from e
+    return {"ok": True}
+
+
+@router.post("/originals/report-failure")
+async def report_original_upload_failure(
+    job_id: str = Form(...),
+    stage: str = Form("put_or_confirm"),
+    photographer_id: UUID = Depends(get_current_photographer),
+):
+    """브라우저의 모든 자동 재시도가 끝난 실패를 운영 진단용으로 기록한다.
+
+    원본 파일은 사용자가 다시 선택해 복구할 수 있으므로 job 상태는 바꾸지 않는다.
+    """
+    supabase = get_supabase()
+    job_r = (
+        supabase.table("original_jobs")
+        .select("id,status,project_id")
+        .eq("id", job_id)
+        .limit(1)
+        .execute()
+    )
+    if not job_r.data:
+        raise HTTPException(status_code=404, detail="job not found")
+    job = job_r.data[0]
+    proj_r = (
+        supabase.table("projects")
+        .select("id")
+        .eq("id", job["project_id"])
+        .eq("photographer_id", str(photographer_id))
+        .limit(1)
+        .execute()
+    )
+    if not proj_r.data:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if job["status"] in ("completed", "pending", "processing"):
+        return {"ok": True}
+
+    safe_stage = re.sub(r"[^a-z0-9_-]", "", stage.lower())[:40] or "put_or_confirm"
+    try:
+        (
+            supabase.table("original_jobs")
+            .update({"last_error": f"browser upload failed after retries: {safe_stage}"})
+            .eq("id", job_id)
+            .in_("status", ["awaiting_upload", "failed"])
+            .execute()
+        )
+    except Exception as e:
+        logger.exception("original upload failure report failed for job %s: %s", job_id, e)
+        raise HTTPException(status_code=500, detail="failure report failed") from e
     return {"ok": True}
 
 
