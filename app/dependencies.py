@@ -43,6 +43,53 @@ def get_jwks() -> List[Dict]:
     return keys
 
 
+#: 일시적 전송 오류만 재시도한다 — 인증 실패·권한 오류 같은 "진짜 실패"는 그대로 올린다.
+#  httpx.TransportError는 ConnectError(DNS 실패 Errno 8)·ReadError(Errno 35)·TimeoutException을
+#  모두 포함하는 상위 클래스다.
+_PHOTOGRAPHER_LOOKUP_ATTEMPTS = 3
+_PHOTOGRAPHER_LOOKUP_BACKOFF_SECONDS = 0.2
+
+
+def _select_photographer_with_retry(client, auth_user_id: str):
+    """photographers 조회 — 전송 계층 오류에 한해 짧은 backoff로 재시도.
+
+    Supabase client는 프로세스 전역 싱글턴이고 HTTP/2로 소켓 하나를 공유하므로, 네트워크가
+    잠깐 흔들리면 그 순간 진행 중이던 요청들이 함께 읽기 오류를 맞는다. 업로드처럼 요청이
+    몰리는 흐름에서는 이 한 번의 흔들림이 곧바로 사진 유실로 이어진다.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(1, _PHOTOGRAPHER_LOOKUP_ATTEMPTS + 1):
+        try:
+            return (
+                client.table("photographers")
+                .select("id")
+                .eq("auth_id", auth_user_id)
+                .limit(1)
+                .execute()
+            )
+        except httpx.TransportError as e:
+            last_error = e
+            logger.warning(
+                "photographers 조회 전송 오류 — 재시도 %d/%d: %s",
+                attempt, _PHOTOGRAPHER_LOOKUP_ATTEMPTS, type(e).__name__,
+            )
+            if attempt < _PHOTOGRAPHER_LOOKUP_ATTEMPTS:
+                time.sleep(_PHOTOGRAPHER_LOOKUP_BACKOFF_SECONDS * attempt)
+
+    # 여기까지 왔으면 재시도를 다 쓴 것이다. 500(서버 결함)이 아니라 503으로 알린다 —
+    # 일시적 장애라는 뜻이고, 클라이언트 재시도 정책도 503을 재시도 대상으로 본다.
+    #
+    # ⚠️ detail 문구에 "인증/Token/JWKS/Unauthorized"를 넣지 말 것. 프론트가 503 중
+    # 그 단어들이 들어간 응답은 **재시도하지 않고 즉시 실패 처리**한다(로그인 만료를 재시도로
+    # 뭉개지 않으려는 장치, upload/page.tsx의 isAuthLikeDetail). 여기는 연결 문제이지
+    # 인증 문제가 아니므로 그 단어를 피해야 재시도가 살아 있다.
+    logger.exception("photographers 조회 실패(재시도 소진)", exc_info=last_error)
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="일시적인 연결 오류입니다. 잠시 후 다시 시도해주세요.",
+    ) from last_error
+
+
 def get_current_photographer(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ) -> UUID:
@@ -117,13 +164,11 @@ def get_current_photographer(
     client = get_supabase()
 
     # photographers 테이블: auth_id = Supabase Auth user id
-    r = (
-        client.table("photographers")
-        .select("id")
-        .eq("auth_id", auth_user_id)
-        .limit(1)
-        .execute()
-    )
+    #
+    # 이 조회는 **모든 업로드 요청**이 통과하는 길목이라, 여기서 나는 일시적 네트워크 오류가
+    # 그대로 500이 되면 사진 한 장이 통째로 유실된다(실측 2026-09-12: 40장 업로드 중
+    # httpx.ReadError로 1장 실패 → 저장된 사진 39장). 끊김은 막을 수 없으니 재시도한다.
+    r = _select_photographer_with_retry(client, auth_user_id)
     if not r.data:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

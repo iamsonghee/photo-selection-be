@@ -1,13 +1,46 @@
 """사진 업로드 재시도는 동일한 R2 객체 키를 재사용해야 한다."""
 import asyncio
+import io
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
+
+from PIL import Image
 
 from app.routers import upload
 
 
 class UploadIdempotencyTest(unittest.TestCase):
+    def test_approved_version_photo_ids_only_returns_approved_rows(self):
+        versions_query = MagicMock()
+        versions_query.select.return_value = versions_query
+        versions_query.eq.return_value = versions_query
+        versions_query.in_.return_value = versions_query
+        versions_query.execute.return_value = SimpleNamespace(data=[
+            {"id": "version-approved", "photo_id": "photo-approved"},
+            {"id": "version-revision", "photo_id": "photo-revision"},
+        ])
+        reviews_query = MagicMock()
+        reviews_query.select.return_value = reviews_query
+        reviews_query.eq.return_value = reviews_query
+        reviews_query.in_.return_value = reviews_query
+        reviews_query.execute.return_value = SimpleNamespace(data=[
+            {"photo_version_id": "version-approved"},
+        ])
+        supabase = MagicMock()
+        supabase.table.side_effect = lambda name: (
+            versions_query if name == "photo_versions" else reviews_query
+        )
+
+        locked = upload._approved_version_photo_ids(
+            supabase,
+            ["photo-approved", "photo-revision"],
+            2,
+        )
+
+        self.assertEqual(locked, {"photo-approved"})
+
     def _run_process_one(self, client_upload_id: str):
         uploaded_keys: list[str] = []
 
@@ -28,7 +61,11 @@ class UploadIdempotencyTest(unittest.TestCase):
                 client_upload_id,
             )
 
-        with patch.object(upload, "_make_thumb_and_preview_sync", return_value=(b"thumb", b"preview")), patch.object(
+        with patch.object(
+            upload,
+            "_make_thumb_and_preview_sync",
+            return_value=(b"thumb", b"preview", 2400, 1600),
+        ), patch.object(
             upload, "_upload_to_r2_sync", side_effect=fake_upload
         ):
             result = asyncio.run(run())
@@ -48,6 +85,22 @@ class UploadIdempotencyTest(unittest.TestCase):
 
         self.assertNotEqual(first_keys, second_keys)
         self.assertNotEqual(first[3]["source_key"], second[3]["source_key"])
+
+    def test_process_one_reuses_decoded_dimensions(self):
+        result, _ = self._run_process_one(str(uuid4()))
+        self.assertEqual(result[4:], (2400, 1600))
+
+    def test_thumbnail_decode_reports_input_dimensions(self):
+        source = Image.new("RGB", (96, 64), color="white")
+        buffer = io.BytesIO()
+        source.save(buffer, format="JPEG")
+        source.close()
+
+        thumb, preview, width, height = upload._make_thumb_and_preview_sync(buffer.getvalue())
+
+        self.assertGreater(len(thumb), 0)
+        self.assertGreater(len(preview), 0)
+        self.assertEqual((width, height), (96, 64))
 
 
 if __name__ == "__main__":

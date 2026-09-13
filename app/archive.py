@@ -15,10 +15,11 @@ import logging
 import os
 import re
 import tempfile
+import time
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from app.database import get_supabase
 from app.storage import (
@@ -52,9 +53,14 @@ ARCHIVE_PART_MAX_BYTES = _env_int(
 _FALLBACK_PHOTO_BYTES = 20 * 1024 * 1024
 # 프로젝트/파트 claim 동시성 (기본 1 — Railway 512MB RAM 보호, 원본 압축 워커와 동일 기준)
 ARCHIVE_BUILD_CONCURRENCY = _env_int("ARCHIVE_BUILD_CONCURRENCY", 1, 1, 4)
-# ZIP은 파일을 순서대로 써야 하지만, R2 객체 요청 대기는 겹칠 수 있다. 기본 2개만
-# 미리 받아 Railway 메모리를 과도하게 쓰지 않으면서 네트워크 왕복 대기를 줄인다.
-ARCHIVE_DOWNLOAD_CONCURRENCY = _env_int("ARCHIVE_DOWNLOAD_CONCURRENCY", 2, 1, 4)
+# ZIP은 파일을 순서대로 써야 하지만, R2 객체 요청 대기는 겹칠 수 있다. 작은 원본은
+# 최대 4개까지 미리 받고, 큰 원본은 아래 메모리 예산에 맞춰 자동으로 동시성을 낮춘다.
+ARCHIVE_DOWNLOAD_CONCURRENCY = _env_int("ARCHIVE_DOWNLOAD_CONCURRENCY", 4, 1, 4)
+ARCHIVE_PREFETCH_MEMORY_BYTES = _env_int(
+    "ARCHIVE_PREFETCH_MEMORY_BYTES", 192 * 1024 * 1024, 64 * 1024 * 1024, 512 * 1024 * 1024
+)
+# 진행률 DB 쓰기가 ZIP 생성 속도를 다시 떨어뜨리지 않도록 이 간격보다 자주 기록하지 않는다.
+ARCHIVE_PROGRESS_UPDATE_SECONDS = _env_int("ARCHIVE_PROGRESS_UPDATE_SECONDS", 2, 1, 10)
 
 # 다운로드 만료(30일) + 유예(7일) 후 R2 아카이브 ZIP 삭제
 ARCHIVE_RETENTION_DAYS = 30
@@ -120,6 +126,21 @@ def _bin_pack(photos: list[dict]) -> list[list[dict]]:
     return groups
 
 
+def _original_prefetch_concurrency(entries: list[tuple[dict, str]]) -> int:
+    """완료된 prefetch Future가 원본 전체 bytes를 들고 있으므로, 가장 큰 원본 기준으로
+    파트당 메모리 예산을 넘지 않는 동시성만 사용한다. 여러 파트를 동시에 빌드하도록
+    운영 설정을 올린 경우에는 전체 예산을 파트 수만큼 나눠 잡는다."""
+    if not entries:
+        return 1
+    largest = max(
+        int(row.get("original_compressed_size") or _FALLBACK_PHOTO_BYTES)
+        for row, _key in entries
+    )
+    per_part_budget = max(1, ARCHIVE_PREFETCH_MEMORY_BYTES // ARCHIVE_BUILD_CONCURRENCY)
+    memory_limited = max(1, per_part_budget // max(1, largest))
+    return min(ARCHIVE_DOWNLOAD_CONCURRENCY, memory_limited, len(entries))
+
+
 async def _create_parts_for_claimed_project(project: dict) -> None:
     """claim_original_archive_builds로 pending→processing claim된 프로젝트에 대해
     완료된 원본을 bin-pack해 original_archive_parts 행을 최초 생성한다.
@@ -162,7 +183,10 @@ async def _create_parts_for_claimed_project(project: dict) -> None:
         }).eq("id", project_id).eq("original_archive_status", "processing").execute()
 
 
-def _download_and_zip_sync(manifest_photo_ids: list[str]) -> tuple[str, int]:
+def _download_and_zip_sync(
+    manifest_photo_ids: list[str],
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> tuple[str, int]:
     """동기: manifest의 photo_id들을 재조회해 원본을 ZIP으로 기록한다.
 
     ZIP 기록 순서는 manifest 그대로 유지하고, 제한된 개수의 다음 R2 다운로드만 미리
@@ -175,7 +199,7 @@ def _download_and_zip_sync(manifest_photo_ids: list[str]) -> tuple[str, int]:
         chunk = manifest_photo_ids[i : i + 500]
         res = (
             supabase.table("photos")
-            .select("id, number, r2_original_url, original_filename")
+            .select("id, number, r2_original_url, original_filename, original_compressed_size")
             .in_("id", chunk)
             .execute()
         )
@@ -197,14 +221,17 @@ def _download_and_zip_sync(manifest_photo_ids: list[str]) -> tuple[str, int]:
     fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="archive_part_")
     os.close(fd)
     count = 0
+    processed_bytes = 0
+    last_progress_at = time.monotonic()
     try:
         used_names: set[str] = set()
         # 다음 몇 장을 미리 요청하되, ZIP 기록은 entries 순서를 지켜 기존 결과와 동일하다.
-        with ThreadPoolExecutor(max_workers=ARCHIVE_DOWNLOAD_CONCURRENCY) as prefetch, \
+        prefetch_concurrency = _original_prefetch_concurrency(entries)
+        with ThreadPoolExecutor(max_workers=prefetch_concurrency) as prefetch, \
              zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
             futures: dict[int, Future[bytes]] = {}
             next_to_schedule = 0
-            while next_to_schedule < min(ARCHIVE_DOWNLOAD_CONCURRENCY, len(entries)):
+            while next_to_schedule < min(prefetch_concurrency, len(entries)):
                 futures[next_to_schedule] = prefetch.submit(get_r2_object_bytes_sync, entries[next_to_schedule][1])
                 next_to_schedule += 1
             for index, (row, _key) in enumerate(entries):
@@ -226,7 +253,15 @@ def _download_and_zip_sync(manifest_photo_ids: list[str]) -> tuple[str, int]:
                 used_names.add(arcname)
                 zf.writestr(arcname, data)
                 count += 1
+                processed_bytes += len(data)
                 del data
+                now = time.monotonic()
+                if on_progress and (
+                    now - last_progress_at >= ARCHIVE_PROGRESS_UPDATE_SECONDS
+                    or count == len(entries)
+                ):
+                    on_progress(count, processed_bytes)
+                    last_progress_at = now
     except Exception:
         try:
             os.remove(tmp_path)
@@ -277,7 +312,29 @@ async def _process_archive_part(part: dict) -> None:
 
     tmp_path: Optional[str] = None
     try:
-        tmp_path, count = await loop.run_in_executor(_executor, _download_and_zip_sync, manifest)
+        supabase.table("original_archive_parts").update({
+            "processed_file_count": 0,
+            "processed_bytes": 0,
+            "progress_updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", part_id).eq("status", "processing").execute()
+    except Exception as e:
+        # 진행률은 보조 정보다. 기록 실패가 ZIP 생성 자체를 막아서는 안 된다.
+        logger.warning("[archive] progress reset failed part=%s: %s", part_id, e)
+
+    def _report_progress(processed_file_count: int, processed_bytes: int) -> None:
+        try:
+            supabase.table("original_archive_parts").update({
+                "processed_file_count": processed_file_count,
+                "processed_bytes": processed_bytes,
+                "progress_updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", part_id).eq("status", "processing").execute()
+        except Exception as progress_error:
+            logger.warning("[archive] progress update failed part=%s: %s", part_id, progress_error)
+
+    try:
+        tmp_path, count = await loop.run_in_executor(
+            _executor, _download_and_zip_sync, manifest, _report_progress
+        )
         logger.info("[archive] zip built part=%s files=%d path=%s", part_id, count, tmp_path)
     except Exception as e:
         logger.exception("[archive] zip build failed for part %s: %s", part_id, e)

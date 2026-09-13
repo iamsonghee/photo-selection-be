@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.database import get_supabase
 from app.routers import projects, storage, upload
 from app.routers.upload import original_compress_worker, stuck_job_sweep_worker
+from app.original_upload_reservations import original_reservation_sweep_worker
 from app.archive import original_archive_worker, archive_sweep_worker, final_delivery_archive_worker
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting background workers...")
     asyncio.create_task(original_compress_worker())
     asyncio.create_task(stuck_job_sweep_worker())
+    asyncio.create_task(original_reservation_sweep_worker())
     # 고객 링크 활성화 뒤에만 ZIP 작업이 enqueue된다. 개별 원본 다운로드는 이 작업을 기다리지 않는다.
     asyncio.create_task(original_archive_worker())
     asyncio.create_task(final_delivery_archive_worker())

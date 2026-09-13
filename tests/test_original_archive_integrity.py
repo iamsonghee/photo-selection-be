@@ -96,6 +96,48 @@ class OriginalArchiveIntegrityTest(unittest.TestCase):
         finally:
             os.remove(path)
 
+    def test_reports_real_bytes_after_each_completed_archive(self):
+        originals = {
+            "originals/source/project/one.jpg": b"one",
+            "originals/source/project/two.jpg": b"second",
+        }
+        rows = [
+            {"id": "1", "number": 1, "r2_original_url": "originals/source/project/one.jpg", "original_filename": "one.jpg", "original_compressed_size": 3},
+            {"id": "2", "number": 2, "r2_original_url": "originals/source/project/two.jpg", "original_filename": "two.jpg", "original_compressed_size": 6},
+        ]
+        progress = []
+        with patch.object(archive, "get_supabase", return_value=_Supabase(rows)), patch.object(
+            archive, "get_r2_object_bytes_sync", side_effect=lambda key: originals[key]
+        ):
+            path, count = archive._download_and_zip_sync(
+                ["1", "2"], lambda files, byte_size: progress.append((files, byte_size))
+            )
+        try:
+            self.assertEqual(count, 2)
+            self.assertEqual(progress[-1], (2, 9))
+        finally:
+            os.remove(path)
+
+    def test_large_original_reduces_prefetch_concurrency_to_memory_budget(self):
+        entries = [
+            ({"original_compressed_size": 120 * 1024 * 1024}, "one.raw"),
+            ({"original_compressed_size": 120 * 1024 * 1024}, "two.raw"),
+        ]
+        with patch.object(archive, "ARCHIVE_DOWNLOAD_CONCURRENCY", 4), patch.object(
+            archive, "ARCHIVE_PREFETCH_MEMORY_BYTES", 192 * 1024 * 1024
+        ), patch.object(archive, "ARCHIVE_BUILD_CONCURRENCY", 1):
+            self.assertEqual(archive._original_prefetch_concurrency(entries), 1)
+
+    def test_small_original_uses_available_prefetch_concurrency(self):
+        entries = [
+            ({"original_compressed_size": 20 * 1024 * 1024}, f"{index}.jpg")
+            for index in range(6)
+        ]
+        with patch.object(archive, "ARCHIVE_DOWNLOAD_CONCURRENCY", 4), patch.object(
+            archive, "ARCHIVE_PREFETCH_MEMORY_BYTES", 192 * 1024 * 1024
+        ), patch.object(archive, "ARCHIVE_BUILD_CONCURRENCY", 1):
+            self.assertEqual(archive._original_prefetch_concurrency(entries), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

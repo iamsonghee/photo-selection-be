@@ -38,7 +38,8 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SEC
 INTERNAL_TOKEN = os.getenv("CLIP_INTERNAL_TOKEN")
 
 # 분석 파라미터
-CLIP_SIMILARITY_THRESHOLD = _env_float("CLIP_SIMILARITY_THRESHOLD", 0.92, 0.5, 0.999)
+# 0.92에서 실사용 중 유사하지 않은 사진들까지 묶이는 문제가 보고돼 0.96으로 상향(2026-08-29).
+CLIP_SIMILARITY_THRESHOLD = _env_float("CLIP_SIMILARITY_THRESHOLD", 0.96, 0.5, 0.999)
 # openai 사전학습 가중치는 quick_gelu 아키텍처로 학습됨 — 일반 ViT-B-32와 섞으면
 # open_clip이 "QuickGELU mismatch" 경고를 내고 임베딩 품질이 떨어진다.
 CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "ViT-B-32-quickgelu")
@@ -63,8 +64,9 @@ GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2
 # 128~3072 가변(Matryoshka). 차원별 가격 차이가 없어 기본값은 최대 품질인 3072.
 GEMINI_EMBEDDING_DIMENSION = _env_int("GEMINI_EMBEDDING_DIMENSION", 3072, 128, 3072)
 # OpenCLIP(0.92)과 점수 분포가 다르므로 그대로 쓰지 않는다 — 실사용 테스트로 0.96에서 적당한
-# 그룹핑을 확인(2026-07-28). 초기값일 뿐, UI 슬라이더에서 API 재호출 없이 재조정 가능.
-GEMINI_SIMILARITY_THRESHOLD = _env_float("GEMINI_SIMILARITY_THRESHOLD", 0.96, 0.5, 0.999)
+# 그룹핑을 확인(2026-07-28)했으나, 이후 실사용에서 0.96은 너무 엄격해 묶여야 할 유사컷이
+# 묶이지 않는다는 보고로 0.94로 하향(2026-09-12). 초기값일 뿐, UI 슬라이더에서 API 재호출 없이 재조정 가능.
+GEMINI_SIMILARITY_THRESHOLD = _env_float("GEMINI_SIMILARITY_THRESHOLD", 0.94, 0.5, 0.999)
 GEMINI_CONCURRENCY = _env_int("GEMINI_CONCURRENCY", 4, 1, 16)
 GEMINI_MAX_RETRIES = _env_int("GEMINI_MAX_RETRIES", 2, 0, 5)
 GEMINI_TIMEOUT_SECONDS = _env_float("GEMINI_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)

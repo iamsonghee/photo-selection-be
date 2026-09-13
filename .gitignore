@@ -13,3 +13,6 @@ env/
 # IDE / OS
 .idea/
 .DS_Store
+
+# Playwright/local test artifacts
+/test-results/

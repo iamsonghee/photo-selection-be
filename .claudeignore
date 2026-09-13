@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.next/
+.git/
+public/
+*.test.*
+*.spec.*
+*.config.js
+*.lock
+*.log
+*.map
+*.min.*
+!README.md
+!CONTRIBUTING.md
