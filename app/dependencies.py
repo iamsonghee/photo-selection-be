@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt.algorithms import ECAlgorithm
+from postgrest.exceptions import APIError
 
 from app.database import get_supabase
 
@@ -43,15 +44,23 @@ def get_jwks() -> List[Dict]:
     return keys
 
 
-#: 일시적 전송 오류만 재시도한다 — 인증 실패·권한 오류 같은 "진짜 실패"는 그대로 올린다.
+#: 일시적 전송/게이트웨이 오류만 재시도한다 — 인증 실패·권한 오류 같은 "진짜 실패"는 그대로 올린다.
 #  httpx.TransportError는 ConnectError(DNS 실패 Errno 8)·ReadError(Errno 35)·TimeoutException을
 #  모두 포함하는 상위 클래스다.
+#  postgrest.APIError 중 message가 "JSON could not be generated"인 것은 응답은 왔지만 body가
+#  JSON이 아닌 경우(Cloudflare 등 앞단 프록시가 HTML 에러 페이지를 반환) — 진짜 Postgrest 에러는
+#  항상 유효한 JSON이므로 이 메시지는 인프라 계층 장애로 보고 재시도 대상에 포함한다.
 _PHOTOGRAPHER_LOOKUP_ATTEMPTS = 3
 _PHOTOGRAPHER_LOOKUP_BACKOFF_SECONDS = 0.2
+_NON_JSON_GATEWAY_ERROR_MESSAGE = "JSON could not be generated"
+
+
+def _is_retryable_gateway_error(e: Exception) -> bool:
+    return isinstance(e, APIError) and e.message == _NON_JSON_GATEWAY_ERROR_MESSAGE
 
 
 def _select_photographer_with_retry(client, auth_user_id: str):
-    """photographers 조회 — 전송 계층 오류에 한해 짧은 backoff로 재시도.
+    """photographers 조회 — 전송/게이트웨이 계층 오류에 한해 짧은 backoff로 재시도.
 
     Supabase client는 프로세스 전역 싱글턴이고 HTTP/2로 소켓 하나를 공유하므로, 네트워크가
     잠깐 흔들리면 그 순간 진행 중이던 요청들이 함께 읽기 오류를 맞는다. 업로드처럼 요청이
@@ -72,6 +81,16 @@ def _select_photographer_with_retry(client, auth_user_id: str):
             logger.warning(
                 "photographers 조회 전송 오류 — 재시도 %d/%d: %s",
                 attempt, _PHOTOGRAPHER_LOOKUP_ATTEMPTS, type(e).__name__,
+            )
+            if attempt < _PHOTOGRAPHER_LOOKUP_ATTEMPTS:
+                time.sleep(_PHOTOGRAPHER_LOOKUP_BACKOFF_SECONDS * attempt)
+        except APIError as e:
+            if not _is_retryable_gateway_error(e):
+                raise
+            last_error = e
+            logger.warning(
+                "photographers 조회 게이트웨이 오류(비-JSON 응답) — 재시도 %d/%d: code=%s",
+                attempt, _PHOTOGRAPHER_LOOKUP_ATTEMPTS, e.code,
             )
             if attempt < _PHOTOGRAPHER_LOOKUP_ATTEMPTS:
                 time.sleep(_PHOTOGRAPHER_LOOKUP_BACKOFF_SECONDS * attempt)
