@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from app.database import get_supabase
+from app.env_utils import env_int
 from app.storage import (
     delete_r2_objects,
     get_r2_object_bytes_sync,
@@ -33,34 +34,23 @@ from app.storage import (
 logger = logging.getLogger(__name__)
 
 
-def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return max(min_v, min(max_v, v))
-
-
 # 파트 최대 크기(bytes) — 기본 500MB. Railway 컨테이너 임시 디스크 실제 여유를 배포 전
 # 확인 후 필요시 환경변수로 조정할 것(코드에서 2GB 등을 임의 확정하지 않음).
-ARCHIVE_PART_MAX_BYTES = _env_int(
+ARCHIVE_PART_MAX_BYTES = env_int(
     "ARCHIVE_PART_MAX_BYTES", 500 * 1024 * 1024, 50 * 1024 * 1024, 5 * 1024 * 1024 * 1024
 )
 # original_compressed_size가 없는(레거시) 사진의 빈-패킹용 추정치
 _FALLBACK_PHOTO_BYTES = 20 * 1024 * 1024
 # 프로젝트/파트 claim 동시성 (기본 1 — Railway 512MB RAM 보호, 원본 압축 워커와 동일 기준)
-ARCHIVE_BUILD_CONCURRENCY = _env_int("ARCHIVE_BUILD_CONCURRENCY", 1, 1, 4)
+ARCHIVE_BUILD_CONCURRENCY = env_int("ARCHIVE_BUILD_CONCURRENCY", 1, 1, 4)
 # ZIP은 파일을 순서대로 써야 하지만, R2 객체 요청 대기는 겹칠 수 있다. 작은 원본은
 # 최대 4개까지 미리 받고, 큰 원본은 아래 메모리 예산에 맞춰 자동으로 동시성을 낮춘다.
-ARCHIVE_DOWNLOAD_CONCURRENCY = _env_int("ARCHIVE_DOWNLOAD_CONCURRENCY", 4, 1, 4)
-ARCHIVE_PREFETCH_MEMORY_BYTES = _env_int(
+ARCHIVE_DOWNLOAD_CONCURRENCY = env_int("ARCHIVE_DOWNLOAD_CONCURRENCY", 4, 1, 4)
+ARCHIVE_PREFETCH_MEMORY_BYTES = env_int(
     "ARCHIVE_PREFETCH_MEMORY_BYTES", 192 * 1024 * 1024, 64 * 1024 * 1024, 512 * 1024 * 1024
 )
 # 진행률 DB 쓰기가 ZIP 생성 속도를 다시 떨어뜨리지 않도록 이 간격보다 자주 기록하지 않는다.
-ARCHIVE_PROGRESS_UPDATE_SECONDS = _env_int("ARCHIVE_PROGRESS_UPDATE_SECONDS", 2, 1, 10)
+ARCHIVE_PROGRESS_UPDATE_SECONDS = env_int("ARCHIVE_PROGRESS_UPDATE_SECONDS", 2, 1, 10)
 
 # 다운로드 만료(30일) + 유예(7일) 후 R2 아카이브 ZIP 삭제
 ARCHIVE_RETENTION_DAYS = 30
@@ -107,14 +97,14 @@ def _fetch_completed_originals_sync(project_id: str) -> list[dict]:
     return rows
 
 
-def _bin_pack(photos: list[dict]) -> list[list[dict]]:
+def _bin_pack(photos: list[dict], size_key: str = "original_compressed_size") -> list[list[dict]]:
     """누적 크기 기준 그룹핑 — 한 그룹이 ARCHIVE_PART_MAX_BYTES를 넘지 않게(사진 1장은
     항상 자기 그룹에 담아 무한루프 없이 최소 1장씩은 진행됨)."""
     groups: list[list[dict]] = []
     current: list[dict] = []
     current_size = 0
     for p in photos:
-        size = p.get("original_compressed_size") or _FALLBACK_PHOTO_BYTES
+        size = int(p.get(size_key) or _FALLBACK_PHOTO_BYTES)
         if current and current_size + size > ARCHIVE_PART_MAX_BYTES:
             groups.append(current)
             current = []
@@ -444,22 +434,6 @@ async def original_archive_worker() -> None:
         await asyncio.sleep(5)
 
 
-def _bin_pack_delivery(entries: list[dict]) -> list[list[dict]]:
-    groups: list[list[dict]] = []
-    current: list[dict] = []
-    current_size = 0
-    for entry in entries:
-        size = int(entry.get("byte_size") or _FALLBACK_PHOTO_BYTES)
-        if current and current_size + size > ARCHIVE_PART_MAX_BYTES:
-            groups.append(current)
-            current, current_size = [], 0
-        current.append(entry)
-        current_size += size
-    if current:
-        groups.append(current)
-    return groups
-
-
 async def _create_final_delivery_parts(archive: dict) -> None:
     """검토 시작 시 고정된 manifest를 파트로 나눈다. 이후 V2 업로드/교체와 무관하다."""
     archive_id = archive["id"]
@@ -472,7 +446,7 @@ async def _create_final_delivery_parts(archive: dict) -> None:
         }).eq("id", archive_id).eq("status", "processing").execute()
         return
     rows = []
-    for idx, group in enumerate(_bin_pack_delivery(manifest), start=1):
+    for idx, group in enumerate(_bin_pack(manifest, size_key="byte_size"), start=1):
         rows.append({
             "archive_id": archive_id,
             "project_id": project_id,

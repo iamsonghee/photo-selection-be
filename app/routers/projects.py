@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from app.database import get_supabase
 from app.dependencies import get_current_photographer
+from app.ownership import require_owned_project
 from app.storage import delete_r2_objects_by_prefix
 
 router = APIRouter()
@@ -79,20 +80,7 @@ def get_project(
 ):
     """프로젝트 상세."""
     client = get_supabase()
-    r = (
-        client.table("projects")
-        .select("*")
-        .eq("id", str(project_id))
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not r.data or len(r.data) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-    return r.data[0]
+    return require_owned_project(client, project_id, photographer_id, select="*")
 
 
 @router.delete("/{project_id}/r2")
@@ -102,19 +90,7 @@ def delete_project_r2(
 ):
     """프로젝트에 속한 R2 객체 삭제 (사진·버전·보존 원본·ZIP). 프로젝트 DB 삭제 전 호출."""
     client = get_supabase()
-    r = (
-        client.table("projects")
-        .select("id")
-        .eq("id", str(project_id))
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not r.data or len(r.data) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
+    require_owned_project(client, project_id, photographer_id)
     pid = str(project_id)
     photographer_id_str = str(photographer_id)
     total = 0

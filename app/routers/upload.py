@@ -31,6 +31,8 @@ register_heif_opener()
 from app.database import get_supabase
 from app.dependencies import get_current_photographer
 from app.beta_policy import get_max_photos_per_project
+from app.env_utils import env_int
+from app.ownership import require_owned_job, require_owned_project
 from app.storage import (
     delete_r2_objects,
     generate_presigned_put_url,
@@ -72,36 +74,25 @@ PROFILE_JPEG_QUALITY = 85
 BETA_MAX_REVISION_COUNT = 2
 
 
-def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return max(min_v, min(max_v, v))
-
-
 # 요청 한 번에 여러 장 병렬 처리 시 메모리·CPU 피크 완화 (기본 5, 환경으로 조절)
-UPLOAD_PHOTOS_CONCURRENCY = _env_int("UPLOAD_PHOTOS_CONCURRENCY", 5, 1, 12)
+UPLOAD_PHOTOS_CONCURRENCY = env_int("UPLOAD_PHOTOS_CONCURRENCY", 5, 1, 12)
 # 원본 포함 업로드 시 presigned PUT 방식으로 서버 부담 낮춤 (기본 3)
-UPLOAD_WITH_ORIGINAL_CONCURRENCY = _env_int("UPLOAD_WITH_ORIGINAL_CONCURRENCY", 3, 1, 8)
-VERSION_UPLOAD_CONCURRENCY = _env_int("VERSION_UPLOAD_CONCURRENCY", 3, 1, 12)
+UPLOAD_WITH_ORIGINAL_CONCURRENCY = env_int("UPLOAD_WITH_ORIGINAL_CONCURRENCY", 3, 1, 8)
+VERSION_UPLOAD_CONCURRENCY = env_int("VERSION_UPLOAD_CONCURRENCY", 3, 1, 12)
 # Pillow/R2 동기 작업 스레드 수 (동시 이미지 디코딩 상한에 맞춤, 기본 8) — /photos 외 다른
 # 엔드포인트(보정본 업로드, 원본 압축, R2 head/get/delete, 프로필 이미지)가 공유해서 쓴다.
-IMAGE_EXECUTOR_MAX_WORKERS = _env_int("IMAGE_EXECUTOR_MAX_WORKERS", 8, 2, 16)
+IMAGE_EXECUTOR_MAX_WORKERS = env_int("IMAGE_EXECUTOR_MAX_WORKERS", 8, 2, 16)
 # 후보 C: /photos 파이프라인(_process_one) 전용 CPU(Pillow)/I/O(R2 PUT) 분리 풀.
 # 동시 2요청 실측(큐 대기: 단일 요청 ~0ms → 동시 2요청 시 Pillow/R2 모두 수백ms)에서 공유
 # executor 경쟁이 확인되어 적용. 위 IMAGE_EXECUTOR_MAX_WORKERS(다른 엔드포인트용)는 그대로 두고
 # 이 파이프라인만 별도 풀로 분리 — CPU 풀은 코어 낭비 방지 위해 작게, I/O 풀은 네트워크 대기라
 # 메모리 부담이 적어 조금 더 크게 기본값을 잡는다.
-PILLOW_EXECUTOR_MAX_WORKERS = _env_int("PILLOW_EXECUTOR_MAX_WORKERS", 4, 2, 12)
-R2_EXECUTOR_MAX_WORKERS = _env_int("R2_EXECUTOR_MAX_WORKERS", 6, 2, 16)
+PILLOW_EXECUTOR_MAX_WORKERS = env_int("PILLOW_EXECUTOR_MAX_WORKERS", 4, 2, 12)
+R2_EXECUTOR_MAX_WORKERS = env_int("R2_EXECUTOR_MAX_WORKERS", 6, 2, 16)
 # 비동기 납품 원본 검증 worker 동시성. 현재 작업은 R2 객체 HEAD와 DB 상태 전이만 수행하며
 # 이미지 디코딩/재압축을 하지 않으므로, 전역 대기열을 한 장씩 막지 않도록 기본 4개로 처리한다.
 # 환경변수로 더 보수적으로 낮출 수 있고, 공유 I/O executor(기본 8)를 넘지 않게 상한을 둔다.
-ORIGINAL_COMPRESS_CONCURRENCY = _env_int("ORIGINAL_COMPRESS_CONCURRENCY", 4, 1, 8)
+ORIGINAL_COMPRESS_CONCURRENCY = env_int("ORIGINAL_COMPRESS_CONCURRENCY", 4, 1, 8)
 # presigned PUT URL 유효 시간 (초)
 ORIGINAL_PRESIGNED_EXPIRES = 3600
 
@@ -507,20 +498,11 @@ async def upload_photos(
         raise HTTPException(status_code=503, detail="DB 연결 실패") from e
 
     # 프로젝트 소유 확인
-    project_r = (
-        supabase.table("projects")
-        .select("id, status")
-        .eq("id", project_id)
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not project_r.data or len(project_r.data) == 0:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = require_owned_project(supabase, project_id, photographer_id, select="id, status")
 
     # 초대 링크 활성화(preparing 이탈) 이후에는 납품용 원본 추가 업로드를 금지 —
     # 이미 생성됐거나 생성 중인 아카이브와 실제 사진 구성이 어긋나는 것을 원천 차단한다.
-    if include_original and project_r.data[0].get("status") != "preparing":
+    if include_original and project.get("status") != "preparing":
         raise HTTPException(
             status_code=403,
             detail="초대 링크 활성화 이후에는 납품용 원본을 추가할 수 없습니다.",
@@ -891,26 +873,7 @@ async def confirm_original_upload(
     """presigned PUT 완료 통지: 소유권 확인 → 멱등 상태 체크 → R2 HEAD → pending 전이."""
     supabase = get_supabase()
     # 소유권 확인 (job → project → photographer)
-    job_r = (
-        supabase.table("original_jobs")
-        .select("id,status,r2_source_key,project_id")
-        .eq("id", job_id)
-        .limit(1)
-        .execute()
-    )
-    if not job_r.data:
-        raise HTTPException(status_code=404, detail="job not found")
-    job = job_r.data[0]
-    proj_r = (
-        supabase.table("projects")
-        .select("id")
-        .eq("id", job["project_id"])
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not proj_r.data:
-        raise HTTPException(status_code=403, detail="forbidden")
+    job = require_owned_job(supabase, job_id, photographer_id, select="id,status,r2_source_key,project_id")
     # 멱등: 이미 pending/processing/completed이면 바로 OK 반환
     if job["status"] in ("pending", "processing", "completed"):
         return {"ok": True}
@@ -943,16 +906,7 @@ async def finalize_original_upload(
     수락 상태로 본다. 따라서 정상 업로드 경로에는 작은 DB count 쿼리만 추가된다.
     """
     supabase = get_supabase()
-    proj_r = (
-        supabase.table("projects")
-        .select("id")
-        .eq("id", project_id)
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not proj_r.data:
-        raise HTTPException(status_code=404, detail="Project not found")
+    require_owned_project(supabase, project_id, photographer_id)
 
     def result_count(result) -> int:
         count = getattr(result, "count", None)
@@ -1026,16 +980,7 @@ async def get_pending_originals(
     24h sweep(stuck_job_sweep_worker)에서 failed로 전환되는데, 이 상태를 배너에서 빼면
     사용자가 복구할 방법이 전혀 없어 원본 아카이브 enqueue가 영구히 막힌다(재업로드로만 복구 가능)."""
     supabase = get_supabase()
-    proj_r = (
-        supabase.table("projects")
-        .select("id")
-        .eq("id", project_id)
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not proj_r.data:
-        raise HTTPException(status_code=404, detail="Project not found")
+    require_owned_project(supabase, project_id, photographer_id)
     jobs_r = (
         supabase.table("original_jobs")
         .select("id,original_filename,original_file_size,original_last_modified,created_at")
@@ -1054,26 +999,9 @@ async def recover_original(
 ):
     """awaiting_upload job 복구: R2 HEAD 확인 → 이미 업로드됐으면 confirm, 없으면 새 presigned URL 발급."""
     supabase = get_supabase()
-    job_r = (
-        supabase.table("original_jobs")
-        .select("id,status,r2_source_key,project_id,source_content_type")
-        .eq("id", job_id)
-        .limit(1)
-        .execute()
+    job = require_owned_job(
+        supabase, job_id, photographer_id, select="id,status,r2_source_key,project_id,source_content_type"
     )
-    if not job_r.data:
-        raise HTTPException(status_code=404, detail="job not found")
-    job = job_r.data[0]
-    proj_r = (
-        supabase.table("projects")
-        .select("id")
-        .eq("id", job["project_id"])
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not proj_r.data:
-        raise HTTPException(status_code=403, detail="forbidden")
     # 이미 처리된 job이면 바로 OK
     if job["status"] in ("pending", "processing", "completed"):
         return {"status": "confirmed"}
@@ -1117,26 +1045,7 @@ async def abandon_original(
 ):
     """사용자가 원본 업로드를 포기할 때 job을 명시적으로 failed 처리."""
     supabase = get_supabase()
-    job_r = (
-        supabase.table("original_jobs")
-        .select("id,photo_id,status,project_id")
-        .eq("id", job_id)
-        .limit(1)
-        .execute()
-    )
-    if not job_r.data:
-        raise HTTPException(status_code=404, detail="job not found")
-    job = job_r.data[0]
-    proj_r = (
-        supabase.table("projects")
-        .select("id")
-        .eq("id", job["project_id"])
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not proj_r.data:
-        raise HTTPException(status_code=403, detail="forbidden")
+    job = require_owned_job(supabase, job_id, photographer_id, select="id,photo_id,status,project_id")
     if job["status"] in ("completed", "failed"):
         return {"ok": True}
     try:
@@ -1162,26 +1071,7 @@ async def report_original_upload_failure(
     원본 파일은 사용자가 다시 선택해 복구할 수 있으므로 job 상태는 바꾸지 않는다.
     """
     supabase = get_supabase()
-    job_r = (
-        supabase.table("original_jobs")
-        .select("id,status,project_id")
-        .eq("id", job_id)
-        .limit(1)
-        .execute()
-    )
-    if not job_r.data:
-        raise HTTPException(status_code=404, detail="job not found")
-    job = job_r.data[0]
-    proj_r = (
-        supabase.table("projects")
-        .select("id")
-        .eq("id", job["project_id"])
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not proj_r.data:
-        raise HTTPException(status_code=403, detail="forbidden")
+    job = require_owned_job(supabase, job_id, photographer_id, select="id,status,project_id")
     if job["status"] in ("completed", "pending", "processing"):
         return {"ok": True}
 
@@ -1545,18 +1435,9 @@ async def presign_delivery_versions(
 
     supabase = get_supabase()
     project_id = str(payload.project_id)
-    project_r = (
-        supabase.table("projects")
-        .select("id,status")
-        .eq("id", project_id)
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not project_r.data:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = require_owned_project(supabase, project_id, photographer_id, select="id,status")
     expected_status = "editing" if payload.version == 1 else "editing_v2"
-    if project_r.data[0].get("status") != expected_status:
+    if project.get("status") != expected_status:
         raise HTTPException(status_code=409, detail="검토 중에는 보정본을 교체할 수 없습니다.")
 
     requested_ids = [str(item.photo_id) for item in payload.items]
@@ -1607,10 +1488,7 @@ async def abandon_delivery_versions(
         raise HTTPException(status_code=400, detail="version must be 1 or 2")
     supabase = get_supabase()
     project_id = str(payload.project_id)
-    owner = (supabase.table("projects").select("id").eq("id", project_id)
-             .eq("photographer_id", str(photographer_id)).limit(1).execute())
-    if not owner.data:
-        raise HTTPException(status_code=404, detail="Project not found")
+    require_owned_project(supabase, project_id, photographer_id)
     prefix = f"versions/{project_id}/delivery/v{payload.version}/"
     if any(not key.startswith(prefix) for key in payload.keys):
         raise HTTPException(status_code=400, detail="Invalid delivery key")
@@ -1658,18 +1536,9 @@ async def upload_versions(
         logger.exception("get_supabase failed")
         raise HTTPException(status_code=503, detail="DB 연결 실패") from e
 
-    project_r = (
-        supabase.table("projects")
-        .select("id,status")
-        .eq("id", project_id)
-        .eq("photographer_id", str(photographer_id))
-        .limit(1)
-        .execute()
-    )
-    if not project_r.data or len(project_r.data) == 0:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = require_owned_project(supabase, project_id, photographer_id, select="id,status")
     allowed_statuses = {"editing", "reviewing_v1"} if version == 1 else {"editing_v2", "reviewing_v2"}
-    if project_r.data[0].get("status") not in allowed_statuses:
+    if project.get("status") not in allowed_statuses:
         raise HTTPException(status_code=409, detail="현재 단계에서는 보정본을 업로드하거나 교체할 수 없습니다.")
 
     # 베타 제한: 보정본 횟수 체크

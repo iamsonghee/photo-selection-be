@@ -39,13 +39,3 @@ def get_supabase() -> Client:
                 options = ClientOptions(postgrest_client_timeout=POSTGREST_TIMEOUT)
                 _supabase_singleton = create_client(SUPABASE_URL, SUPABASE_KEY, options)
     return _supabase_singleton
-
-
-# 하위 호환 — 외부에서 직접 참조하는 코드가 있을 경우를 위해 유지
-supabase: Optional[Client] = None
-
-
-def init_supabase() -> Client:
-    global supabase
-    supabase = get_supabase()
-    return supabase

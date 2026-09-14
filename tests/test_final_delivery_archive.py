@@ -34,7 +34,7 @@ class FinalDeliveryArchiveTest(unittest.TestCase):
     def test_bin_pack_uses_delivery_byte_size(self):
         entries = [{"byte_size": 60}, {"byte_size": 60}, {"byte_size": 40}]
         with patch.object(archive, "ARCHIVE_PART_MAX_BYTES", 100):
-            groups = archive._bin_pack_delivery(entries)
+            groups = archive._bin_pack(entries, size_key="byte_size")
         self.assertEqual([len(group) for group in groups], [1, 2])
 
 

@@ -1,7 +1,6 @@
 """
-GCS + Cloudflare R2 (S3 호환) 스토리지 클라이언트.
+Cloudflare R2 (S3 호환) 스토리지 클라이언트.
 """
-import json
 import os
 import re
 import threading
@@ -14,38 +13,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _get_gcs_credentials_json() -> str:
-    raw = os.getenv("GCS_CREDENTIALS_JSON") or ""
-    return raw.replace("\\n", "\n") if raw else ""
-
-
-# GCS
-GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
-GCS_CREDENTIALS_JSON = _get_gcs_credentials_json()
-
 # R2 (S3 호환)
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
-
-
-def get_gcs_client():
-    """Google Cloud Storage 클라이언트 반환. GCS_* 설정이 있을 때만 사용 가능."""
-    if not GCS_BUCKET_NAME or not GCS_CREDENTIALS_JSON:
-        raise ValueError("GCS_BUCKET_NAME and GCS_CREDENTIALS_JSON must be set in .env")
-    from google.cloud import storage
-
-    creds_info = json.loads(GCS_CREDENTIALS_JSON)
-    client = storage.Client.from_service_account_info(creds_info)
-    return client
-
-
-def get_gcs_bucket():
-    """GCS 버킷 인스턴스 반환."""
-    client = get_gcs_client()
-    return client.bucket(GCS_BUCKET_NAME)
 
 
 _r2_client = None
@@ -316,13 +289,3 @@ def head_r2_object_sync(key: str) -> int:
         if code in ("404", "NoSuchKey", "403"):
             raise KeyError(f"R2 key not found: {key}")
         raise
-
-
-# ─── GCS ─────────────────────────────────────────────────────────────────────
-
-def upload_to_gcs(key: str, body: bytes, content_type: str) -> str:
-    """GCS 버킷에 업로드. 반환: gcs URI 또는 공개 URL (구성에 따름)."""
-    bucket = get_gcs_bucket()
-    blob = bucket.blob(key)
-    blob.upload_from_string(body, content_type=content_type)
-    return f"gs://{GCS_BUCKET_NAME}/{key}"
