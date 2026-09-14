@@ -22,6 +22,7 @@ from app.config import (
     GEMINI_EMBEDDING_VERSION,
     GEMINI_MATCH_AUTO_THRESHOLD,
     GEMINI_MATCH_LOW_THRESHOLD,
+    GEMINI_MATCH_MARGIN_THRESHOLD,
 )
 from app.downloader import download_all
 from app.gemini_client import embed_images
@@ -167,6 +168,10 @@ def _greedy_assign(
             pairs.append((sim, fi, pi))
     pairs.sort(key=lambda x: x[0], reverse=True)
 
+    margins = []
+    for row in similarity_matrix:
+        top_two = sorted(row, reverse=True)[:2]
+        margins.append(top_two[0] - top_two[1] if len(top_two) > 1 else 1.0)
     claimed_files: set[int] = set()
     claimed_photos: set[int] = set()
     results: List[dict] = []
@@ -182,7 +187,12 @@ def _greedy_assign(
                 "photo_id": photo_meta[pi]["photo_id"],
                 "filename": file_meta[fi]["filename"],
                 "similarity": round(sim, 4),
-                "type": "gemini" if sim >= GEMINI_MATCH_AUTO_THRESHOLD else "gemini_low",
+                "type": (
+                    "gemini"
+                    if sim >= GEMINI_MATCH_AUTO_THRESHOLD
+                    and margins[fi] >= GEMINI_MATCH_MARGIN_THRESHOLD
+                    else "gemini_low"
+                ),
             }
         )
     return results

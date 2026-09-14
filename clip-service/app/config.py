@@ -88,6 +88,8 @@ R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
 # 그대로 쓰면 연속컷 간 우연한 유사도(같은 프로젝트 내 최대 0.98)와 구분이 안 돼 위험함을 확인.
 GEMINI_MATCH_AUTO_THRESHOLD = _env_float("GEMINI_MATCH_AUTO_THRESHOLD", 0.96, 0.5, 0.999)
 GEMINI_MATCH_LOW_THRESHOLD = _env_float("GEMINI_MATCH_LOW_THRESHOLD", 0.85, 0.5, 0.999)
+# 1위와 2위가 거의 같은 고신뢰 매칭은 연결을 유지하되 UI에서 확인 대상으로 표시한다.
+GEMINI_MATCH_MARGIN_THRESHOLD = _env_float("GEMINI_MATCH_MARGIN_THRESHOLD", 0.03, 0.0, 0.5)
 
 # ── Gemini Flash 품질 판정 POC (Embedding과도 완전히 독립, GEMINI_API_KEY만 공유) ──────
 # 2026-10-16 종료 예정인 2.5 계열은 피하고 현재 GA인 3.5 계열 중 가장 비용 효율적인 모델 채택.
