@@ -39,6 +39,8 @@ allow_origins = [
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
     "https://acut.vercel.app",
+    "https://acut.kr",
+    "https://www.acut.kr",
 ] + _extra
 
 app.add_middleware(
