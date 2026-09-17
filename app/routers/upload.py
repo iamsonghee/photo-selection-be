@@ -192,6 +192,12 @@ def _insert_photos_with_numbers(supabase, project_id: str, rows: list[dict]) -> 
     return insert_r.data or []
 
 
+def _ensure_project_accepts_new_photos(status: str, new_item_count: int) -> None:
+    """활성화 뒤에는 새 사진만 막고, 응답 유실로 재전송된 기존 사진은 허용한다."""
+    if status != "preparing" and new_item_count > 0:
+        raise HTTPException(status_code=409, detail="고객 셀렉 시작 후에는 사진을 추가할 수 없습니다.")
+
+
 def _infer_content_type(filename: str) -> Optional[str]:
     """파일 확장자로 content-type 추론. 알 수 없는 확장자는 None 반환 (BUG-01: CR3 등 RAW 파일 조용한 실패 방지)."""
     lower = (filename or "").lower()
@@ -500,14 +506,6 @@ async def upload_photos(
     # 프로젝트 소유 확인
     project = require_owned_project(supabase, project_id, photographer_id, select="id, status")
 
-    # 초대 링크 활성화(preparing 이탈) 이후에는 납품용 원본 추가 업로드를 금지 —
-    # 이미 생성됐거나 생성 중인 아카이브와 실제 사진 구성이 어긋나는 것을 원천 차단한다.
-    if include_original and project.get("status") != "preparing":
-        raise HTTPException(
-            status_code=403,
-            detail="초대 링크 활성화 이후에는 납품용 원본을 추가할 수 없습니다.",
-        )
-
     # 허용된 파일만 읽음 (BUG-01: 거부 파일 목록 수집 / BUG-02: 소문자 정규화)
     valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, compressed_filename, file_size)
     # 목록 source metadata + 원본 복구 매칭 메타 (valid와 1:1 대응, original_* Form 필드 기반)
@@ -606,6 +604,7 @@ async def upload_photos(
             raise HTTPException(status_code=500, detail="업로드 재시도 상태 확인 실패") from e
 
     new_item_count = sum(1 for item in meta if not item[4] or item[4] not in existing_client_ids)
+    _ensure_project_accepts_new_photos(project.get("status", ""), new_item_count)
 
     # 등급별 업로드 한도 체크 (관리자는 None=무제한)
     max_photos = get_max_photos_per_project(supabase, photographer_id)
@@ -746,6 +745,8 @@ async def upload_photos(
     try:
         inserted = _insert_photos_with_numbers(supabase, project_id, rows)
     except Exception as e:
+        if "photo_upload_not_allowed" in str(e):
+            raise HTTPException(status_code=409, detail="고객 셀렉 시작 후에는 사진을 추가할 수 없습니다.") from e
         logger.error(f"에러내용: {e}")
         logger.exception("photos insert failed: %s", e)
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e

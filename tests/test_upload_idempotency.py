@@ -9,9 +9,16 @@ from uuid import UUID, uuid4
 from PIL import Image
 
 from app.routers import upload
+from fastapi import HTTPException
 
 
 class UploadIdempotencyTest(unittest.TestCase):
+    def test_new_photos_are_blocked_after_selection_but_replays_are_allowed(self):
+        with self.assertRaises(HTTPException) as raised:
+            upload._ensure_project_accepts_new_photos("selecting", 1)
+        self.assertEqual(raised.exception.status_code, 409)
+        upload._ensure_project_accepts_new_photos("selecting", 0)
+
     def test_approved_version_photo_ids_only_returns_approved_rows(self):
         versions_query = MagicMock()
         versions_query.select.return_value = versions_query
