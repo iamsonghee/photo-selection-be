@@ -170,7 +170,11 @@ async def upload_customer_photos(
         return {"uploaded": 0, "rejected": rejected_filenames}
 
     insert_rows = [
-        {"id": r["id"], "project_id": r["project_id"], "filename": r["filename"], "order_index": r["order_index"], "storage_key": r["storage_key"]}
+        {
+            "id": r["id"], "project_id": r["project_id"], "filename": r["filename"],
+            "order_index": r["order_index"], "storage_key": r["storage_key"],
+            "thumb_url": r["_thumb_url"], "preview_url": r["_preview_url"],
+        }
         for r in rows
     ]
     try:
