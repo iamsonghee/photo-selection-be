@@ -109,11 +109,13 @@ def _select_photographer_with_retry(client, auth_user_id: str):
     ) from last_error
 
 
-def get_current_photographer(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-) -> UUID:
-    """Authorization 헤더의 Supabase JWT를 JWKS로 검증하고 photographer_id를 반환."""
-    token = credentials.credentials
+def verify_supabase_jwt(token: str) -> str:
+    """Authorization 헤더의 Supabase JWT를 JWKS로 검증하고 auth.users.id(sub)를 반환.
+
+    photographer/customer 어느 쪽 테이블도 조회하지 않는다 — get_current_photographer와
+    고객용 get_current_customer_owner(app/routers/customer_upload.py)가 이 순수 검증
+    로직만 공유하고, 그 뒤에 각자 다른 테이블에서 소유권을 확인한다.
+    """
     if not SUPABASE_URL:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -148,6 +150,7 @@ def get_current_photographer(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token",
             )
+        return auth_user_id
     except jwt.ExpiredSignatureError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -180,6 +183,12 @@ def get_current_photographer(
             detail=f"인증 처리 중 오류: {type(e).__name__}",
         ) from e
 
+
+def get_current_photographer(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> UUID:
+    """Authorization 헤더의 Supabase JWT를 검증하고 photographer_id를 반환."""
+    auth_user_id = verify_supabase_jwt(credentials.credentials)
     client = get_supabase()
 
     # photographers 테이블: auth_id = Supabase Auth user id

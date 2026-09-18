@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import get_supabase
-from app.routers import projects, storage, upload
+from app.routers import customer_upload, projects, storage, upload
 from app.routers.upload import original_compress_worker, stuck_job_sweep_worker
 from app.original_upload_reservations import original_reservation_sweep_worker
 from app.archive import original_archive_worker, archive_sweep_worker, final_delivery_archive_worker
@@ -55,6 +55,7 @@ app.add_middleware(
 app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
 app.include_router(upload.router, prefix="/api/upload", tags=["upload"])
 app.include_router(storage.router, prefix="/api/storage", tags=["storage"])
+app.include_router(customer_upload.router, prefix="/api/customer-upload", tags=["customer-upload"])
 
 
 @app.get("/health")
