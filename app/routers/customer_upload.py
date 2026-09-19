@@ -24,7 +24,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # 1차 범위 상한(사용자 결정) — 등급별 쿼터 테이블 없이 상수 하나로 충분하다(YAGNI).
-MAX_PHOTOS_PER_CUSTOMER_PROJECT = 5000
+MAX_PHOTOS_PER_CUSTOMER_PROJECT = 2000
 
 UPLOAD_CONCURRENCY = env_int("CUSTOMER_UPLOAD_CONCURRENCY", 5, 1, 12)
 IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
