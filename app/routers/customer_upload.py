@@ -193,3 +193,101 @@ async def upload_customer_photos(
             for r in rows
         ],
     }
+
+
+@router.post("/retouched")
+async def upload_customer_retouched_photos(
+    project_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+    # files와 같은 순서/길이 — FE가 lib/version-mapping.ts로 원본과 미리 매칭(자동+수동)해서 보낸다.
+    photo_ids: list[str] = Form(...),
+    share_token: Optional[str] = Form(None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+):
+    """보정본 업로드(단계 7, S10). 원본과 달리 photo_id가 이미 정해져 들어오므로 순서 배정이
+    필요 없고, 같은 photo_id에 몇 번째 회차인지(round)만 계산해서 붙인다."""
+    if not files or len(files) != len(photo_ids):
+        raise HTTPException(status_code=400, detail="files와 photo_ids 길이가 일치해야 합니다.")
+
+    supabase = get_supabase()
+    project = _authorize_customer_project(supabase, project_id, credentials, share_token)
+
+    # photo_id가 실제로 이 프로젝트 소유인지 확인 — 다른 프로젝트 사진에 보정본을 붙이는 것 방지.
+    owned = (
+        supabase.table("customer_photos").select("id").eq("project_id", project["id"]).in_("id", list(set(photo_ids))).execute()
+    )
+    owned_ids = {row["id"] for row in (owned.data or [])}
+    if not owned_ids.issuperset(set(photo_ids)):
+        raise HTTPException(status_code=403, detail="이 프로젝트의 사진이 아닙니다.")
+
+    existing = (
+        supabase.table("customer_photo_versions").select("photo_id, round").in_("photo_id", list(set(photo_ids))).execute()
+    )
+    next_round: dict[str, int] = {}
+    for row in existing.data or []:
+        next_round[row["photo_id"]] = max(next_round.get(row["photo_id"], 0), row["round"])
+    for pid in photo_ids:
+        next_round.setdefault(pid, 0)
+
+    loop = asyncio.get_event_loop()
+    sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+    rejected_filenames: list[str] = []
+
+    async def _process(f: UploadFile, photo_id: str):
+        ct = (f.content_type or "").lower()
+        if not ct or ct not in ALLOWED_CONTENT_TYPES:
+            inferred = _infer_content_type(f.filename or "")
+            if inferred is None:
+                rejected_filenames.append(f.filename or "(unknown)")
+                return None
+        contents = await f.read()
+        if not contents:
+            rejected_filenames.append(f.filename or "(unknown)")
+            return None
+        async with sem:
+            version_id = str(uuid_module.uuid4())
+            try:
+                thumb_bytes, preview_bytes, _w, _h = await loop.run_in_executor(None, _make_thumb_and_preview_sync, contents)
+            except Exception as e:
+                logger.warning("retouched resize failed: %s", e)
+                rejected_filenames.append(f.filename or "(unknown)")
+                return None
+            thumb_key = f"customer-photos/{project_id}/retouched/{version_id}_thumb.jpg"
+            preview_key = f"customer-photos/{project_id}/retouched/{version_id}_preview.jpg"
+            try:
+                thumb_url, preview_url = await asyncio.gather(
+                    loop.run_in_executor(None, upload_to_r2, thumb_key, thumb_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL),
+                    loop.run_in_executor(None, upload_to_r2, preview_key, preview_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL),
+                )
+            except Exception as e:
+                logger.warning("retouched R2 upload failed: %s", e)
+                rejected_filenames.append(f.filename or "(unknown)")
+                return None
+        return {
+            "id": version_id, "photo_id": photo_id, "filename": f.filename or "",
+            "thumb_url": thumb_url, "preview_url": preview_url,
+        }
+
+    results = await asyncio.gather(*[_process(f, pid) for f, pid in zip(files, photo_ids)], return_exceptions=True)
+
+    rows: list[dict] = []
+    for r, pid in zip(results, photo_ids):
+        if isinstance(r, Exception) or r is None:
+            if isinstance(r, Exception):
+                logger.warning("retouched task failed: %s", r)
+            continue
+        next_round[pid] += 1
+        rows.append({**r, "round": next_round[pid]})
+
+    if not rows:
+        return {"uploaded": 0, "rejected": rejected_filenames}
+
+    try:
+        supabase.table("customer_photo_versions").insert(
+            [{k: v for k, v in r.items() if k != ""} for r in rows]
+        ).execute()
+    except Exception as e:
+        logger.exception("customer_photo_versions insert failed: %s", e)
+        raise HTTPException(status_code=500, detail="보정본 저장 실패") from e
+
+    return {"uploaded": len(rows), "rejected": rejected_filenames, "versions": rows}
