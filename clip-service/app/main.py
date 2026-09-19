@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app import analyzer, gemini_analyzer, gemini_matcher, gemini_quality_analyzer, state
+from app import analyzer, customer_ai, gemini_analyzer, gemini_matcher, gemini_quality_analyzer, state
 from app import gemini_state, gemini_quality_state
 from app.auth import verify_internal_token
 from app.config import (
@@ -60,6 +60,38 @@ class MatchRetouchResponse(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+def _latest_customer_run(db, project_id: str, kind: str):
+    rows = (db.table("customer_ai_runs").select("*").eq("project_id", project_id)
+            .eq("kind", kind).order("created_at", desc=True).limit(1).execute()).data or []
+    return rows[0] if rows else None
+
+
+@app.post("/analyze/customer/{kind}", status_code=202, dependencies=[Depends(verify_internal_token)])
+def analyze_customer(kind: str, req: AnalyzeRequest, background_tasks: BackgroundTasks):
+    if kind not in {"similarity", "quality"}:
+        raise HTTPException(status_code=404, detail="Unknown analysis kind")
+    db = get_supabase()
+    if not db.table("customer_projects").select("id").eq("id", req.project_id).limit(1).execute().data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    latest = _latest_customer_run(db, req.project_id, kind)
+    if latest and latest["status"] == "processing":
+        raise HTTPException(status_code=409, detail="Analysis already in progress")
+    run = db.table("customer_ai_runs").insert({
+        "project_id": req.project_id, "kind": kind, "status": "processing"
+    }).execute().data[0]
+    task = customer_ai.run_similarity if kind == "similarity" else customer_ai.run_quality
+    background_tasks.add_task(task, run["id"], req.project_id)
+    return {"status": "processing", "run_id": run["id"]}
+
+
+@app.get("/analyze/customer/{kind}/{project_id}/status", dependencies=[Depends(verify_internal_token)])
+def analyze_customer_status(kind: str, project_id: str):
+    if kind not in {"similarity", "quality"}:
+        raise HTTPException(status_code=404, detail="Unknown analysis kind")
+    latest = _latest_customer_run(get_supabase(), project_id, kind)
+    return {"status": latest["status"] if latest else None, "run": latest}
 
 
 @app.post("/analyze", status_code=202, dependencies=[Depends(verify_internal_token)])
