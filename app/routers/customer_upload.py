@@ -13,12 +13,13 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from app.database import get_supabase
 from app.dependencies import verify_supabase_jwt
 from app.env_utils import env_int
 from app.routers.upload import ALLOWED_CONTENT_TYPES, _infer_content_type, _make_thumb_and_preview_sync
-from app.storage import upload_to_r2
+from app.storage import delete_r2_objects, upload_to_r2
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -31,6 +32,12 @@ IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 # 참가자(공유 링크)는 로그인하지 않으므로 Authorization 헤더가 없을 수 있다.
 _optional_bearer = HTTPBearer(auto_error=False)
+
+
+class CustomerPhotoDeleteRequest(BaseModel):
+    project_id: str
+    photo_ids: list[str]
+    share_token: Optional[str] = None
 
 
 def _get_customer_project(supabase, project_id: str) -> dict:
@@ -193,6 +200,62 @@ async def upload_customer_photos(
             for r in rows
         ],
     }
+
+
+@router.delete("/photos")
+async def delete_customer_photos(
+    body: CustomerPhotoDeleteRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+):
+    supabase = get_supabase()
+    project = _authorize_customer_project(supabase, body.project_id, credentials, body.share_token)
+    photo_ids = list(dict.fromkeys(body.photo_ids))
+    if not photo_ids:
+        raise HTTPException(status_code=400, detail="삭제할 사진이 없습니다.")
+
+    photos = (
+        supabase.table("customer_photos")
+        .select("id")
+        .eq("project_id", project["id"])
+        .in_("id", photo_ids)
+        .execute()
+    ).data or []
+    owned_ids = [row["id"] for row in photos]
+    if len(owned_ids) != len(photo_ids):
+        raise HTTPException(status_code=403, detail="이 프로젝트의 사진이 아닙니다.")
+
+    versions = (
+        supabase.table("customer_photo_versions")
+        .select("id")
+        .in_("photo_id", owned_ids)
+        .execute()
+    ).data or []
+    try:
+        supabase.table("customer_photos").delete().eq("project_id", project["id"]).in_("id", owned_ids).execute()
+        remaining = (
+            supabase.table("customer_photos")
+            .select("id", count="exact")
+            .eq("project_id", project["id"])
+            .execute()
+        ).count or 0
+        supabase.table("customer_projects").update({"photo_count": remaining}).eq("id", project["id"]).execute()
+    except Exception as e:
+        logger.exception("customer photo delete failed: %s", e)
+        raise HTTPException(status_code=500, detail="사진 삭제 실패") from e
+
+    keys = [key for photo_id in owned_ids for key in (
+        f"customer-photos/{project['id']}/{photo_id}_thumb.jpg",
+        f"customer-photos/{project['id']}/{photo_id}_preview.jpg",
+    )]
+    keys.extend(key for row in versions for key in (
+        f"customer-photos/{project['id']}/retouched/{row['id']}_thumb.jpg",
+        f"customer-photos/{project['id']}/retouched/{row['id']}_preview.jpg",
+    ))
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, delete_r2_objects, keys)
+    except Exception as e:
+        logger.warning("deleted customer photo R2 cleanup failed: %s", e)
+    return {"deleted": len(owned_ids), "photo_count": remaining}
 
 
 @router.post("/retouched")
