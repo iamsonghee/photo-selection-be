@@ -145,6 +145,7 @@ async def upload_customer_photos(
             detail={"error": "limit_exceeded", "max": MAX_PHOTOS_PER_CUSTOMER_PROJECT, "message": f"프로젝트당 최대 {MAX_PHOTOS_PER_CUSTOMER_PROJECT}장까지 업로드할 수 있습니다."},
         )
     if len(valid) > remaining:
+        rejected_filenames.extend(filename for _, filename in valid[remaining:])
         valid = valid[:remaining]
 
     loop = asyncio.get_event_loop()
@@ -161,6 +162,7 @@ async def upload_customer_photos(
         if isinstance(r, Exception) or r is None:
             if isinstance(r, Exception):
                 logger.warning("customer photo task failed: %s", r)
+            rejected_filenames.append(filename)
             continue
         photo_id, thumb_url, preview_url = r
         rows.append({
