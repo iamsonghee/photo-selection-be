@@ -30,7 +30,7 @@ MAX_PHOTOS_PER_CUSTOMER_PROJECT = 2000
 UPLOAD_CONCURRENCY = env_int("CUSTOMER_UPLOAD_CONCURRENCY", 5, 1, 12)
 IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
-# 참가자(공유 링크)는 로그인하지 않으므로 Authorization 헤더가 없을 수 있다.
+# 프록시 계약 호환을 위해 optional로 받되, 사진 관리는 소유자 JWT만 허용한다.
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
@@ -43,7 +43,7 @@ class CustomerPhotoDeleteRequest(BaseModel):
 def _get_customer_project(supabase, project_id: str) -> dict:
     r = (
         supabase.table("customer_projects")
-        .select("id, owner_id, share_token, photo_count")
+        .select("id, owner_id, photo_count")
         .eq("id", project_id)
         .limit(1)
         .execute()
@@ -59,15 +59,14 @@ def _authorize_customer_project(
     credentials: Optional[HTTPAuthorizationCredentials],
     share_token: Optional[str],
 ) -> dict:
-    """소유자는 Supabase JWT로, 공유 링크 참가자는 share_token으로 접근한다."""
+    """사진 업로드·삭제·보정본 관리는 프로젝트 소유자만 할 수 있다."""
     project = _get_customer_project(supabase, project_id)
     if credentials is not None:
         auth_user_id = verify_supabase_jwt(credentials.credentials)
         if auth_user_id == project["owner_id"]:
             return project
-    if share_token and share_token == project["share_token"]:
-        return project
-    raise HTTPException(status_code=403, detail="이 프로젝트에 접근할 권한이 없습니다.")
+    del share_token
+    raise HTTPException(status_code=403, detail="프로젝트 소유자만 사진을 관리할 수 있습니다.")
 
 
 async def _process_one_customer_photo(

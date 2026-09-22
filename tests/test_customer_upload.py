@@ -11,6 +11,16 @@ from app.routers import customer_upload
 
 
 class CustomerUploadTest(unittest.TestCase):
+    def test_share_token_cannot_manage_photos(self):
+        with patch.object(
+            customer_upload,
+            "_get_customer_project",
+            return_value={"id": "project-1", "owner_id": "owner-1", "photo_count": 0},
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                customer_upload._authorize_customer_project(MagicMock(), "project-1", None, "old-share-token")
+        self.assertEqual(raised.exception.status_code, 403)
+
     def test_rejects_entire_over_limit_request_before_processing(self):
         files = [
             UploadFile(filename=name, file=io.BytesIO(b"jpeg"), headers=Headers({"content-type": "image/jpeg"}))
