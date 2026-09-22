@@ -43,7 +43,7 @@ class CustomerPhotoDeleteRequest(BaseModel):
 def _get_customer_project(supabase, project_id: str) -> dict:
     r = (
         supabase.table("customer_projects")
-        .select("id, owner_id, photo_count, lifetime_uploaded_count, exported")
+        .select("id, owner_id, photo_count, lifetime_uploaded_count, exported, delivery_count")
         .eq("id", project_id)
         .limit(1)
         .execute()
@@ -54,10 +54,10 @@ def _get_customer_project(supabase, project_id: str) -> dict:
 
 
 def _require_photo_set_mutable(project: dict) -> None:
-    if project.get("exported"):
+    if project.get("exported") or project.get("delivery_count", 0) > 0:
         raise HTTPException(
             status_code=409,
-            detail="전달을 완료한 프로젝트의 사진은 추가하거나 삭제할 수 없습니다.",
+            detail="한 번 전달한 프로젝트의 사진 구성은 변경할 수 없습니다.",
         )
 
 
