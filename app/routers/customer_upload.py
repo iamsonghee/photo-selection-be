@@ -260,6 +260,46 @@ async def delete_customer_photos(
     return {"deleted": len(owned_ids), "photo_count": remaining}
 
 
+@router.delete("/projects/{project_id}")
+async def delete_customer_project(
+    project_id: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+):
+    """소유자만 프로젝트와 파생 데이터·R2 이미지를 함께 삭제한다."""
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    supabase = get_supabase()
+    project = _get_customer_project(supabase, project_id)
+    if verify_supabase_jwt(credentials.credentials) != project["owner_id"]:
+        raise HTTPException(status_code=403, detail="프로젝트 소유자만 삭제할 수 있습니다.")
+
+    photos = supabase.table("customer_photos").select("id").eq("project_id", project_id).execute().data or []
+    photo_ids = [row["id"] for row in photos]
+    versions = []
+    if photo_ids:
+        versions = supabase.table("customer_photo_versions").select("id").in_("photo_id", photo_ids).execute().data or []
+    try:
+        supabase.table("customer_projects").delete().eq("id", project_id).eq("owner_id", project["owner_id"]).execute()
+    except Exception as e:
+        logger.exception("customer project delete failed: %s", e)
+        raise HTTPException(status_code=500, detail="프로젝트 삭제 실패") from e
+
+    keys = [key for photo_id in photo_ids for key in (
+        f"customer-photos/{project_id}/{photo_id}_thumb.jpg",
+        f"customer-photos/{project_id}/{photo_id}_preview.jpg",
+    )]
+    keys.extend(key for row in versions for key in (
+        f"customer-photos/{project_id}/retouched/{row['id']}_thumb.jpg",
+        f"customer-photos/{project_id}/retouched/{row['id']}_preview.jpg",
+    ))
+    if keys:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, delete_r2_objects, keys)
+        except Exception as e:
+            logger.warning("deleted customer project R2 cleanup failed: %s", e)
+    return {"deleted": True}
+
+
 @router.post("/retouched")
 async def upload_customer_retouched_photos(
     project_id: str = Form(...),
