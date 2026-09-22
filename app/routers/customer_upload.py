@@ -115,6 +115,15 @@ async def upload_customer_photos(
     supabase = get_supabase()
     project = _authorize_customer_project(supabase, project_id, credentials, share_token)
 
+    remaining = max(0, MAX_PHOTOS_PER_CUSTOMER_PROJECT - project["photo_count"])
+    if len(files) > remaining:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "limit_exceeded", "max": MAX_PHOTOS_PER_CUSTOMER_PROJECT,
+                    "remaining": remaining,
+                    "message": f"{len(files)}장을 선택했어요. {remaining}장까지 추가할 수 있습니다. 파일을 다시 선택해 주세요."},
+        )
+
     valid: list[tuple[bytes, str]] = []  # (contents, original_filename)
     rejected_filenames: list[str] = []
     for f in files:
@@ -138,15 +147,6 @@ async def upload_customer_photos(
         )
 
     current_count = project["photo_count"]
-    remaining = MAX_PHOTOS_PER_CUSTOMER_PROJECT - current_count
-    if remaining <= 0:
-        raise HTTPException(
-            status_code=403,
-            detail={"error": "limit_exceeded", "max": MAX_PHOTOS_PER_CUSTOMER_PROJECT, "message": f"프로젝트당 최대 {MAX_PHOTOS_PER_CUSTOMER_PROJECT}장까지 업로드할 수 있습니다."},
-        )
-    if len(valid) > remaining:
-        rejected_filenames.extend(filename for _, filename in valid[remaining:])
-        valid = valid[:remaining]
 
     loop = asyncio.get_event_loop()
     sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)

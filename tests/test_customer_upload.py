@@ -3,7 +3,7 @@ import io
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials
 from starlette.datastructures import Headers
 
@@ -11,7 +11,7 @@ from app.routers import customer_upload
 
 
 class CustomerUploadTest(unittest.TestCase):
-    def test_reports_limit_and_processing_rejections(self):
+    def test_rejects_entire_over_limit_request_before_processing(self):
         files = [
             UploadFile(filename=name, file=io.BytesIO(b"jpeg"), headers=Headers({"content-type": "image/jpeg"}))
             for name in ("first.jpg", "over-limit.jpg")
@@ -24,11 +24,21 @@ class CustomerUploadTest(unittest.TestCase):
             customer_upload,
             "_process_one_customer_photo",
             new=AsyncMock(return_value=None),
-        ):
-            result = asyncio.run(customer_upload.upload_customer_photos("project", files, None, None))
+        ) as process:
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(customer_upload.upload_customer_photos("project", files, None, None))
+            process.assert_not_awaited()
+        self.assertEqual(raised.exception.detail["error"], "limit_exceeded")
+        self.assertEqual(raised.exception.detail["remaining"], 1)
 
+    def test_processing_failure_is_reported_within_limit(self):
+        file = UploadFile(filename="failed.jpg", file=io.BytesIO(b"jpeg"), headers=Headers({"content-type": "image/jpeg"}))
+        with patch.object(customer_upload, "get_supabase", return_value=MagicMock()), patch.object(
+            customer_upload, "_authorize_customer_project", return_value={"photo_count": 1999}
+        ), patch.object(customer_upload, "_process_one_customer_photo", new=AsyncMock(return_value=None)):
+            result = asyncio.run(customer_upload.upload_customer_photos("project", [file], None, None))
         self.assertEqual(result["uploaded"], 0)
-        self.assertCountEqual(result["rejected"], ["first.jpg", "over-limit.jpg"])
+        self.assertEqual(result["rejected"], ["failed.jpg"])
 
     def test_project_delete_cascades_and_cleans_r2(self):
         supabase = MagicMock()
