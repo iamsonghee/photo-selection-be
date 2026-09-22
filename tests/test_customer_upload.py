@@ -11,6 +11,11 @@ from app.routers import customer_upload
 
 
 class CustomerUploadTest(unittest.TestCase):
+    def test_exported_project_rejects_photo_changes(self):
+        with self.assertRaises(HTTPException) as raised:
+            customer_upload._require_photo_set_mutable({"exported": True})
+        self.assertEqual(raised.exception.status_code, 409)
+
     def test_share_token_cannot_manage_photos(self):
         with patch.object(
             customer_upload,

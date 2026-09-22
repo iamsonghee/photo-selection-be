@@ -43,7 +43,7 @@ class CustomerPhotoDeleteRequest(BaseModel):
 def _get_customer_project(supabase, project_id: str) -> dict:
     r = (
         supabase.table("customer_projects")
-        .select("id, owner_id, photo_count")
+        .select("id, owner_id, photo_count, lifetime_uploaded_count, exported")
         .eq("id", project_id)
         .limit(1)
         .execute()
@@ -51,6 +51,14 @@ def _get_customer_project(supabase, project_id: str) -> dict:
     if not r.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
     return r.data[0]
+
+
+def _require_photo_set_mutable(project: dict) -> None:
+    if project.get("exported"):
+        raise HTTPException(
+            status_code=409,
+            detail="전달을 완료한 프로젝트의 사진은 추가하거나 삭제할 수 없습니다.",
+        )
 
 
 def _authorize_customer_project(
@@ -113,6 +121,7 @@ async def upload_customer_photos(
 
     supabase = get_supabase()
     project = _authorize_customer_project(supabase, project_id, credentials, share_token)
+    _require_photo_set_mutable(project)
 
     remaining = max(0, MAX_PHOTOS_PER_CUSTOMER_PROJECT - project["photo_count"])
     if len(files) > remaining:
@@ -188,7 +197,10 @@ async def upload_customer_photos(
     try:
         supabase.table("customer_photos").insert(insert_rows).execute()
         new_count = current_count + len(rows)
-        supabase.table("customer_projects").update({"photo_count": new_count}).eq("id", project_id).execute()
+        supabase.table("customer_projects").update({
+            "photo_count": new_count,
+            "lifetime_uploaded_count": project.get("lifetime_uploaded_count", current_count) + len(rows),
+        }).eq("id", project_id).execute()
     except Exception as e:
         logger.exception("customer_photos insert failed: %s", e)
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e
@@ -210,6 +222,7 @@ async def delete_customer_photos(
 ):
     supabase = get_supabase()
     project = _authorize_customer_project(supabase, body.project_id, credentials, body.share_token)
+    _require_photo_set_mutable(project)
     photo_ids = list(dict.fromkeys(body.photo_ids))
     if not photo_ids:
         raise HTTPException(status_code=400, detail="삭제할 사진이 없습니다.")
