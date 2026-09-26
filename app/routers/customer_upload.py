@@ -25,7 +25,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # 1차 범위 상한(사용자 결정) — 등급별 쿼터 테이블 없이 상수 하나로 충분하다(YAGNI).
-MAX_PHOTOS_PER_CUSTOMER_PROJECT = 2000
+MAX_PHOTOS_PER_CUSTOMER_ACCOUNT = 2000
 
 UPLOAD_CONCURRENCY = env_int("CUSTOMER_UPLOAD_CONCURRENCY", 5, 1, 12)
 IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
@@ -51,6 +51,16 @@ def _get_customer_project(supabase, project_id: str) -> dict:
     if not r.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
     return r.data[0]
+
+
+def _get_customer_account_photo_count(supabase, owner_id: str) -> int:
+    result = (
+        supabase.table("customer_projects")
+        .select("photo_count")
+        .eq("owner_id", owner_id)
+        .execute()
+    )
+    return sum(max(0, int(row.get("photo_count") or 0)) for row in (result.data or []))
 
 
 def _require_photo_set_mutable(project: dict) -> None:
@@ -123,13 +133,14 @@ async def upload_customer_photos(
     project = _authorize_customer_project(supabase, project_id, credentials, share_token)
     _require_photo_set_mutable(project)
 
-    remaining = max(0, MAX_PHOTOS_PER_CUSTOMER_PROJECT - project["photo_count"])
+    account_photo_count = _get_customer_account_photo_count(supabase, project["owner_id"])
+    remaining = max(0, MAX_PHOTOS_PER_CUSTOMER_ACCOUNT - account_photo_count)
     if len(files) > remaining:
         raise HTTPException(
             status_code=403,
-            detail={"error": "limit_exceeded", "max": MAX_PHOTOS_PER_CUSTOMER_PROJECT,
+            detail={"error": "limit_exceeded", "max": MAX_PHOTOS_PER_CUSTOMER_ACCOUNT,
                     "remaining": remaining,
-                    "message": f"{len(files)}장을 선택했어요. {remaining}장까지 추가할 수 있습니다. 파일을 다시 선택해 주세요."},
+                    "message": f"{len(files)}장을 선택했어요. 셀프 고객 전체 한도에서 {remaining}장까지 추가할 수 있습니다. 파일을 다시 선택해 주세요."},
         )
 
     valid: list[tuple[bytes, str]] = []  # (contents, original_filename)
@@ -203,6 +214,22 @@ async def upload_customer_photos(
         }).eq("id", project_id).execute()
     except Exception as e:
         logger.exception("customer_photos insert failed: %s", e)
+        keys = [key for row in rows for key in (
+            f"customer-photos/{project_id}/{row['id']}_thumb.jpg",
+            f"customer-photos/{project_id}/{row['id']}_preview.jpg",
+        )]
+        try:
+            await loop.run_in_executor(None, delete_r2_objects, keys)
+        except Exception as cleanup_error:
+            logger.warning("failed customer photo R2 cleanup after insert error: %s", cleanup_error)
+        if "customer account photo limit exceeded" in str(e):
+            remaining = max(0, MAX_PHOTOS_PER_CUSTOMER_ACCOUNT - _get_customer_account_photo_count(supabase, project["owner_id"]))
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "limit_exceeded", "max": MAX_PHOTOS_PER_CUSTOMER_ACCOUNT,
+                        "remaining": remaining,
+                        "message": f"다른 업로드가 먼저 완료되어 전체 한도에 도달했어요. 현재 {remaining}장까지 추가할 수 있습니다."},
+            ) from e
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e
 
     return {

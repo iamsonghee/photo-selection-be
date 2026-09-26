@@ -31,7 +31,7 @@ class CustomerUploadTest(unittest.TestCase):
                 customer_upload._authorize_customer_project(MagicMock(), "project-1", None, "old-share-token")
         self.assertEqual(raised.exception.status_code, 403)
 
-    def test_rejects_entire_over_limit_request_before_processing(self):
+    def test_rejects_entire_request_when_other_projects_use_account_limit(self):
         files = [
             UploadFile(filename=name, file=io.BytesIO(b"jpeg"), headers=Headers({"content-type": "image/jpeg"}))
             for name in ("first.jpg", "over-limit.jpg")
@@ -39,7 +39,11 @@ class CustomerUploadTest(unittest.TestCase):
         with patch.object(customer_upload, "get_supabase", return_value=MagicMock()), patch.object(
             customer_upload,
             "_authorize_customer_project",
-            return_value={"photo_count": customer_upload.MAX_PHOTOS_PER_CUSTOMER_PROJECT - 1},
+            return_value={"owner_id": "owner-1", "photo_count": 0},
+        ), patch.object(
+            customer_upload,
+            "_get_customer_account_photo_count",
+            return_value=customer_upload.MAX_PHOTOS_PER_CUSTOMER_ACCOUNT - 1,
         ), patch.object(
             customer_upload,
             "_process_one_customer_photo",
@@ -54,7 +58,9 @@ class CustomerUploadTest(unittest.TestCase):
     def test_processing_failure_is_reported_within_limit(self):
         file = UploadFile(filename="failed.jpg", file=io.BytesIO(b"jpeg"), headers=Headers({"content-type": "image/jpeg"}))
         with patch.object(customer_upload, "get_supabase", return_value=MagicMock()), patch.object(
-            customer_upload, "_authorize_customer_project", return_value={"photo_count": 1999}
+            customer_upload, "_authorize_customer_project", return_value={"owner_id": "owner-1", "photo_count": 1999}
+        ), patch.object(
+            customer_upload, "_get_customer_account_photo_count", return_value=1999
         ), patch.object(customer_upload, "_process_one_customer_photo", new=AsyncMock(return_value=None)):
             result = asyncio.run(customer_upload.upload_customer_photos("project", [file], None, None))
         self.assertEqual(result["uploaded"], 0)
