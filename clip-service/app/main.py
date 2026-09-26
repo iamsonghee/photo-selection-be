@@ -4,6 +4,8 @@ CLIP 모델은 서버 시작 시 미리 로드하지 않고, 분석 요청이 �
 처음 호출될 때 lazy하게 로드된다(clip_model._ensure_loaded). Railway Sleep으로 유휴 시
 컨테이너가 내려가는 걸 전제로, 깨어난 직후 아무 요청도 없으면 모델도 메모리에 올라가지
 않도록 하기 위함이다."""
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timezone
 

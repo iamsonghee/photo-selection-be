@@ -1,4 +1,6 @@
 """분석 파이프라인 오케스트레이션: DB 조회 -> 다운로드 -> 임베딩 -> 그룹핑 -> DB 기록."""
+from __future__ import annotations
+
 import asyncio
 import logging
 import time

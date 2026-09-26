@@ -1,4 +1,6 @@
 """open_clip 모델 lazy-load 싱글톤 + 임베딩 계산."""
+from __future__ import annotations
+
 import io
 import logging
 import threading

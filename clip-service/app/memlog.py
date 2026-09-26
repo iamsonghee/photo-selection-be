@@ -1,5 +1,7 @@
 """임시 계측: Railway Sleep 동작 여부 및 CLIP lazy-load 전환 효과를 RSS로 확인하기 위한 로깅.
 검증 끝나면 삭제할 코드다."""
+from __future__ import annotations
+
 import logging
 import os
 
