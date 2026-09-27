@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import time
+import unicodedata
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -69,8 +70,11 @@ def _maybe_enqueue_archive_build(project_id: str) -> None:
 
 
 def _sanitize_arcname(filename: str) -> str:
-    """ZIP 내부 파일명: 작가가 올린 원본 파일명을 유지한다."""
-    base = re.sub(r'[/\\\x00-\x1f]', "_", filename or "photo.jpg").strip()
+    """ZIP 내부 파일명: 작가가 올린 원본 파일명을 유지한다.
+    NFC 정규화는 업로드 시점에도 적용되지만, 그 전에 이미 NFD(macOS 자모 분리형)로
+    저장된 기존 레코드도 내보내기 시점에 자동 교정되도록 여기서도 한 번 더 적용한다."""
+    normalized = unicodedata.normalize("NFC", filename or "photo.jpg")
+    base = re.sub(r'[/\\\x00-\x1f]', "_", normalized).strip()
     if not base:
         base = "photo.jpg"
     return base
