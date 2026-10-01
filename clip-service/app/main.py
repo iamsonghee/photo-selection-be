@@ -36,6 +36,12 @@ class AnalyzeRequest(BaseModel):
     project_id: str
 
 
+class CustomerAnalyzeRequest(BaseModel):
+    project_id: str
+    # 촬영 종류별 장면 이름 목록(FE가 관리). 주면 유사컷 분석 뒤 장면에 이름을 붙인다.
+    scene_names: list[str] | None = None
+
+
 class AnalyzeGeminiRequest(BaseModel):
     project_id: str
     limit: int | None = None  # number 순 앞 N장만 분석 (POC 비용 통제용, 예: 50/100)
@@ -71,7 +77,7 @@ def _latest_customer_run(db, project_id: str, kind: str):
 
 
 @app.post("/analyze/customer/{kind}", status_code=202, dependencies=[Depends(verify_internal_token)])
-def analyze_customer(kind: str, req: AnalyzeRequest, background_tasks: BackgroundTasks):
+def analyze_customer(kind: str, req: CustomerAnalyzeRequest, background_tasks: BackgroundTasks):
     if kind not in {"similarity", "quality"}:
         raise HTTPException(status_code=404, detail="Unknown analysis kind")
     db = get_supabase()
@@ -83,8 +89,10 @@ def analyze_customer(kind: str, req: AnalyzeRequest, background_tasks: Backgroun
     run = db.table("customer_ai_runs").insert({
         "project_id": req.project_id, "kind": kind, "status": "processing"
     }).execute().data[0]
-    task = customer_ai.run_similarity if kind == "similarity" else customer_ai.run_quality
-    background_tasks.add_task(task, run["id"], req.project_id)
+    if kind == "similarity":
+        background_tasks.add_task(customer_ai.run_similarity, run["id"], req.project_id, req.scene_names)
+    else:
+        background_tasks.add_task(customer_ai.run_quality, run["id"], req.project_id)
     return {"status": "processing", "run_id": run["id"]}
 
 
