@@ -20,6 +20,8 @@ from app.scenes import split_scenes
 
 logger = logging.getLogger(__name__)
 OTHER_SCENE = "기타 장면"
+# 셀프 고객 판정은 인물 구성(people)까지 묻는 별도 프롬프트라 버전을 따로 둔다 — 작가 판정 캐시와 섞이지 않게.
+CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
 SCENE_SAMPLE_PHOTOS = 3
 
 
@@ -37,13 +39,14 @@ def is_stale(run: dict, now: datetime) -> bool:
 
 
 def _progress(db, run_id: str, total: int, start: int):
-    """진행 수 기록: 시작 시 전체·재사용 장수를 쓰고, 이후 5장마다(그리고 마지막에) 처리 장수를 갱신하는 콜백을 돌려준다."""
-    count = {"done": start}
+    """진행 수 기록: 시작 시 전체·재사용 수를 쓰고, 이후 5 이상 늘 때마다(그리고 마지막에) 처리 수를 갱신하는 콜백을 돌려준다."""
+    count = {"done": start, "written": start}
     db.table("customer_ai_runs").update({"image_count": total, "processed_count": start}).eq("id", run_id).execute()
 
-    def tick():
-        count["done"] += 1
-        if count["done"] % 5 == 0 or count["done"] >= total:
+    def tick(step: int = 1):
+        count["done"] += step
+        if count["done"] - count["written"] >= 5 or count["done"] >= total:
+            count["written"] = count["done"]
             try:
                 db.table("customer_ai_runs").update({"processed_count": count["done"]}).eq("id", run_id).execute()
             except Exception as exc:  # 진행 표시는 실패해도 분석은 계속한다
@@ -65,7 +68,7 @@ def capture_order(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=lambda row: (row.get("taken_at") is None, row.get("taken_at") or "", row["order_index"]))
 
 
-async def _embeddings(db, project_id: str, rows: list[dict], run_id: Optional[str] = None) -> list[Optional[np.ndarray]]:
+async def _embeddings(db, project_id: str, rows: list[dict], tick=None) -> list[Optional[np.ndarray]]:
     """사진별 임베딩(rows 순서). 이미 저장된 사진은 재사용하고 새 사진만 Gemini로 계산해 저장한다."""
     stored = {
         row["photo_id"]: np.asarray(row["embedding"], dtype=np.float64)
@@ -75,7 +78,8 @@ async def _embeddings(db, project_id: str, rows: list[dict], run_id: Optional[st
                     .execute()).data or []
     }
     missing = [row for row in rows if row["id"] not in stored]
-    tick = _progress(db, run_id, len(rows), len(rows) - len(missing)) if run_id else None
+    if tick:
+        tick(len(rows) - len(missing))
     if missing:
         vectors, _ = await embed_images(await download_all([row["thumb_url"] for row in missing]), on_each=tick)
         payload = [{"project_id": project_id, "photo_id": row["id"],
@@ -113,24 +117,42 @@ async def _name_scene(client, images: list[bytes], names: list[str]) -> str:
         return OTHER_SCENE
 
 
-async def _save_scenes(db, project_id: str, rows: list[dict], scene_names: Optional[list[str]]):
+def merge_same_named(scenes: list[list[dict]], names: list[Optional[str]]) -> tuple[list[list[dict]], list[Optional[str]]]:
+    """바로 붙은 장면의 이름이 같으면 한 장면으로 합친다 — 시간 공백이 한 장면을 잘못 나눈 경우(예: 하객, 하객).
+    떨어져 있는 같은 이름은 실제로 다른 시점이라 그대로 둔다. 이름 없는 장면은 합치지 않는다."""
+    merged: list[list[dict]] = []
+    merged_names: list[Optional[str]] = []
+    for scene, name in zip(scenes, names):
+        if name is not None and merged_names and merged_names[-1] == name:
+            merged[-1] = merged[-1] + scene
+        else:
+            merged.append(scene)
+            merged_names.append(name)
+    return merged, merged_names
+
+
+async def _save_scenes(db, project_id: str, rows: list[dict], scene_names: Optional[list[str]], tick=lambda step=1: None):
     """촬영 시각 공백으로 장면을 나누고(이름 목록이 있으면 대표 사진으로 이름을 붙여) 저장한다. 나눌 근거가 없으면 장면을 지운다."""
     db.table("customer_photos").update({"scene_id": None}).eq("project_id", project_id).execute()
     db.table("customer_scenes").delete().eq("project_id", project_id).execute()
     scenes = split_scenes(rows)
     if not scenes:
+        tick(len(rows))
         return
     names: list[Optional[str]] = [None] * len(scenes)
     if scene_names:
         client = await get_client()
         for index, scene in enumerate(scenes):
-            if not scene[0].get("taken_at"):
-                continue  # 촬영 시각 없는 사진 모음은 이름 없이 둔다
-            step = max(1, len(scene) // SCENE_SAMPLE_PHOTOS)
-            sample = scene[step // 2::step][:SCENE_SAMPLE_PHOTOS]
-            images = [image for image in await download_all([photo["preview_url"] for photo in sample]) if image]
-            if images:
-                names[index] = await _name_scene(client, images, scene_names)
+            if scene[0].get("taken_at"):  # 촬영 시각 없는 사진 모음은 이름 없이 둔다
+                step = max(1, len(scene) // SCENE_SAMPLE_PHOTOS)
+                sample = scene[step // 2::step][:SCENE_SAMPLE_PHOTOS]
+                images = [image for image in await download_all([photo["preview_url"] for photo in sample]) if image]
+                if images:
+                    names[index] = await _name_scene(client, images, scene_names)
+            tick(len(scene))
+        scenes, names = merge_same_named(scenes, names)
+    else:
+        tick(len(rows))
     for index, scene in enumerate(scenes):
         saved = db.table("customer_scenes").insert({
             "project_id": project_id, "scene_index": index, "name": names[index],
@@ -147,7 +169,10 @@ async def run_similarity(run_id: str, project_id: str, scene_names: Optional[lis
     rows = capture_order((db.table("customer_photos").select("id,order_index,thumb_url,preview_url,taken_at")
                           .eq("project_id", project_id).execute()).data or [])
     try:
-        vectors = await _embeddings(db, project_id, rows, run_id)
+        # 진행률: 앞 절반은 사진 임베딩(재사용분은 바로 채움), 뒤 절반은 장면 이름 붙이기(장면 사진 수만큼).
+        # 다시 정리할 때는 임베딩이 다 저장돼 있어 실제 시간은 장면 쪽에서 든다 — 한 단계만 세면 바로 100%에서 멈춰 보인다.
+        tick = _progress(db, run_id, len(rows) * 2, 0)
+        vectors = await _embeddings(db, project_id, rows, tick)
         db.table("customer_photos").update({"similarity_group_id": None}).eq("project_id", project_id).execute()
         db.table("customer_photo_groups").delete().eq("project_id", project_id).execute()
         for members in group_by_similarity(vectors, GEMINI_SIMILARITY_THRESHOLD):
@@ -156,7 +181,7 @@ async def run_similarity(run_id: str, project_id: str, scene_names: Optional[lis
                 "project_id": project_id, "representative_photo_id": ids[0], "photo_count": len(ids)
             }).execute().data[0]
             db.table("customer_photos").update({"similarity_group_id": group["id"]}).in_("id", ids).execute()
-        await _save_scenes(db, project_id, rows, scene_names)
+        await _save_scenes(db, project_id, rows, scene_names, tick)
         processed = sum(vector is not None for vector in vectors)
         _done(db, run_id, len(rows), processed, len(rows) - processed)
     except Exception as exc:
@@ -170,15 +195,15 @@ async def run_quality(run_id: str, project_id: str):
     # 같은 모델·프롬프트 버전으로 이미 판정한 사진은 다시 부르지 않는다(사진을 추가하고 다시 정리할 때 새 사진만).
     done = {row["photo_id"] for row in (db.table("customer_quality_assessments").select("photo_id")
             .eq("project_id", project_id).eq("model", GEMINI_FLASH_MODEL)
-            .eq("prompt_version", GEMINI_QUALITY_PROMPT_VERSION).execute()).data or []}
+            .eq("prompt_version", CUSTOMER_QUALITY_PROMPT_VERSION).execute()).data or []}
     reused = len([row for row in rows if row["id"] in done])
     rows = [row for row in rows if row["id"] not in done]
     try:
         tick = _progress(db, run_id, reused + len(rows), reused)
         images = await download_all([row["preview_url"] for row in rows])
-        assessments, _ = await assess_images(images, on_each=tick)
+        assessments, _ = await assess_images(images, on_each=tick, customer=True)
         payload = [{"project_id": project_id, "photo_id": row["id"], "model": GEMINI_FLASH_MODEL,
-                    "prompt_version": GEMINI_QUALITY_PROMPT_VERSION,
+                    "prompt_version": CUSTOMER_QUALITY_PROMPT_VERSION,
                     "eyes_closed": value.eyes_closed.value, "blur_or_shake": value.blur_or_shake.value,
                     "focus_issue": value.focus_issue.value, "face_occluded": value.face_occluded.value,
                     "primary_subject_detected": value.primary_subject_detected, "notes": value.notes,
@@ -188,6 +213,9 @@ async def run_quality(run_id: str, project_id: str):
             db.table("customer_quality_assessments").upsert(
                 payload[start:start + 100],
                 on_conflict="project_id,photo_id,model,prompt_version").execute()
+        # 이전 프롬프트 판정은 지운다 — 프로젝트 조회가 버전 구분 없이 사진별 판정을 읽어서 남으면 섞인다.
+        db.table("customer_quality_assessments").delete().eq("project_id", project_id) \
+            .neq("prompt_version", CUSTOMER_QUALITY_PROMPT_VERSION).execute()
         _done(db, run_id, reused + len(rows), reused + len(payload), len(rows) - len(payload))
     except Exception as exc:
         _done(db, run_id, reused + len(rows), reused, len(rows), str(exc)[:500])

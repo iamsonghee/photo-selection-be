@@ -1,3 +1,4 @@
+from app.customer_ai import merge_same_named
 from app.scenes import split_scenes
 
 
@@ -13,10 +14,16 @@ def _photos(blocks):
     return photos
 
 
-def test_splits_on_ten_minute_gaps_like_the_frontend():
+def test_splits_on_long_gaps_like_the_frontend():
     scenes = split_scenes(_photos([(11, 0, 30), (11, 40, 30), (12, 30, 30)]))
     assert [len(scene) for scene in scenes] == [30, 30, 30]
     assert scenes[1][0]["id"] == "p30"
+
+
+def test_event_snap_splits_on_short_breaks():
+    # 돌잔치 스냅 실데이터 패턴: 쉬지 않고 찍다가 순서가 바뀔 때만 4~5분 쉰다(10분 공백 없음).
+    scenes = split_scenes(_photos([(10, 0, 30), (10, 15, 30), (10, 30, 30)]))
+    assert [len(scene) for scene in scenes] == [30, 30, 30]
 
 
 def test_small_scenes_merge_into_neighbours_and_untimed_go_last():
@@ -31,3 +38,34 @@ def test_too_few_or_mostly_untimed_photos_have_no_scenes():
     assert split_scenes(_photos([(11, 0, 19)])) is None
     untimed = [{"id": f"u{i}", "order_index": i, "taken_at": None} for i in range(30)]
     assert split_scenes(_photos([(11, 0, 20)]) + untimed) is None
+
+
+def test_adjacent_same_named_scenes_merge():
+    a, b, c, d, e = ([{"id": n}] for n in "abcde")
+    scenes, names = merge_same_named([a, b, c, d, e], ["하객", "하객", "돌잡이", "하객", None])
+    assert names == ["하객", "돌잡이", "하객", None]
+    assert [[photo["id"] for photo in scene] for scene in scenes] == [["a", "b"], ["c"], ["d"], ["e"]]
+
+
+def test_scene_progress_fills_second_half(monkeypatch):
+    # 다시 정리(임베딩 재사용)할 때도 장면 이름을 붙이는 동안 진행률이 올라 끝에서 정확히 전체가 된다.
+    import asyncio
+    from unittest.mock import MagicMock
+    from app import customer_ai
+
+    async def fake_client():
+        return None
+
+    async def fake_download(urls):
+        return [b"x" for _ in urls]
+
+    async def fake_name(client, images, names):
+        return names[0]
+
+    monkeypatch.setattr(customer_ai, "get_client", fake_client)
+    monkeypatch.setattr(customer_ai, "download_all", fake_download)
+    monkeypatch.setattr(customer_ai, "_name_scene", fake_name)
+    rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 30), (11, 40, 30)])]
+    steps = []
+    asyncio.run(customer_ai._save_scenes(MagicMock(), "p", rows, ["하객"], lambda step=1: steps.append(step)))
+    assert sum(steps) == len(rows)

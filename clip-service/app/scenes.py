@@ -10,7 +10,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-SCENE_GAP_SECONDS = 10 * 60
+# 3분: 행사 스냅(돌잔치 등)은 쉬지 않고 찍다가 순서가 바뀔 때만 3~10분 쉰다. 본식처럼 공백이 많으면
+# MAX_SCENES 안에서 큰 공백부터 자르므로 기준이 낮아도 장면이 과하게 쪼개지지 않는다.
+SCENE_GAP_SECONDS = 3 * 60
 MIN_SCENE_PHOTOS = 10
 MAX_SCENES = 8
 MIN_PHOTOS_FOR_SCENES = 20

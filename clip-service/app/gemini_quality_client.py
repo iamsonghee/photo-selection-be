@@ -41,6 +41,19 @@ class PhotoQualityAssessment(BaseModel):
     notes: Optional[str] = None
 
 
+class PeopleKind(str, Enum):
+    SOLO = "solo"  # 한 사람 단독(돌잔치면 아기 독사진)
+    FAMILY = "family"  # 가족·커플 등 가까운 소수(2~6명)
+    GROUP = "group"  # 하객·단체 등 여러 사람
+    NONE = "none"  # 인물 없음(공간·소품·상차림 디테일)
+
+
+class CustomerPhotoAssessment(PhotoQualityAssessment):
+    """셀프 고객 전용 — 품질 판정에 인물 구성을 더한다(장면 안에서 아기 단독·가족 등으로 걸러 보기용).
+    작가 판정(PhotoQualityAssessment)은 바꾸지 않는다: 프롬프트가 바뀌면 작가 쪽 저장된 판정이 모두 무효가 된다."""
+    people: PeopleKind
+
+
 _PROMPT = """당신은 사진작가의 1차 검토를 돕는 보조 도구입니다. 이 사진 1장을 보고 아래 4가지 항목을
 각각 "ok"(문제 없음) / "possible"(문제 가능성 있음) / "likely"(명확한 문제 의심) / "unknown"(판정하기 어려움) 중 하나로 판정하세요.
 
@@ -63,6 +76,12 @@ _PROMPT = """당신은 사진작가의 1차 검토를 돕는 보조 도구입니
 
 주어진 JSON 스키마 형식으로만 응답하세요."""
 
+_CUSTOMER_PROMPT = _PROMPT.replace("주어진 JSON 스키마 형식으로만 응답하세요.", """- people: 사진의 인물 구성을 하나로 고르세요.
+  "solo" = 한 사람이 단독으로 주인공(다른 사람은 손·뒷모습 정도만), "family" = 가족·커플 등 2~6명이 함께,
+  "group" = 하객·단체 등 7명 이상이거나 여러 무리가 함께, "none" = 사람이 없거나 공간·소품·음식 디테일이 주인공.
+
+주어진 JSON 스키마 형식으로만 응답하세요.""")
+
 
 def _build_usage(response) -> Optional[dict]:
     usage = getattr(response, "usage_metadata", None)
@@ -75,7 +94,8 @@ def _build_usage(response) -> Optional[dict]:
     }
 
 
-async def _assess_one(client, image_bytes: bytes, mime_type: str):
+async def _assess_one(client, image_bytes: bytes, mime_type: str, customer: bool = False):
+    schema, prompt = (CustomerPhotoAssessment, _CUSTOMER_PROMPT) if customer else (PhotoQualityAssessment, _PROMPT)
     last_exc: Optional[Exception] = None
     for attempt in range(GEMINI_QUALITY_MAX_RETRIES + 1):
         try:
@@ -83,18 +103,18 @@ async def _assess_one(client, image_bytes: bytes, mime_type: str):
                 client.aio.models.generate_content(
                     model=GEMINI_FLASH_MODEL,
                     contents=[
-                        _PROMPT,
+                        prompt,
                         types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                     ],
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
-                        response_schema=PhotoQualityAssessment,
+                        response_schema=schema,
                         temperature=0,
                     ),
                 ),
                 timeout=GEMINI_QUALITY_TIMEOUT_SECONDS,
             )
-            assessment = PhotoQualityAssessment.model_validate_json(response.text)
+            assessment = schema.model_validate_json(response.text)
             return assessment, _build_usage(response)
         except Exception as e:
             last_exc = e
@@ -107,6 +127,7 @@ async def _assess_one(client, image_bytes: bytes, mime_type: str):
 async def assess_images(
     images: list[Optional[bytes]],
     on_each: Optional[Callable[[], None]] = None,
+    customer: bool = False,
 ) -> tuple[list[Optional[PhotoQualityAssessment]], list[dict]]:
     """순서를 보존하며 이미지별 품질 판정. 다운로드 실패(None) 또는 판정 실패 항목은 None.
     반환: (판정 리스트, 실제 usage_metadata 리스트)."""
@@ -121,7 +142,7 @@ async def assess_images(
             return None
         async with sem:
             try:
-                assessment, usage = await _assess_one(client, img, "image/jpeg")
+                assessment, usage = await _assess_one(client, img, "image/jpeg", customer)
                 if usage:
                     usages.append(usage)
                 return assessment
