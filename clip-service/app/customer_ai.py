@@ -19,10 +19,16 @@ def _done(db, run_id, total, processed, failed, error=None):
     }).eq("id", run_id).execute()
 
 
+def capture_order(rows: list[dict]) -> list[dict]:
+    """촬영 시각순(없으면 뒤로, 같으면 업로드 순). 유사컷은 인접한 사진끼리만 비교하므로
+    업로드 순서가 아니라 실제로 연달아 찍은 순서로 늘어놓아야 연속 촬영을 놓치지 않는다."""
+    return sorted(rows, key=lambda row: (row.get("taken_at") is None, row.get("taken_at") or "", row["order_index"]))
+
+
 async def run_similarity(run_id: str, project_id: str):
     db = get_supabase()
-    rows = (db.table("customer_photos").select("id,order_index,thumb_url")
-            .eq("project_id", project_id).order("order_index").execute()).data or []
+    rows = capture_order((db.table("customer_photos").select("id,order_index,thumb_url,taken_at")
+                          .eq("project_id", project_id).execute()).data or [])
     try:
         images = await download_all([row["thumb_url"] for row in rows])
         vectors, _ = await embed_images(images)
