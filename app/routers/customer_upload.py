@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid as uuid_module
 from typing import Optional
 
@@ -93,11 +94,13 @@ async def _process_one_customer_photo(
     loop: asyncio.AbstractEventLoop,
     contents: bytes,
     project_id: str,
+    timings: Optional[dict[str, list[float]]] = None,
 ) -> Optional[tuple[str, str, str]]:
     """파일 하나: 썸네일+미리보기 생성 → R2 업로드. 반환값 (photo_id, thumb_url, preview_url)."""
     # ponytail: 기본 asyncio 스레드풀을 그대로 쓴다(작가 업로드처럼 CPU/IO 전용 풀로 분리하지 않음).
     # 고객 프로젝트는 동시 다중 업로드 배치 규모가 작아 병목이 아니다 — 실측으로 문제가 확인되면 분리.
     photo_id = str(uuid_module.uuid4())
+    started = time.perf_counter()
     try:
         thumb_bytes, preview_bytes, _w, _h = await loop.run_in_executor(
             None, _make_thumb_and_preview_sync, contents
@@ -105,6 +108,9 @@ async def _process_one_customer_photo(
     except Exception as e:
         logger.warning("customer photo resize failed: %s", e)
         return None
+    resized = time.perf_counter()
+    if timings is not None:
+        timings["resize"].append(resized - started)
 
     thumb_key = f"customer-photos/{project_id}/{photo_id}_thumb.jpg"
     preview_key = f"customer-photos/{project_id}/{photo_id}_preview.jpg"
@@ -116,6 +122,8 @@ async def _process_one_customer_photo(
     except Exception as e:
         logger.warning("customer photo R2 upload failed: %s", e)
         return None
+    if timings is not None:
+        timings["r2"].append(time.perf_counter() - resized)
     if not thumb_url or not preview_url:
         return None
     return photo_id, thumb_url, preview_url
@@ -137,6 +145,30 @@ def _parse_taken_at(raw: Optional[str], count: int) -> list[Optional[str]]:
     return parsed + [None] * (count - len(parsed))
 
 
+# 이 시간을 넘긴 배치는 원인 구간을 바로 볼 수 있게 warning으로 남긴다(로컬 기본 로깅에서도 출력됨).
+SLOW_UPLOAD_SECONDS = 15.0
+
+
+def _log_upload_timing(project_id: str, files: int, ok: int, rejected: int, upload_bytes: int,
+                       marks: dict[str, float], timings: dict[str, list[float]]) -> None:
+    """배치 하나의 단계별 소요 시간. 느린 업로드가 디코딩·R2·DB 중 어디서 걸렸는지 구분하기 위함."""
+    ms = lambda seconds: round(seconds * 1000)  # noqa: E731
+    total = marks["end"] - marks["start"]
+    fields = {
+        "project": project_id, "files": files, "ok": ok, "rejected": rejected, "mb": round(upload_bytes / 1_048_576, 1),
+        "auth_quota_ms": ms(marks["authorized"] - marks["start"]),
+        "read_ms": ms(marks["checked"] - marks["authorized"]),
+        "process_ms": ms(marks["processed"] - marks["checked"]),
+        "resize_max_ms": ms(max(timings["resize"], default=0)),
+        "r2_max_ms": ms(max(timings["r2"], default=0)),
+        "db_ms": ms(marks["end"] - marks["processed"]),
+        "total_ms": ms(total),
+    }
+    (logger.warning if total > SLOW_UPLOAD_SECONDS else logger.info)(
+        "customer upload timing %s", " ".join(f"{key}={value}" for key, value in fields.items())
+    )
+
+
 @router.post("/photos")
 async def upload_customer_photos(
     project_id: str = Form(...),
@@ -148,6 +180,8 @@ async def upload_customer_photos(
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
     taken_at_values = _parse_taken_at(taken_at, len(files))
+    marks = {"start": time.perf_counter()}
+    timings: dict[str, list[float]] = {"resize": [], "r2": []}
 
     supabase = get_supabase()
     project = _authorize_customer_project(supabase, project_id, credentials, share_token)
@@ -163,6 +197,7 @@ async def upload_customer_photos(
                     "message": f"{len(files)}장을 선택했어요. 셀프 고객 전체 한도에서 {remaining}장까지 추가할 수 있습니다. 파일을 다시 선택해 주세요."},
         )
 
+    marks["authorized"] = time.perf_counter()
     valid: list[tuple[bytes, str, Optional[str]]] = []  # (contents, original_filename, taken_at)
     rejected_filenames: list[str] = []
     for f, file_taken_at in zip(files, taken_at_values):
@@ -186,15 +221,18 @@ async def upload_customer_photos(
         )
 
     current_count = project["photo_count"]
+    upload_bytes = sum(len(contents) for contents, _, _ in valid)
+    marks["checked"] = time.perf_counter()
 
     loop = asyncio.get_event_loop()
     sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
 
     async def _limited(contents: bytes):
         async with sem:
-            return await _process_one_customer_photo(loop, contents, project_id)
+            return await _process_one_customer_photo(loop, contents, project_id, timings)
 
     results = await asyncio.gather(*[_limited(contents) for contents, _, _ in valid], return_exceptions=True)
+    marks["processed"] = time.perf_counter()
 
     rows: list[dict] = []
     for order_offset, (r, (_, filename, file_taken_at)) in enumerate(zip(results, valid)):
@@ -216,6 +254,8 @@ async def upload_customer_photos(
         })
 
     if not rows:
+        marks["end"] = time.perf_counter()
+        _log_upload_timing(project_id, len(files), 0, len(rejected_filenames), upload_bytes, marks, timings)
         return {"uploaded": 0, "rejected": rejected_filenames}
 
     insert_rows = [
@@ -254,6 +294,8 @@ async def upload_customer_photos(
             ) from e
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e
 
+    marks["end"] = time.perf_counter()
+    _log_upload_timing(project_id, len(files), len(rows), len(rejected_filenames), upload_bytes, marks, timings)
     return {
         "uploaded": len(rows),
         "rejected": rejected_filenames,

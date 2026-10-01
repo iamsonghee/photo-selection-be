@@ -15,6 +15,18 @@ class CustomerUploadTest(unittest.TestCase):
         parsed = customer_upload._parse_taken_at('["2026-10-03T11:02:45", null, "bad", 5]', 5)
         self.assertEqual(parsed, ["2026-10-03T11:02:45", None, None, None, None])
 
+    def test_upload_timing_warns_only_when_slow(self):
+        marks = {"start": 0.0, "authorized": 0.2, "checked": 0.3, "processed": 1.3, "end": 1.5}
+        timings = {"resize": [0.1, 0.4], "r2": [0.3]}
+        with self.assertLogs(customer_upload.logger, level="INFO") as fast:
+            customer_upload._log_upload_timing("p1", 2, 2, 0, 2_097_152, marks, timings)
+        self.assertEqual(fast.records[0].levelname, "INFO")
+        self.assertIn("resize_max_ms=400 r2_max_ms=300 db_ms=200 total_ms=1500", fast.output[0])
+        slow = {**marks, "end": customer_upload.SLOW_UPLOAD_SECONDS + 1}
+        with self.assertLogs(customer_upload.logger, level="INFO") as logged:
+            customer_upload._log_upload_timing("p1", 2, 2, 0, 0, slow, {"resize": [], "r2": []})
+        self.assertEqual(logged.records[0].levelname, "WARNING")
+
     def test_taken_at_ignores_missing_or_invalid_payload(self):
         self.assertEqual(customer_upload._parse_taken_at(None, 2), [None, None])
         self.assertEqual(customer_upload._parse_taken_at("not json", 1), [None])
