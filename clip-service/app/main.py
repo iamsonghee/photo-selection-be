@@ -73,7 +73,16 @@ def health():
 def _latest_customer_run(db, project_id: str, kind: str):
     rows = (db.table("customer_ai_runs").select("*").eq("project_id", project_id)
             .eq("kind", kind).order("created_at", desc=True).limit(1).execute()).data or []
-    return rows[0] if rows else None
+    run = rows[0] if rows else None
+    # 서비스가 분석 도중 재시작되면 그 실행은 "processing"으로 남는다 — 오래 멈춘 실행은 실패로 닫아 다시 시작할 수 있게 한다.
+    # (서비스 시작 시 한꺼번에 닫지 않는다: 로컬·운영이 같은 DB를 쓰면 다른 인스턴스의 진행 중 실행까지 닫힌다.)
+    if run and customer_ai.is_stale(run, datetime.now(timezone.utc)):
+        db.table("customer_ai_runs").update({
+            "status": "failed", "error": "분석이 중간에 멈췄어요. 다시 시도해 주세요.",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", run["id"]).eq("status", "processing").execute()
+        run = {**run, "status": "failed"}
+    return run
 
 
 @app.post("/analyze/customer/{kind}", status_code=202, dependencies=[Depends(verify_internal_token)])

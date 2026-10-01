@@ -23,6 +23,19 @@ OTHER_SCENE = "기타 장면"
 SCENE_SAMPLE_PHOTOS = 3
 
 
+STALE_RUN_SECONDS = 30 * 60  # ponytail: 고정 시간. 2,000장도 넉넉히 끝나는 값 — 진행 갱신 시각을 기록하게 되면 그 기준으로 바꾼다.
+
+
+def is_stale(run: dict, now: datetime) -> bool:
+    """진행 중으로 STALE_RUN_SECONDS 넘게 남은 실행(서비스 재시작 등으로 멈춘 것)."""
+    if run.get("status") != "processing" or not run.get("started_at"):
+        return False
+    started = datetime.fromisoformat(str(run["started_at"]).replace("Z", "+00:00"))
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return (now - started).total_seconds() > STALE_RUN_SECONDS
+
+
 def _progress(db, run_id: str, total: int, start: int):
     """진행 수 기록: 시작 시 전체·재사용 장수를 쓰고, 이후 5장마다(그리고 마지막에) 처리 장수를 갱신하는 콜백을 돌려준다."""
     count = {"done": start}
