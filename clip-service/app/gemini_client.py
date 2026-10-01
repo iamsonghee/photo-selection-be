@@ -6,7 +6,7 @@ API 키와 이미지 바이트, 임베딩 값은 절대 로그에 남기지 않�
 """
 import asyncio
 import logging
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 from google import genai
@@ -91,6 +91,7 @@ async def _embed_one(client: genai.Client, image_bytes: bytes, mime_type: str):
 
 async def embed_images(
     images: List[Optional[bytes]],
+    on_each: Optional[Callable[[], None]] = None,
 ) -> tuple[List[Optional[np.ndarray]], List[dict]]:
     """순서를 보존하며 이미지별 임베딩 계산. 다운로드 실패(None) 또는 임베딩 실패 항목은 None.
     반환: (임베딩 리스트, 실제 usage_metadata 수집분 리스트)."""
@@ -100,6 +101,8 @@ async def embed_images(
 
     async def _run(idx: int, img: Optional[bytes]) -> Optional[np.ndarray]:
         if img is None:
+            if on_each:
+                on_each()
             return None
         async with sem:
             try:
@@ -110,6 +113,9 @@ async def embed_images(
             except Exception as e:
                 logger.warning("gemini embedding failed for image index=%d: %s", idx, e)
                 return None
+            finally:
+                if on_each:
+                    on_each()
 
     embeddings = await asyncio.gather(*[_run(i, img) for i, img in enumerate(images)])
     return list(embeddings), usages

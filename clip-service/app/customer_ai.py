@@ -23,6 +23,21 @@ OTHER_SCENE = "기타 장면"
 SCENE_SAMPLE_PHOTOS = 3
 
 
+def _progress(db, run_id: str, total: int, start: int):
+    """진행 수 기록: 시작 시 전체·재사용 장수를 쓰고, 이후 5장마다(그리고 마지막에) 처리 장수를 갱신하는 콜백을 돌려준다."""
+    count = {"done": start}
+    db.table("customer_ai_runs").update({"image_count": total, "processed_count": start}).eq("id", run_id).execute()
+
+    def tick():
+        count["done"] += 1
+        if count["done"] % 5 == 0 or count["done"] >= total:
+            try:
+                db.table("customer_ai_runs").update({"processed_count": count["done"]}).eq("id", run_id).execute()
+            except Exception as exc:  # 진행 표시는 실패해도 분석은 계속한다
+                logger.warning("progress update failed: %s", exc)
+    return tick
+
+
 def _done(db, run_id, total, processed, failed, error=None):
     db.table("customer_ai_runs").update({
         "status": "failed" if error else "completed", "image_count": total,
@@ -37,7 +52,7 @@ def capture_order(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=lambda row: (row.get("taken_at") is None, row.get("taken_at") or "", row["order_index"]))
 
 
-async def _embeddings(db, project_id: str, rows: list[dict]) -> list[Optional[np.ndarray]]:
+async def _embeddings(db, project_id: str, rows: list[dict], run_id: Optional[str] = None) -> list[Optional[np.ndarray]]:
     """사진별 임베딩(rows 순서). 이미 저장된 사진은 재사용하고 새 사진만 Gemini로 계산해 저장한다."""
     stored = {
         row["photo_id"]: np.asarray(row["embedding"], dtype=np.float64)
@@ -47,8 +62,9 @@ async def _embeddings(db, project_id: str, rows: list[dict]) -> list[Optional[np
                     .execute()).data or []
     }
     missing = [row for row in rows if row["id"] not in stored]
+    tick = _progress(db, run_id, len(rows), len(rows) - len(missing)) if run_id else None
     if missing:
-        vectors, _ = await embed_images(await download_all([row["thumb_url"] for row in missing]))
+        vectors, _ = await embed_images(await download_all([row["thumb_url"] for row in missing]), on_each=tick)
         payload = [{"project_id": project_id, "photo_id": row["id"],
                     "model": GEMINI_EMBEDDING_MODEL, "dimension": GEMINI_EMBEDDING_DIMENSION,
                     "version": GEMINI_EMBEDDING_VERSION, "embedding": vector.tolist()}
@@ -118,7 +134,7 @@ async def run_similarity(run_id: str, project_id: str, scene_names: Optional[lis
     rows = capture_order((db.table("customer_photos").select("id,order_index,thumb_url,preview_url,taken_at")
                           .eq("project_id", project_id).execute()).data or [])
     try:
-        vectors = await _embeddings(db, project_id, rows)
+        vectors = await _embeddings(db, project_id, rows, run_id)
         db.table("customer_photos").update({"similarity_group_id": None}).eq("project_id", project_id).execute()
         db.table("customer_photo_groups").delete().eq("project_id", project_id).execute()
         for members in group_by_similarity(vectors, GEMINI_SIMILARITY_THRESHOLD):
@@ -145,8 +161,9 @@ async def run_quality(run_id: str, project_id: str):
     reused = len([row for row in rows if row["id"] in done])
     rows = [row for row in rows if row["id"] not in done]
     try:
+        tick = _progress(db, run_id, reused + len(rows), reused)
         images = await download_all([row["preview_url"] for row in rows])
-        assessments, _ = await assess_images(images)
+        assessments, _ = await assess_images(images, on_each=tick)
         payload = [{"project_id": project_id, "photo_id": row["id"], "model": GEMINI_FLASH_MODEL,
                     "prompt_version": GEMINI_QUALITY_PROMPT_VERSION,
                     "eyes_closed": value.eyes_closed.value, "blur_or_shake": value.blur_or_shake.value,

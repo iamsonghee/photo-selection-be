@@ -9,7 +9,7 @@ API 키와 이미지 바이트, 판정 원문(raw_response)은 절대 로그에 
 import asyncio
 import logging
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 from google.genai import types
 from pydantic import BaseModel
@@ -106,6 +106,7 @@ async def _assess_one(client, image_bytes: bytes, mime_type: str):
 
 async def assess_images(
     images: list[Optional[bytes]],
+    on_each: Optional[Callable[[], None]] = None,
 ) -> tuple[list[Optional[PhotoQualityAssessment]], list[dict]]:
     """순서를 보존하며 이미지별 품질 판정. 다운로드 실패(None) 또는 판정 실패 항목은 None.
     반환: (판정 리스트, 실제 usage_metadata 리스트)."""
@@ -115,6 +116,8 @@ async def assess_images(
 
     async def _run(idx: int, img: Optional[bytes]) -> Optional[PhotoQualityAssessment]:
         if img is None:
+            if on_each:
+                on_each()
             return None
         async with sem:
             try:
@@ -125,6 +128,9 @@ async def assess_images(
             except Exception as e:
                 logger.warning("gemini quality assessment failed for image index=%d: %s", idx, e)
                 return None
+            finally:
+                if on_each:
+                    on_each()
 
     results = await asyncio.gather(*[_run(i, img) for i, img in enumerate(images)])
     return list(results), usages
