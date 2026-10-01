@@ -7,7 +7,9 @@
 훨씬 단순하게 새로 만든다 — 원본(납품) 보관은 1차 범위에서 제외(사용자 결정).
 """
 import asyncio
+import json
 import logging
+import re
 import uuid as uuid_module
 from typing import Optional
 
@@ -119,15 +121,33 @@ async def _process_one_customer_photo(
     return photo_id, thumb_url, preview_url
 
 
+_TAKEN_AT_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+
+
+def _parse_taken_at(raw: Optional[str], count: int) -> list[Optional[str]]:
+    """브라우저가 원본 EXIF에서 읽은 촬영 시각 목록(files와 같은 순서). 형식이 틀린 값은 버린다 —
+    촬영 시각은 장면 구분 보조 정보일 뿐이라 업로드 자체를 실패시키지 않는다."""
+    try:
+        values = json.loads(raw) if raw else []
+    except ValueError:
+        values = []
+    if not isinstance(values, list):
+        values = []
+    parsed = [v if isinstance(v, str) and _TAKEN_AT_PATTERN.match(v) else None for v in values[:count]]
+    return parsed + [None] * (count - len(parsed))
+
+
 @router.post("/photos")
 async def upload_customer_photos(
     project_id: str = Form(...),
     files: list[UploadFile] = File(...),
     share_token: Optional[str] = Form(None),
+    taken_at: Optional[str] = Form(None),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
 ):
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
+    taken_at_values = _parse_taken_at(taken_at, len(files))
 
     supabase = get_supabase()
     project = _authorize_customer_project(supabase, project_id, credentials, share_token)
@@ -143,9 +163,9 @@ async def upload_customer_photos(
                     "message": f"{len(files)}장을 선택했어요. 셀프 고객 전체 한도에서 {remaining}장까지 추가할 수 있습니다. 파일을 다시 선택해 주세요."},
         )
 
-    valid: list[tuple[bytes, str]] = []  # (contents, original_filename)
+    valid: list[tuple[bytes, str, Optional[str]]] = []  # (contents, original_filename, taken_at)
     rejected_filenames: list[str] = []
-    for f in files:
+    for f, file_taken_at in zip(files, taken_at_values):
         ct = (f.content_type or "").lower()
         if not ct or ct not in ALLOWED_CONTENT_TYPES:
             inferred = _infer_content_type(f.filename or "")
@@ -157,7 +177,7 @@ async def upload_customer_photos(
         if not contents:
             rejected_filenames.append(f.filename or "(unknown)")
             continue
-        valid.append((contents, f.filename or ""))
+        valid.append((contents, f.filename or "", file_taken_at))
 
     if not valid:
         raise HTTPException(
@@ -174,10 +194,10 @@ async def upload_customer_photos(
         async with sem:
             return await _process_one_customer_photo(loop, contents, project_id)
 
-    results = await asyncio.gather(*[_limited(contents) for contents, _ in valid], return_exceptions=True)
+    results = await asyncio.gather(*[_limited(contents) for contents, _, _ in valid], return_exceptions=True)
 
     rows: list[dict] = []
-    for order_offset, (r, (_, filename)) in enumerate(zip(results, valid)):
+    for order_offset, (r, (_, filename, file_taken_at)) in enumerate(zip(results, valid)):
         if isinstance(r, Exception) or r is None:
             if isinstance(r, Exception):
                 logger.warning("customer photo task failed: %s", r)
@@ -190,6 +210,7 @@ async def upload_customer_photos(
             "filename": filename,
             "order_index": current_count + order_offset,
             "storage_key": f"customer-photos/{project_id}/{photo_id}",
+            "taken_at": file_taken_at,
             "_thumb_url": thumb_url,
             "_preview_url": preview_url,
         })
@@ -202,6 +223,7 @@ async def upload_customer_photos(
             "id": r["id"], "project_id": r["project_id"], "filename": r["filename"],
             "order_index": r["order_index"], "storage_key": r["storage_key"],
             "thumb_url": r["_thumb_url"], "preview_url": r["_preview_url"],
+            "taken_at": r["taken_at"],
         }
         for r in rows
     ]

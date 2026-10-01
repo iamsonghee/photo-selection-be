@@ -11,6 +11,16 @@ from app.routers import customer_upload
 
 
 class CustomerUploadTest(unittest.TestCase):
+    def test_taken_at_keeps_valid_values_in_file_order(self):
+        parsed = customer_upload._parse_taken_at('["2026-10-03T11:02:45", null, "bad", 5]', 5)
+        self.assertEqual(parsed, ["2026-10-03T11:02:45", None, None, None, None])
+
+    def test_taken_at_ignores_missing_or_invalid_payload(self):
+        self.assertEqual(customer_upload._parse_taken_at(None, 2), [None, None])
+        self.assertEqual(customer_upload._parse_taken_at("not json", 1), [None])
+        self.assertEqual(customer_upload._parse_taken_at('{"a": 1}', 1), [None])
+        self.assertEqual(customer_upload._parse_taken_at('["2026-10-03T11:02:45", "2026-10-03T11:02:46"]', 1), ["2026-10-03T11:02:45"])
+
     def test_exported_project_rejects_photo_changes(self):
         with self.assertRaises(HTTPException) as raised:
             customer_upload._require_photo_set_mutable({"exported": True})
