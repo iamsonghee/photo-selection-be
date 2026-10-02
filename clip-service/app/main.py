@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
+from postgrest.exceptions import APIError
 from pydantic import BaseModel
 
 from app import analyzer, customer_ai, gemini_analyzer, gemini_matcher, gemini_quality_analyzer, state
@@ -94,10 +95,17 @@ def analyze_customer(kind: str, req: CustomerAnalyzeRequest, background_tasks: B
         raise HTTPException(status_code=404, detail="Project not found")
     latest = _latest_customer_run(db, req.project_id, kind)
     if latest and latest["status"] == "processing":
-        raise HTTPException(status_code=409, detail="Analysis already in progress")
-    run = db.table("customer_ai_runs").insert({
-        "project_id": req.project_id, "kind": kind, "status": "processing"
-    }).execute().data[0]
+        raise HTTPException(status_code=409, detail={"error": "already_processing", "run_id": latest["id"]})
+    try:
+        run = db.table("customer_ai_runs").insert({
+            "project_id": req.project_id, "kind": kind, "status": "processing"
+        }).execute().data[0]
+    except APIError as exc:
+        # 동시에 두 요청이 위 확인을 통과한 경우 — 진행 중 실행 하나만 허용하는 부분 UNIQUE 인덱스가 막는다.
+        if exc.code != "23505":
+            raise
+        current = _latest_customer_run(db, req.project_id, kind)
+        raise HTTPException(status_code=409, detail={"error": "already_processing", "run_id": current and current["id"]})
     if kind == "similarity":
         background_tasks.add_task(customer_ai.run_similarity, run["id"], req.project_id, req.scene_names)
     else:

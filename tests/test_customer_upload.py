@@ -112,8 +112,9 @@ class CustomerUploadTest(unittest.TestCase):
             customer_upload, "_process_one_customer_photo", new=process
         ):
             result = asyncio.run(customer_upload.upload_customer_photos(
-                "project", files, None, None, None,
+                "project", files, None, '[null, "2026-10-03T11:02:45", null]', None,
                 f'["{saved}", "{fresh}", "{broken}"]', '["IMG_001.PNG", "IMG_002.HEIC", "IMG_003.JPG"]',
+                '[null, "file", "exif"]',
             ))
 
         self.assertEqual(result["uploaded"], 2)
@@ -121,6 +122,8 @@ class CustomerUploadTest(unittest.TestCase):
         self.assertEqual(result["rejected"], ["IMG_003.JPG"])
         rows = photos.upsert.call_args.args[0]
         self.assertEqual([(row["id"], row["filename"]) for row in rows], [(fresh, "IMG_002.HEIC")])
+        # 파일 수정 시각으로 대신한 촬영 시각은 출처를 함께 저장한다(장면 경계에서 뺀다).
+        self.assertEqual((rows[0]["taken_at"], rows[0]["taken_at_source"]), ("2026-10-03T11:02:45", "file"))
         self.assertEqual(photos.upsert.call_args.kwargs, {"on_conflict": "id", "ignore_duplicates": True})
         projects.update.assert_called_once_with({"photo_count": 2, "lifetime_uploaded_count": 2})
 

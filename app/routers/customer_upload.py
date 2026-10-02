@@ -217,10 +217,14 @@ async def upload_customer_photos(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
     client_upload_ids: Optional[str] = Form(None),
     original_filenames: Optional[str] = Form(None),
+    taken_at_source: Optional[str] = Form(None),
 ):
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
     taken_at_values = _parse_taken_at(taken_at, len(files))
+    # 촬영 시각 출처: "exif" | "file"(파일 수정 시각으로 대신함 — 장면 경계에 안 씀). 시각이 없으면 출처도 없다.
+    taken_at_sources = [source if value and source in {"exif", "file"} else None
+                        for value, source in zip(taken_at_values, _json_list(taken_at_source, len(files)))]
     photo_ids = _parse_client_upload_ids(client_upload_ids, len(files))
     filenames = _parse_original_filenames(original_filenames, files)
     marks = {"start": time.perf_counter()}
@@ -245,10 +249,11 @@ async def upload_customer_photos(
         )
 
     marks["authorized"] = time.perf_counter()
-    # (files 내 위치, contents, 원본 파일명, taken_at, photo_id). 실패 보고는 위치로 한다 — 이름은 겹칠 수 있다.
-    valid: list[tuple[int, bytes, str, Optional[str], str]] = []
+    # (files 내 위치, contents, 원본 파일명, (taken_at, taken_at_source), photo_id). 실패 보고는 위치로 한다 — 이름은 겹칠 수 있다.
+    valid: list[tuple[int, bytes, str, tuple[Optional[str], Optional[str]], str]] = []
     rejected_indices: list[int] = []
-    for index, (f, filename, file_taken_at, photo_id) in enumerate(zip(files, filenames, taken_at_values, photo_ids)):
+    for index, (f, filename, file_taken_at, file_taken_at_source, photo_id) in enumerate(
+            zip(files, filenames, taken_at_values, taken_at_sources, photo_ids)):
         if photo_id in already_saved:
             continue
         ct = (f.content_type or "").lower()
@@ -262,7 +267,7 @@ async def upload_customer_photos(
         if not contents:
             rejected_indices.append(index)
             continue
-        valid.append((index, contents, filename, file_taken_at, photo_id))
+        valid.append((index, contents, filename, (file_taken_at, file_taken_at_source), photo_id))
 
     def _rejected_names() -> list[str]:
         return [filenames[index] or "(unknown)" for index in rejected_indices]
@@ -303,7 +308,8 @@ async def upload_customer_photos(
             "filename": filename,
             "order_index": current_count + order_offset,
             "storage_key": f"customer-photos/{project_id}/{photo_id}",
-            "taken_at": file_taken_at,
+            "taken_at": file_taken_at[0],
+            "taken_at_source": file_taken_at[1],
             "_thumb_url": thumb_url,
             "_preview_url": preview_url,
         })
@@ -318,7 +324,7 @@ async def upload_customer_photos(
             "id": r["id"], "project_id": r["project_id"], "filename": r["filename"],
             "order_index": r["order_index"], "storage_key": r["storage_key"],
             "thumb_url": r["_thumb_url"], "preview_url": r["_preview_url"],
-            "taken_at": r["taken_at"],
+            "taken_at": r["taken_at"], "taken_at_source": r["taken_at_source"],
         }
         for r in rows
     ]

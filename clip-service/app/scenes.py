@@ -28,15 +28,20 @@ def _time(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def scene_taken_at(photo: dict) -> Optional[str]:
+    """장면 경계에 쓸 수 있는 촬영 시각. 파일 수정 시각("file")은 실제 촬영 시각이 아니라 뺀다(출처 기록 전 사진은 그대로 쓴다)."""
+    return None if photo.get("taken_at_source") == "file" else photo.get("taken_at")
+
+
 def split_scenes(photos: list[dict]) -> Optional[list[list[dict]]]:
-    """photos: {"id", "order_index", "taken_at"}. 반환: 장면별 사진 목록(시간순, 촬영 시각 없는 사진은 맨 끝 장면).
+    """photos: {"id", "order_index", "taken_at", "taken_at_source"}. 반환: 장면별 사진 목록(시간순, 촬영 시각 없는 사진은 맨 끝 장면).
     장면으로 나눌 근거가 부족하면(사진이 적거나 촬영 시각 대부분이 없으면) None."""
-    timed = [photo for photo in photos if _time(photo.get("taken_at"))]
+    timed = [photo for photo in photos if _time(scene_taken_at(photo))]
     if len(photos) < MIN_PHOTOS_FOR_SCENES or len(timed) < len(photos) * MIN_TIMED_RATIO:
         return None
 
-    ordered = sorted(timed, key=lambda photo: (_time(photo["taken_at"]), photo["order_index"]))
-    gaps = [(index, (_time(photo["taken_at"]) - _time(ordered[index - 1]["taken_at"])).total_seconds())
+    ordered = sorted(timed, key=lambda photo: (_time(scene_taken_at(photo)), photo["order_index"]))
+    gaps = [(index, (_time(scene_taken_at(photo)) - _time(scene_taken_at(ordered[index - 1]))).total_seconds())
             for index, photo in enumerate(ordered) if index > 0]
     cuts = sorted(index for index, _ in sorted(
         [item for item in gaps if item[1] >= SCENE_GAP_SECONDS], key=lambda item: -item[1])[:MAX_SCENES - 1])
@@ -54,7 +59,7 @@ def split_scenes(photos: list[dict]) -> Optional[list[list[dict]]]:
     if len(ranges) > 1 and len(ranges[0]) < MIN_SCENE_PHOTOS:
         ranges[0:2] = [ranges[0] + ranges[1]]
 
-    untimed = sorted((photo for photo in photos if not _time(photo.get("taken_at"))), key=lambda photo: photo["order_index"])
+    untimed = sorted((photo for photo in photos if not _time(scene_taken_at(photo))), key=lambda photo: photo["order_index"])
     if untimed:
         ranges.append(untimed)
     return ranges

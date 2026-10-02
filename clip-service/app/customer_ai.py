@@ -16,7 +16,7 @@ from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
 from app.gemini_quality_client import assess_images
 from app.grouping import group_by_similarity
-from app.scenes import split_scenes
+from app.scenes import scene_taken_at, split_scenes
 
 logger = logging.getLogger(__name__)
 OTHER_SCENE = "기타 장면"
@@ -25,41 +25,55 @@ CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
 SCENE_SAMPLE_PHOTOS = 3
 
 
-STALE_RUN_SECONDS = 30 * 60  # ponytail: 고정 시간. 2,000장도 넉넉히 끝나는 값 — 진행 갱신 시각을 기록하게 되면 그 기준으로 바꾼다.
+# 진행 갱신(updated_at)이 이만큼 없으면 멈춘 실행. 진행 수는 5장마다·장면마다 갱신되고, 그 사이 가장 긴 구간은
+# 전체 사진 내려받기(동시 다운로드라 2,000장도 몇 분)라 10분이면 정상 실행을 닫지 않는다.
+STALE_RUN_SECONDS = 10 * 60
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def is_stale(run: dict, now: datetime) -> bool:
-    """진행 중으로 STALE_RUN_SECONDS 넘게 남은 실행(서비스 재시작 등으로 멈춘 것)."""
-    if run.get("status") != "processing" or not run.get("started_at"):
+    """진행 중인데 마지막 진행 갱신 뒤 STALE_RUN_SECONDS 넘게 멈춘 실행(서비스 재시작 등). 갱신 기록 전 실행은 시작 시각 기준."""
+    last = run.get("updated_at") or run.get("started_at")
+    if run.get("status") != "processing" or not last:
         return False
-    started = datetime.fromisoformat(str(run["started_at"]).replace("Z", "+00:00"))
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=timezone.utc)
-    return (now - started).total_seconds() > STALE_RUN_SECONDS
+    last_at = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+    if last_at.tzinfo is None:
+        last_at = last_at.replace(tzinfo=timezone.utc)
+    return (now - last_at).total_seconds() > STALE_RUN_SECONDS
+
+
+def _still_running(db, run_id: str) -> bool:
+    """이 실행이 아직 현재 실행인지 — 멈춘 것으로 닫혀 새 실행이 시작됐으면 결과를 쓰지 않는다."""
+    rows = db.table("customer_ai_runs").select("status").eq("id", run_id).limit(1).execute().data or []
+    return bool(rows) and rows[0]["status"] == "processing"
 
 
 def _progress(db, run_id: str, total: int, start: int):
     """진행 수 기록: 시작 시 전체·재사용 수를 쓰고, 이후 5 이상 늘 때마다(그리고 마지막에) 처리 수를 갱신하는 콜백을 돌려준다."""
     count = {"done": start, "written": start}
-    db.table("customer_ai_runs").update({"image_count": total, "processed_count": start}).eq("id", run_id).execute()
+    db.table("customer_ai_runs").update({"image_count": total, "processed_count": start, "updated_at": _now()}).eq("id", run_id).execute()
 
     def tick(step: int = 1):
         count["done"] += step
         if count["done"] - count["written"] >= 5 or count["done"] >= total:
             count["written"] = count["done"]
             try:
-                db.table("customer_ai_runs").update({"processed_count": count["done"]}).eq("id", run_id).execute()
+                db.table("customer_ai_runs").update({"processed_count": count["done"], "updated_at": _now()}).eq("id", run_id).execute()
             except Exception as exc:  # 진행 표시는 실패해도 분석은 계속한다
                 logger.warning("progress update failed: %s", exc)
     return tick
 
 
 def _done(db, run_id, total, processed, failed, error=None):
+    # 진행 중일 때만 닫는다 — 멈춘 것으로 이미 닫힌 실행이 늦게 끝나 failed를 completed로 되돌리지 않게.
     db.table("customer_ai_runs").update({
         "status": "failed" if error else "completed", "image_count": total,
         "processed_count": processed, "failed_count": failed, "error": error,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", run_id).execute()
+        "completed_at": _now(), "updated_at": _now(),
+    }).eq("id", run_id).eq("status", "processing").execute()
 
 
 def capture_order(rows: list[dict]) -> list[dict]:
@@ -131,19 +145,15 @@ def merge_same_named(scenes: list[list[dict]], names: list[Optional[str]]) -> tu
     return merged, merged_names
 
 
-async def _save_scenes(db, project_id: str, rows: list[dict], scene_names: Optional[list[str]], tick=lambda step=1: None):
-    """촬영 시각 공백으로 장면을 나누고(이름 목록이 있으면 대표 사진으로 이름을 붙여) 저장한다. 나눌 근거가 없으면 장면을 지운다."""
-    db.table("customer_photos").update({"scene_id": None}).eq("project_id", project_id).execute()
-    db.table("customer_scenes").delete().eq("project_id", project_id).execute()
-    scenes = split_scenes(rows)
-    if not scenes:
-        tick(len(rows))
-        return
+async def _save_scenes(db, run_id: str, project_id: str, rows: list[dict], scene_names: Optional[list[str]], tick=lambda step=1: None):
+    """촬영 시각 공백으로 장면을 나누고(이름 목록이 있으면 대표 사진으로 이름을 붙여) 저장한다. 나눌 근거가 없으면 장면을 지운다.
+    이름 붙이기(Gemini·다운로드, 오래 걸림)를 다 끝낸 뒤에 기존 장면을 바꾼다 — 도중에 서비스가 재시작돼도 기존 장면은 남는다."""
+    scenes = split_scenes(rows) or []
     names: list[Optional[str]] = [None] * len(scenes)
-    if scene_names:
+    if scenes and scene_names:
         client = await get_client()
         for index, scene in enumerate(scenes):
-            if scene[0].get("taken_at"):  # 촬영 시각 없는 사진 모음은 이름 없이 둔다
+            if scene_taken_at(scene[0]):  # 촬영 시각 없는 사진 모음은 이름 없이 둔다
                 step = max(1, len(scene) // SCENE_SAMPLE_PHOTOS)
                 sample = scene[step // 2::step][:SCENE_SAMPLE_PHOTOS]
                 images = [image for image in await download_all([photo["preview_url"] for photo in sample]) if image]
@@ -153,10 +163,15 @@ async def _save_scenes(db, project_id: str, rows: list[dict], scene_names: Optio
         scenes, names = merge_same_named(scenes, names)
     else:
         tick(len(rows))
+    if not _still_running(db, run_id):
+        return
+    # ponytail: 지우기·넣기가 여러 REST 호출이라 그 사이(수 초)에 죽으면 장면이 일부만 남는다. 문제되면 한 트랜잭션 RPC로.
+    db.table("customer_photos").update({"scene_id": None}).eq("project_id", project_id).execute()
+    db.table("customer_scenes").delete().eq("project_id", project_id).execute()
     for index, scene in enumerate(scenes):
         saved = db.table("customer_scenes").insert({
             "project_id": project_id, "scene_index": index, "name": names[index],
-            "start_at": scene[0].get("taken_at"), "end_at": scene[-1].get("taken_at"), "photo_count": len(scene),
+            "start_at": scene_taken_at(scene[0]), "end_at": scene_taken_at(scene[-1]), "photo_count": len(scene),
         }).execute().data[0]
         ids = [photo["id"] for photo in scene]
         for start in range(0, len(ids), 200):
@@ -166,13 +181,15 @@ async def _save_scenes(db, project_id: str, rows: list[dict], scene_names: Optio
 async def run_similarity(run_id: str, project_id: str, scene_names: Optional[list[str]] = None):
     """유사컷 묶기 + 장면. 같은 임베딩을 쓰므로 한 실행에서 이어서 한다(새 사진만 Gemini 호출)."""
     db = get_supabase()
-    rows = capture_order((db.table("customer_photos").select("id,order_index,thumb_url,preview_url,taken_at")
+    rows = capture_order((db.table("customer_photos").select("id,order_index,thumb_url,preview_url,taken_at,taken_at_source")
                           .eq("project_id", project_id).execute()).data or [])
     try:
         # 진행률: 앞 절반은 사진 임베딩(재사용분은 바로 채움), 뒤 절반은 장면 이름 붙이기(장면 사진 수만큼).
         # 다시 정리할 때는 임베딩이 다 저장돼 있어 실제 시간은 장면 쪽에서 든다 — 한 단계만 세면 바로 100%에서 멈춰 보인다.
         tick = _progress(db, run_id, len(rows) * 2, 0)
         vectors = await _embeddings(db, project_id, rows, tick)
+        if not _still_running(db, run_id):
+            return
         db.table("customer_photos").update({"similarity_group_id": None}).eq("project_id", project_id).execute()
         db.table("customer_photo_groups").delete().eq("project_id", project_id).execute()
         for members in group_by_similarity(vectors, GEMINI_SIMILARITY_THRESHOLD):
@@ -181,7 +198,7 @@ async def run_similarity(run_id: str, project_id: str, scene_names: Optional[lis
                 "project_id": project_id, "representative_photo_id": ids[0], "photo_count": len(ids)
             }).execute().data[0]
             db.table("customer_photos").update({"similarity_group_id": group["id"]}).in_("id", ids).execute()
-        await _save_scenes(db, project_id, rows, scene_names, tick)
+        await _save_scenes(db, run_id, project_id, rows, scene_names, tick)
         processed = sum(vector is not None for vector in vectors)
         _done(db, run_id, len(rows), processed, len(rows) - processed)
     except Exception as exc:

@@ -67,5 +67,54 @@ def test_scene_progress_fills_second_half(monkeypatch):
     monkeypatch.setattr(customer_ai, "_name_scene", fake_name)
     rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 30), (11, 40, 30)])]
     steps = []
-    asyncio.run(customer_ai._save_scenes(MagicMock(), "p", rows, ["하객"], lambda step=1: steps.append(step)))
+    asyncio.run(customer_ai._save_scenes(MagicMock(), "run", "p", rows, ["하객"], lambda step=1: steps.append(step)))
     assert sum(steps) == len(rows)
+
+
+def test_file_modified_times_are_not_used_for_scene_boundaries():
+    # EXIF가 없어 파일 수정 시각으로 대신한 사진(HEIC·카카오톡)은 경계 계산에서 빠지고 "촬영 시각 없음" 장면으로 간다.
+    photos = _photos([(11, 0, 30), (11, 40, 30)])
+    fake = [{"id": f"f{i}", "order_index": 100 + i, "taken_at": "2026-10-03T11:20:00", "taken_at_source": "file"} for i in range(5)]
+    scenes = split_scenes(photos + fake)
+    assert [len(scene) for scene in scenes] == [30, 30, 5]
+    assert scenes[-1][0]["id"] == "f0"
+
+
+def test_file_modified_times_do_not_count_as_timed():
+    exif = _photos([(11, 0, 20)])
+    fake = [{"id": f"f{i}", "order_index": 100 + i, "taken_at": "2026-10-03T12:00:00", "taken_at_source": "file"} for i in range(10)]
+    assert split_scenes(exif + fake) is None  # 20/30 = 67% < 80%
+
+
+def test_scenes_are_replaced_only_after_naming_and_only_by_the_current_run(monkeypatch):
+    # 기존 장면은 이름 붙이기(오래 걸림)가 끝난 뒤에 지운다. 멈춘 것으로 닫힌 실행은 장면을 건드리지 않는다.
+    import asyncio
+    from unittest.mock import MagicMock
+    from app import customer_ai
+
+    events = []
+
+    async def fake_client():
+        return None
+
+    async def fake_download(urls):
+        return [b"x" for _ in urls]
+
+    async def fake_name(client, images, names):
+        events.append("name")
+        return names[0]
+
+    monkeypatch.setattr(customer_ai, "get_client", fake_client)
+    monkeypatch.setattr(customer_ai, "download_all", fake_download)
+    monkeypatch.setattr(customer_ai, "_name_scene", fake_name)
+    rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 30), (11, 40, 30)])]
+
+    for status, expect_delete in (("processing", True), ("failed", False)):
+        events.clear()
+        db = MagicMock()
+        db.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [{"status": status}]
+        db.table.return_value.delete.side_effect = lambda: events.append("delete") or MagicMock()
+        asyncio.run(customer_ai._save_scenes(db, "run", "p", rows, ["하객"]))
+        assert ("delete" in events) == expect_delete
+        if expect_delete:
+            assert events.index("delete") > max(i for i, e in enumerate(events) if e == "name")
