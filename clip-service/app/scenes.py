@@ -18,7 +18,7 @@ MAX_SCENES = 8
 MIN_PHOTOS_FOR_SCENES = 20
 MIN_TIMED_RATIO = 0.8
 # 이보다 짧은 공백은 "이어진 촬영": 작은 장면은 공백이 더 짧은 이웃에 붙이되, 양쪽(첫·마지막 장면은 한쪽) 공백이
-# 모두 이 이상이면 작아도 따로 둔다(입장·케이크 커팅처럼 짧은 장면). 같은 이름 장면 병합도 이 공백 미만일 때만.
+# 모두 이 이상이면 작아도 따로 둔다(입장·케이크 커팅처럼 짧은 장면). 같은 이름 장면 병합도 이 공백 미만일 때만(한쪽이 작은 장면이면 공백 무관).
 CLOSE_GAP_SECONDS = 10 * 60
 # 따로 떨어져 있어도 이보다 적으면(한두 장 튄 사진) 장면으로 두지 않고 가까운 쪽에 붙인다.
 MIN_ISOLATED_PHOTOS = 3
@@ -27,7 +27,7 @@ SCENE_ALGORITHM_VERSION = "gap-v2"  # v2: 파일 수정 시각 제외, 작은 �
 SCENE_SETTINGS = {
     "algorithm": SCENE_ALGORITHM_VERSION, "gapSeconds": SCENE_GAP_SECONDS, "minScenePhotos": MIN_SCENE_PHOTOS,
     "maxScenes": MAX_SCENES, "minPhotos": MIN_PHOTOS_FOR_SCENES, "minTimedRatio": MIN_TIMED_RATIO,
-    "closeGapSeconds": CLOSE_GAP_SECONDS, "minIsolatedPhotos": MIN_ISOLATED_PHOTOS, "sameNameMerge": "close-gap",
+    "closeGapSeconds": CLOSE_GAP_SECONDS, "minIsolatedPhotos": MIN_ISOLATED_PHOTOS, "sameNameMerge": "close-gap-or-small",
 }
 
 

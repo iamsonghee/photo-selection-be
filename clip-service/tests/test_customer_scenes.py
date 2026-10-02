@@ -59,6 +59,15 @@ def test_same_named_scenes_merge_only_when_close_in_time():
     assert names == [None, None]
 
 
+def test_same_named_small_scene_merges_even_after_long_gap():
+    # 실데이터(돌잔치): 하객 4장 ─13분─ 하객 11장 → 작은 쪽이 있으면 공백이 길어도 합친다.
+    a, b = _photos([(17, 15, 4)]), _photos([(17, 29, 11)])
+    for photo in b:
+        photo["id"] = "b" + photo["id"]
+    scenes, names = merge_same_named([a, b], ["하객", "하객"])
+    assert names == ["하객"] and [len(scene) for scene in scenes] == [15]
+
+
 def _fake_scene_run(monkeypatch, rows, status="processing", name="하객", flagged=()):
     """run_scene을 DB·Gemini 없이 돌린다. 반환: 일어난 일 순서(events)와 _done 호출 인자."""
     import asyncio
