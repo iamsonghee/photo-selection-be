@@ -39,7 +39,7 @@ class AnalyzeRequest(BaseModel):
 
 class CustomerAnalyzeRequest(BaseModel):
     project_id: str
-    # 촬영 종류별 장면 이름 목록(FE가 관리). 주면 유사컷 분석 뒤 장면에 이름을 붙인다.
+    # 촬영 종류별 장면 이름 목록(FE가 관리). 장면 정리(kind=scene)에서 주면 장면에 이름을 붙인다.
     scene_names: list[str] | None = None
 
 
@@ -71,6 +71,9 @@ def health():
     return {"status": "ok"}
 
 
+CUSTOMER_AI_KINDS = {"scene", "similarity", "quality"}
+
+
 def _latest_customer_run(db, project_id: str, kind: str):
     rows = (db.table("customer_ai_runs").select("*").eq("project_id", project_id)
             .eq("kind", kind).order("created_at", desc=True).limit(1).execute()).data or []
@@ -88,7 +91,7 @@ def _latest_customer_run(db, project_id: str, kind: str):
 
 @app.post("/analyze/customer/{kind}", status_code=202, dependencies=[Depends(verify_internal_token)])
 def analyze_customer(kind: str, req: CustomerAnalyzeRequest, background_tasks: BackgroundTasks):
-    if kind not in {"similarity", "quality"}:
+    if kind not in CUSTOMER_AI_KINDS:
         raise HTTPException(status_code=404, detail="Unknown analysis kind")
     db = get_supabase()
     if not db.table("customer_projects").select("id").eq("id", req.project_id).limit(1).execute().data:
@@ -106,8 +109,10 @@ def analyze_customer(kind: str, req: CustomerAnalyzeRequest, background_tasks: B
             raise
         current = _latest_customer_run(db, req.project_id, kind)
         raise HTTPException(status_code=409, detail={"error": "already_processing", "run_id": current and current["id"]})
-    if kind == "similarity":
-        background_tasks.add_task(customer_ai.run_similarity, run["id"], req.project_id, req.scene_names)
+    if kind == "scene":
+        background_tasks.add_task(customer_ai.run_scene, run["id"], req.project_id, req.scene_names)
+    elif kind == "similarity":
+        background_tasks.add_task(customer_ai.run_similarity, run["id"], req.project_id)
     else:
         background_tasks.add_task(customer_ai.run_quality, run["id"], req.project_id)
     return {"status": "processing", "run_id": run["id"]}
@@ -115,7 +120,7 @@ def analyze_customer(kind: str, req: CustomerAnalyzeRequest, background_tasks: B
 
 @app.get("/analyze/customer/{kind}/{project_id}/status", dependencies=[Depends(verify_internal_token)])
 def analyze_customer_status(kind: str, project_id: str):
-    if kind not in {"similarity", "quality"}:
+    if kind not in CUSTOMER_AI_KINDS:
         raise HTTPException(status_code=404, detail="Unknown analysis kind")
     latest = _latest_customer_run(get_supabase(), project_id, kind)
     return {"status": latest["status"] if latest else None, "run": latest}

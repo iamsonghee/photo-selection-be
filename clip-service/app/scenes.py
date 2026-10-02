@@ -22,6 +22,13 @@ MIN_TIMED_RATIO = 0.8
 CLOSE_GAP_SECONDS = 10 * 60
 # 따로 떨어져 있어도 이보다 적으면(한두 장 튄 사진) 장면으로 두지 않고 가까운 쪽에 붙인다.
 MIN_ISOLATED_PHOTOS = 3
+# 장면 나누기 규칙 버전 — 규칙을 바꾸면 올린다. 실행 settings에 기준값과 함께 남아 검수 채점에서 설정끼리 비교한다.
+SCENE_ALGORITHM_VERSION = "gap-v2"  # v2: 파일 수정 시각 제외, 작은 장면은 가까운 이웃에, 같은 이름은 짧은 공백일 때만
+SCENE_SETTINGS = {
+    "algorithm": SCENE_ALGORITHM_VERSION, "gapSeconds": SCENE_GAP_SECONDS, "minScenePhotos": MIN_SCENE_PHOTOS,
+    "maxScenes": MAX_SCENES, "minPhotos": MIN_PHOTOS_FOR_SCENES, "minTimedRatio": MIN_TIMED_RATIO,
+    "closeGapSeconds": CLOSE_GAP_SECONDS, "minIsolatedPhotos": MIN_ISOLATED_PHOTOS, "sameNameMerge": "close-gap",
+}
 
 
 def _time(value: Optional[str]) -> Optional[datetime]:
