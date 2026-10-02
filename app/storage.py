@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.parse as _urlparse
 from typing import Optional
 
@@ -215,8 +216,10 @@ _FILENAME_MAX_LEN = 80
 
 def sanitize_filename_component(raw: str) -> str:
     """Content-Disposition에 안전하게 넣을 수 있도록 파일명 구성요소를 정리한다.
-    슬래시/백슬래시/제어문자/따옴표 제거, 연속 공백 축소, 길이 제한."""
-    cleaned = _FILENAME_UNSAFE_RE.sub("", raw or "")
+    슬래시/백슬래시/제어문자/따옴표 제거, 연속 공백 축소, 길이 제한.
+    macOS Finder가 NFD(자모 분리형)로 남긴 한글 파일명이 이미 DB에 저장돼 있어도
+    다운로드 시점에 NFC로 교정해 깨진 표시를 막는다."""
+    cleaned = _FILENAME_UNSAFE_RE.sub("", unicodedata.normalize("NFC", raw or ""))
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         cleaned = "download"

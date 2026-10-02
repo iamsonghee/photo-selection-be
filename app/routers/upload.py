@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 import uuid as uuid_module
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -23,7 +24,7 @@ except ImportError:
         return -1.0
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 register_heif_opener()
@@ -120,6 +121,11 @@ class DeliveryVersionPresignItem(BaseModel):
     content_type: str = Field(min_length=1, max_length=100)
     byte_size: int = Field(gt=0, le=DELIVERY_VERSION_MAX_BYTES)
 
+    @field_validator("filename")
+    @classmethod
+    def _normalize_filename_nfc(cls, value: str) -> str:
+        return unicodedata.normalize("NFC", value)
+
 
 class DeliveryVersionPresignRequest(BaseModel):
     project_id: UUID
@@ -196,6 +202,14 @@ def _ensure_project_accepts_new_photos(status: str, new_item_count: int) -> None
     """활성화 뒤에는 새 사진만 막고, 응답 유실로 재전송된 기존 사진은 허용한다."""
     if status != "preparing" and new_item_count > 0:
         raise HTTPException(status_code=409, detail="고객 셀렉 시작 후에는 사진을 추가할 수 없습니다.")
+
+
+def _normalize_filename(filename: Optional[str]) -> Optional[str]:
+    """macOS Finder가 NFD(자모 분리형)로 넘기는 한글 파일명을 NFC로 통일.
+    FE에서도 정규화하지만, 클라이언트를 신뢰하지 않는 서버 경계에서도 방어적으로 적용한다."""
+    if not filename:
+        return filename
+    return unicodedata.normalize("NFC", filename)
 
 
 def _infer_content_type(filename: str) -> Optional[str]:
@@ -432,6 +446,11 @@ class OriginalUploadReservationRequest(BaseModel):
     file_size: int = Field(gt=0)
     last_modified: int = Field(ge=0)
 
+    @field_validator("filename")
+    @classmethod
+    def _normalize_filename_nfc(cls, value: str) -> str:
+        return unicodedata.normalize("NFC", value)
+
 
 @router.post("/originals/presign")
 async def presign_original_upload(
@@ -512,6 +531,7 @@ async def upload_photos(
     meta: list[tuple[str, str, Optional[int], Optional[int], Optional[str], Optional[int], Optional[int]]] = []
     rejected_filenames: list[str] = []
     for i, f in enumerate(files):
+        f.filename = _normalize_filename(f.filename)
         ct = (f.content_type or "").lower()  # BUG-02: 대문자 MIME 타입 정규화
         if not ct or ct not in ALLOWED_CONTENT_TYPES:
             inferred = _infer_content_type(f.filename or "")
@@ -534,7 +554,7 @@ async def upload_photos(
             continue
         valid.append((contents, ct, f.filename or "", len(contents)))
         # original_* 배열은 files와 인덱스 동기화 — 파싱 실패 시 압축 파일 정보로 fallback
-        orig_fn = (original_filenames[i] if i < len(original_filenames) else "") or (f.filename or "")
+        orig_fn = _normalize_filename(original_filenames[i]) if i < len(original_filenames) and original_filenames[i] else (f.filename or "")
         supplied_orig_ct = (original_content_types[i] if i < len(original_content_types) else "").lower()
         orig_ct = supplied_orig_ct or _infer_content_type(orig_fn) or ct
         orig_sz: Optional[int] = original_file_sizes[i] if i < len(original_file_sizes) else None
