@@ -15,6 +15,7 @@ from google.genai import types
 from pydantic import BaseModel, ValidationError
 
 from app.config import (
+    GEMINI_CUSTOMER_QUALITY_SERVICE_TIER,
     GEMINI_FLASH_MODEL,
     GEMINI_QUALITY_CONCURRENCY,
     GEMINI_QUALITY_MAX_RETRIES,
@@ -83,6 +84,10 @@ _CUSTOMER_PROMPT = _PROMPT.replace("주어진 JSON 스키마 형식으로만 응
 주어진 JSON 스키마 형식으로만 응답하세요.""")
 
 
+# ponytail: 운영(Python 3.11)의 SDK는 service_tier를 받지만 로컬 Python 3.9용 SDK(1.47)에는 없다 — 없으면 표준으로 보낸다.
+_SUPPORTS_SERVICE_TIER = "service_tier" in types.GenerateContentConfig.model_fields
+
+
 def _build_usage(response) -> Optional[dict]:
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
@@ -110,6 +115,7 @@ def sum_usage(usages: list[dict]) -> dict:
 
 async def _assess_one(client, image_bytes: bytes, mime_type: str, customer: bool = False):
     schema, prompt = (CustomerPhotoAssessment, _CUSTOMER_PROMPT) if customer else (PhotoQualityAssessment, _PROMPT)
+    tier = {"service_tier": GEMINI_CUSTOMER_QUALITY_SERVICE_TIER} if customer and _SUPPORTS_SERVICE_TIER else {}
     last_exc: Optional[Exception] = None
     for attempt in range(GEMINI_QUALITY_MAX_RETRIES + 1):
         try:
@@ -124,6 +130,7 @@ async def _assess_one(client, image_bytes: bytes, mime_type: str, customer: bool
                         response_mime_type="application/json",
                         response_schema=schema,
                         temperature=0,
+                        **tier,
                     ),
                 ),
                 timeout=GEMINI_QUALITY_TIMEOUT_SECONDS,

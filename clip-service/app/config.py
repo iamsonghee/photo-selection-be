@@ -101,6 +101,9 @@ GEMINI_QUALITY_PROMPT_VERSION = os.getenv("GEMINI_QUALITY_PROMPT_VERSION", "v1")
 GEMINI_QUALITY_CONCURRENCY = _env_int("GEMINI_QUALITY_CONCURRENCY", 4, 1, 16)
 GEMINI_QUALITY_MAX_RETRIES = _env_int("GEMINI_QUALITY_MAX_RETRIES", 2, 0, 5)
 GEMINI_QUALITY_TIMEOUT_SECONDS = _env_float("GEMINI_QUALITY_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
+# 셀프 고객 품질 판정의 Gemini 서비스 티어. flex는 표준가의 절반 — 백그라운드 분석이라 지연이 불규칙해도 된다
+# (2026-10-03 실측: 150장 비교에서 판정·지연 차이 없음). "standard"로 되돌릴 수 있다. 작가 판정은 표준(비용 추정이 표준가 기준).
+GEMINI_CUSTOMER_QUALITY_SERVICE_TIER = os.getenv("GEMINI_CUSTOMER_QUALITY_SERVICE_TIER", "flex")
 # gemini-3.5-flash-lite 표준가(1M 토큰당 USD). 실제 비용은 usage_metadata 실사용량으로 계산하므로
 # 이 값은 참고용 단가일 뿐이며, 한 곳에서만 관리해 코드 곳곳에 하드코딩하지 않는다.
 GEMINI_FLASH_INPUT_PRICE_PER_1M = _env_float("GEMINI_FLASH_INPUT_PRICE_PER_1M", 0.30, 0.0, 100.0)
