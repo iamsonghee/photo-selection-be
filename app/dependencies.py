@@ -44,6 +44,22 @@ def get_jwks() -> List[Dict]:
     return keys
 
 
+# OPT: auth_id -> photographer_id 매핑 TTL 캐시(5분) — JWKS 캐시(_jwks_cache)와 동일한 패턴.
+# 거의 바뀌지 않는 매핑을 인증된 모든 요청마다 Supabase에 왕복 조회하던 것을 줄인다.
+_PHOTOGRAPHER_ID_CACHE_TTL_SECONDS = 300
+_photographer_id_cache: Dict[str, Tuple[str, float]] = {}  # auth_user_id -> (photographer_id, cached_at)
+
+
+def _get_cached_photographer_id(auth_user_id: str) -> Optional[str]:
+    entry = _photographer_id_cache.get(auth_user_id)
+    if entry is None:
+        return None
+    photographer_id, cached_at = entry
+    if time.monotonic() - cached_at >= _PHOTOGRAPHER_ID_CACHE_TTL_SECONDS:
+        return None
+    return photographer_id
+
+
 #: 일시적 전송/게이트웨이 오류만 재시도한다 — 인증 실패·권한 오류 같은 "진짜 실패"는 그대로 올린다.
 #  httpx.TransportError는 ConnectError(DNS 실패 Errno 8)·ReadError(Errno 35)·TimeoutException을
 #  모두 포함하는 상위 클래스다.
@@ -180,6 +196,10 @@ def get_current_photographer(
             detail=f"인증 처리 중 오류: {type(e).__name__}",
         ) from e
 
+    cached_id = _get_cached_photographer_id(auth_user_id)
+    if cached_id is not None:
+        return UUID(cached_id)
+
     client = get_supabase()
 
     # photographers 테이블: auth_id = Supabase Auth user id
@@ -193,4 +213,6 @@ def get_current_photographer(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Photographer not found",
         )
-    return UUID(r.data[0]["id"])
+    photographer_id = r.data[0]["id"]
+    _photographer_id_cache[auth_user_id] = (photographer_id, time.monotonic())
+    return UUID(photographer_id)
