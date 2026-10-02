@@ -95,11 +95,12 @@ async def _process_one_customer_photo(
     contents: bytes,
     project_id: str,
     timings: Optional[dict[str, list[float]]] = None,
+    photo_id: Optional[str] = None,
 ) -> Optional[tuple[str, str, str]]:
     """파일 하나: 썸네일+미리보기 생성 → R2 업로드. 반환값 (photo_id, thumb_url, preview_url)."""
     # ponytail: 기본 asyncio 스레드풀을 그대로 쓴다(작가 업로드처럼 CPU/IO 전용 풀로 분리하지 않음).
     # 고객 프로젝트는 동시 다중 업로드 배치 규모가 작아 병목이 아니다 — 실측으로 문제가 확인되면 분리.
-    photo_id = str(uuid_module.uuid4())
+    photo_id = photo_id or str(uuid_module.uuid4())
     started = time.perf_counter()
     try:
         thumb_bytes, preview_bytes, _w, _h = await loop.run_in_executor(
@@ -145,6 +146,44 @@ def _parse_taken_at(raw: Optional[str], count: int) -> list[Optional[str]]:
     return parsed + [None] * (count - len(parsed))
 
 
+def _json_list(raw: Optional[str], count: int) -> list:
+    """files와 같은 순서의 JSON 배열 폼 필드. 없거나 깨졌으면 None으로 채운다."""
+    try:
+        values = json.loads(raw) if isinstance(raw, str) and raw else []
+    except ValueError:
+        values = []
+    if not isinstance(values, list):
+        values = []
+    values = values[:count]
+    return values + [None] * (count - len(values))
+
+
+def _parse_client_upload_ids(raw: Optional[str], count: int) -> list[str]:
+    """브라우저가 사진마다 만든 UUID를 사진 ID로 그대로 쓴다 — 응답을 못 받아 같은 사진을 재시도해도
+    같은 ID라 중복 행이 생기지 않는다. 값이 없거나 형식이 틀리면 새 UUID(멱등성 없음)."""
+    ids: list[str] = []
+    for value in _json_list(raw, count):
+        try:
+            ids.append(str(uuid_module.UUID(value)))
+        except (TypeError, ValueError, AttributeError):
+            ids.append(str(uuid_module.uuid4()))
+    return ids
+
+
+def _parse_original_filenames(raw: Optional[str], files: list[UploadFile]) -> list[str]:
+    """압축 과정에서 전송 파일명이 `이름.jpg`로 바뀌므로, 브라우저가 따로 보낸 원본 파일명을 저장한다."""
+    return [
+        value[:255] if isinstance(value, str) and value.strip() else (f.filename or "")
+        for value, f in zip(_json_list(raw, len(files)), files)
+    ]
+
+
+def _existing_photo_ids(supabase, project_id: str, photo_ids: list[str]) -> set[str]:
+    return {row["id"] for chunk in _chunks(photo_ids) for row in (
+        supabase.table("customer_photos").select("id").eq("project_id", project_id).in_("id", chunk).execute()
+    ).data or []}
+
+
 # 이 시간을 넘긴 배치는 원인 구간을 바로 볼 수 있게 warning으로 남긴다(로컬 기본 로깅에서도 출력됨).
 SLOW_UPLOAD_SECONDS = 15.0
 
@@ -176,10 +215,14 @@ async def upload_customer_photos(
     share_token: Optional[str] = Form(None),
     taken_at: Optional[str] = Form(None),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+    client_upload_ids: Optional[str] = Form(None),
+    original_filenames: Optional[str] = Form(None),
 ):
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required")
     taken_at_values = _parse_taken_at(taken_at, len(files))
+    photo_ids = _parse_client_upload_ids(client_upload_ids, len(files))
+    filenames = _parse_original_filenames(original_filenames, files)
     marks = {"start": time.perf_counter()}
     timings: dict[str, list[float]] = {"resize": [], "r2": []}
 
@@ -187,59 +230,71 @@ async def upload_customer_photos(
     project = _authorize_customer_project(supabase, project_id, credentials, share_token)
     _require_photo_set_mutable(project)
 
+    # 재시도 배치 중 이미 저장된 사진은 다시 처리하지 않고 성공으로 센다.
+    already_saved = _existing_photo_ids(supabase, project_id, photo_ids)
+    new_count = len(files) - sum(photo_id in already_saved for photo_id in photo_ids)
+
     account_photo_count = _get_customer_account_photo_count(supabase, project["owner_id"])
     remaining = max(0, MAX_PHOTOS_PER_CUSTOMER_ACCOUNT - account_photo_count)
-    if len(files) > remaining:
+    if new_count > remaining:
         raise HTTPException(
             status_code=403,
             detail={"error": "limit_exceeded", "max": MAX_PHOTOS_PER_CUSTOMER_ACCOUNT,
                     "remaining": remaining,
-                    "message": f"{len(files)}장을 선택했어요. 셀프 고객 전체 한도에서 {remaining}장까지 추가할 수 있습니다. 파일을 다시 선택해 주세요."},
+                    "message": f"{new_count}장을 선택했어요. 셀프 고객 전체 한도에서 {remaining}장까지 추가할 수 있습니다. 파일을 다시 선택해 주세요."},
         )
 
     marks["authorized"] = time.perf_counter()
-    valid: list[tuple[bytes, str, Optional[str]]] = []  # (contents, original_filename, taken_at)
-    rejected_filenames: list[str] = []
-    for f, file_taken_at in zip(files, taken_at_values):
+    # (files 내 위치, contents, 원본 파일명, taken_at, photo_id). 실패 보고는 위치로 한다 — 이름은 겹칠 수 있다.
+    valid: list[tuple[int, bytes, str, Optional[str], str]] = []
+    rejected_indices: list[int] = []
+    for index, (f, filename, file_taken_at, photo_id) in enumerate(zip(files, filenames, taken_at_values, photo_ids)):
+        if photo_id in already_saved:
+            continue
         ct = (f.content_type or "").lower()
         if not ct or ct not in ALLOWED_CONTENT_TYPES:
             inferred = _infer_content_type(f.filename or "")
             if inferred is None:
-                rejected_filenames.append(f.filename or "(unknown)")
+                rejected_indices.append(index)
                 continue
             ct = inferred
         contents = await f.read()
         if not contents:
-            rejected_filenames.append(f.filename or "(unknown)")
+            rejected_indices.append(index)
             continue
-        valid.append((contents, f.filename or "", file_taken_at))
+        valid.append((index, contents, filename, file_taken_at, photo_id))
 
-    if not valid:
+    def _rejected_names() -> list[str]:
+        return [filenames[index] or "(unknown)" for index in rejected_indices]
+
+    if not valid and not already_saved:
         raise HTTPException(
             status_code=400,
-            detail={"error": "no_valid_files", "message": "지원하지 않는 파일 형식입니다.", "rejected": rejected_filenames},
+            detail={"error": "no_valid_files", "message": "지원하지 않는 파일 형식입니다.",
+                    "rejected": _rejected_names(), "rejected_indices": rejected_indices},
         )
 
     current_count = project["photo_count"]
-    upload_bytes = sum(len(contents) for contents, _, _ in valid)
+    upload_bytes = sum(len(contents) for _, contents, _, _, _ in valid)
     marks["checked"] = time.perf_counter()
 
     loop = asyncio.get_event_loop()
     sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
 
-    async def _limited(contents: bytes):
+    async def _limited(contents: bytes, photo_id: str):
         async with sem:
-            return await _process_one_customer_photo(loop, contents, project_id, timings)
+            return await _process_one_customer_photo(loop, contents, project_id, timings, photo_id)
 
-    results = await asyncio.gather(*[_limited(contents) for contents, _, _ in valid], return_exceptions=True)
+    results = await asyncio.gather(*[_limited(contents, photo_id) for _, contents, _, _, photo_id in valid],
+                                   return_exceptions=True)
     marks["processed"] = time.perf_counter()
 
     rows: list[dict] = []
-    for order_offset, (r, (_, filename, file_taken_at)) in enumerate(zip(results, valid)):
+    for order_offset, (r, (index, _, filename, file_taken_at, _)) in enumerate(zip(results, valid)):
         if isinstance(r, Exception) or r is None:
             if isinstance(r, Exception):
                 logger.warning("customer photo task failed: %s", r)
-            rejected_filenames.append(filename)
+            rejected_indices.append(index)
             continue
         photo_id, thumb_url, preview_url = r
         rows.append({
@@ -255,8 +310,8 @@ async def upload_customer_photos(
 
     if not rows:
         marks["end"] = time.perf_counter()
-        _log_upload_timing(project_id, len(files), 0, len(rejected_filenames), upload_bytes, marks, timings)
-        return {"uploaded": 0, "rejected": rejected_filenames}
+        _log_upload_timing(project_id, len(files), 0, len(rejected_indices), upload_bytes, marks, timings)
+        return {"uploaded": len(already_saved), "rejected": _rejected_names(), "rejected_indices": rejected_indices}
 
     insert_rows = [
         {
@@ -268,15 +323,27 @@ async def upload_customer_photos(
         for r in rows
     ]
     try:
-        supabase.table("customer_photos").insert(insert_rows).execute()
-        new_count = current_count + len(rows)
+        # 시간 초과된 요청이 서버에서 아직 처리 중일 때 재시도가 겹치면 같은 ID가 동시에 들어온다 —
+        # 충돌한 행은 건너뛴다. 응답에는 실제로 새로 들어간 행만 담긴다.
+        inserted = supabase.table("customer_photos").upsert(
+            insert_rows, on_conflict="id", ignore_duplicates=True
+        ).execute().data or []
+        # photo_count는 삭제와 같이 실제 행 수로 다시 센다 — 동시 업로드가 서로의 증가분을 덮어쓰지 않게.
+        photo_count = (
+            supabase.table("customer_photos").select("id", count="exact").eq("project_id", project_id).execute()
+        ).count or 0
         supabase.table("customer_projects").update({
-            "photo_count": new_count,
-            "lifetime_uploaded_count": project.get("lifetime_uploaded_count", current_count) + len(rows),
+            "photo_count": photo_count,
+            "lifetime_uploaded_count": project.get("lifetime_uploaded_count", current_count) + len(inserted),
         }).eq("id", project_id).execute()
     except Exception as e:
         logger.exception("customer_photos insert failed: %s", e)
-        keys = [key for row in rows for key in (
+        # 같은 ID로 먼저 저장된 행(동시 재시도)의 이미지는 지우지 않는다.
+        try:
+            saved_ids = _existing_photo_ids(supabase, project_id, [row["id"] for row in rows])
+        except Exception:
+            saved_ids = {row["id"] for row in rows}
+        keys = [key for row in rows if row["id"] not in saved_ids for key in (
             f"customer-photos/{project_id}/{row['id']}_thumb.jpg",
             f"customer-photos/{project_id}/{row['id']}_preview.jpg",
         )]
@@ -295,10 +362,11 @@ async def upload_customer_photos(
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e
 
     marks["end"] = time.perf_counter()
-    _log_upload_timing(project_id, len(files), len(rows), len(rejected_filenames), upload_bytes, marks, timings)
+    _log_upload_timing(project_id, len(files), len(rows), len(rejected_indices), upload_bytes, marks, timings)
     return {
-        "uploaded": len(rows),
-        "rejected": rejected_filenames,
+        "uploaded": len(rows) + len(already_saved),
+        "rejected": _rejected_names(),
+        "rejected_indices": rejected_indices,
         "photos": [
             {"id": r["id"], "filename": r["filename"], "thumb_url": r["_thumb_url"], "preview_url": r["_preview_url"]}
             for r in rows

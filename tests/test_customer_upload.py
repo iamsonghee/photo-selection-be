@@ -88,6 +88,42 @@ class CustomerUploadTest(unittest.TestCase):
         self.assertEqual(result["uploaded"], 0)
         self.assertEqual(result["rejected"], ["failed.jpg"])
 
+    def test_retry_skips_saved_photos_and_keeps_original_filenames(self):
+        saved, fresh, broken = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "bad"
+        files = [
+            UploadFile(filename=name, file=io.BytesIO(b"jpeg"), headers=Headers({"content-type": "image/jpeg"}))
+            for name in ("IMG_001.jpg", "IMG_002.jpg", "IMG_003.jpg")
+        ]
+        supabase = MagicMock()
+        photos = MagicMock()
+        photos.select.return_value.eq.return_value.in_.return_value.execute.return_value.data = [{"id": saved}]
+        photos.upsert.return_value.execute.return_value.data = [{"id": fresh}]
+        photos.select.return_value.eq.return_value.execute.return_value.count = 2
+        projects = MagicMock()
+        supabase.table.side_effect = lambda name: {"customer_photos": photos, "customer_projects": projects}[name]
+
+        async def process(_loop, _contents, _project, _timings, photo_id):
+            return None if photo_id not in (fresh,) else (photo_id, "thumb", "preview")
+
+        with patch.object(customer_upload, "get_supabase", return_value=supabase), patch.object(
+            customer_upload, "_authorize_customer_project",
+            return_value={"owner_id": "owner-1", "photo_count": 1, "lifetime_uploaded_count": 1},
+        ), patch.object(customer_upload, "_get_customer_account_photo_count", return_value=1998), patch.object(
+            customer_upload, "_process_one_customer_photo", new=process
+        ):
+            result = asyncio.run(customer_upload.upload_customer_photos(
+                "project", files, None, None, None,
+                f'["{saved}", "{fresh}", "{broken}"]', '["IMG_001.PNG", "IMG_002.HEIC", "IMG_003.JPG"]',
+            ))
+
+        self.assertEqual(result["uploaded"], 2)
+        self.assertEqual(result["rejected_indices"], [2])
+        self.assertEqual(result["rejected"], ["IMG_003.JPG"])
+        rows = photos.upsert.call_args.args[0]
+        self.assertEqual([(row["id"], row["filename"]) for row in rows], [(fresh, "IMG_002.HEIC")])
+        self.assertEqual(photos.upsert.call_args.kwargs, {"on_conflict": "id", "ignore_duplicates": True})
+        projects.update.assert_called_once_with({"photo_count": 2, "lifetime_uploaded_count": 2})
+
     def test_project_delete_cascades_and_cleans_r2(self):
         supabase = MagicMock()
         photos = MagicMock()
