@@ -167,6 +167,20 @@ def merge_same_named(scenes: list[list[dict]], names: list[Optional[str]]) -> tu
     return merged, merged_names
 
 
+def number_repeated(names: list[Optional[str]]) -> list[Optional[str]]:
+    """같은 이름이 (합치지 않고) 두 번 이상 남으면 순서대로 번호를 붙인다 — "야외", "야외" → "야외 1", "야외 2".
+    순서 정보는 모델이 아니라 여기서 붙인다(모델은 사진으로 보이는 이름만 고른다). 기타 장면·이름 없음은 그대로."""
+    repeated = {name for name in names if name not in (None, OTHER_SCENE) and names.count(name) > 1}
+    seen: dict[str, int] = {}
+    numbered = []
+    for name in names:
+        if name in repeated:
+            seen[name] = seen.get(name, 0) + 1
+            name = f"{name} {seen[name]}"
+        numbered.append(name)
+    return numbered
+
+
 def pick_samples(scene: list[dict], flagged: set[str], count: int = SCENE_SAMPLE_PHOTOS) -> list[dict]:
     """이름 붙일 대표 사진: 흔들림·눈 감음이 뚜렷한 사진은 빼고(다 빠지면 그대로), 같은 유사컷 묶음은 한 장만 남긴 뒤
     장면 앞·중간·뒤에서 고르게 고른다. 품질·유사컷 결과는 이미 있을 때만 쓴다(장면 이름이 그 분석을 기다리지 않게)."""
@@ -213,7 +227,8 @@ async def run_scene(run_id: str, project_id: str, scene_names: Optional[list[str
     나눌 근거가 없으면(사진이 적거나 촬영 시각 대부분이 없으면) 장면을 지운다."""
     db = get_supabase()
     settings = {**SCENE_SETTINGS, "catalog": scene_names or [], "nameModel": GEMINI_FLASH_MODEL,
-                "namePromptVersion": SCENE_NAME_PROMPT_VERSION, "sampleSelection": "quality+similarity-dedupe"}
+                "namePromptVersion": SCENE_NAME_PROMPT_VERSION, "sampleSelection": "quality+similarity-dedupe",
+                "repeatedNames": "numbered"}
     try:
         rows = capture_order(_all_rows(lambda: db.table("customer_photos")
                                        .select("id,order_index,preview_url,taken_at,taken_at_source,similarity_group_id")
@@ -234,6 +249,7 @@ async def run_scene(run_id: str, project_id: str, scene_names: Optional[list[str
                 names[index] = name or OTHER_SCENE
                 tick()
             scenes, names = merge_same_named(scenes, names)
+            names = number_repeated(names)
         if not _still_running(db, run_id):
             return
         _replace_scenes(db, project_id, scenes, names)

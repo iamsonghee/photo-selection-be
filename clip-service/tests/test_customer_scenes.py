@@ -118,3 +118,9 @@ def test_samples_skip_flagged_photos_and_similar_duplicates():
     assert sum(photo_id in {"p0", "p1", "p2", "p3"} for photo_id in ids) <= 1  # 유사컷 묶음은 한 장만
     # 전부 흔들림이면 그대로 쓴다(이름을 못 붙이는 것보다 낫다).
     assert len(pick_samples(scene[:3], flagged={"p0", "p1", "p2"})) >= 1
+
+
+def test_repeated_names_get_numbers_in_order():
+    from app.customer_ai import number_repeated
+    assert number_repeated(["야외", "실내·카페", "야외", "기타 장면", "기타 장면", None]) == \
+        ["야외 1", "실내·카페", "야외 2", "기타 장면", "기타 장면", None]
