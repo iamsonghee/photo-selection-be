@@ -73,8 +73,9 @@ def _fake_scene_run(monkeypatch, rows, status="processing", name="하객", flagg
     async def fake_download(urls):
         return [b"x" for _ in urls]
 
-    async def fake_name(client, images, names):
+    async def fake_name(client, images, names, usages=None):
         events.append("name")
+        usages.append({"prompt_token_count": 100, "candidates_token_count": 10, "thoughts_token_count": 50, "total_token_count": 160})
         return name
 
     db = MagicMock()
@@ -87,8 +88,8 @@ def _fake_scene_run(monkeypatch, rows, status="processing", name="하객", flagg
     monkeypatch.setattr(customer_ai, "download_all", fake_download)
     monkeypatch.setattr(customer_ai, "_name_scene", fake_name)
     monkeypatch.setattr(customer_ai, "_progress", lambda *args, **kwargs: (lambda step=1: events.append("tick")))
-    monkeypatch.setattr(customer_ai, "_done", lambda db, run_id, total, processed, failed, error=None: done.update(
-        total=total, processed=processed, failed=failed, error=error))
+    monkeypatch.setattr(customer_ai, "_done", lambda db, run_id, total, processed, failed, error=None, usage=None: done.update(
+        total=total, processed=processed, failed=failed, error=error, usage=usage))
     asyncio.run(customer_ai.run_scene("run", "p", ["하객", "돌잡이"]))
     return events, done
 
@@ -99,7 +100,8 @@ def test_scenes_are_replaced_only_after_naming_and_only_by_the_current_run(monke
     events, done = _fake_scene_run(monkeypatch, rows)
     assert events.index("delete") > max(i for i, event in enumerate(events) if event == "name")
     assert events.count("tick") == 2  # 진행 수 = 이름 붙일 장면 수
-    assert done == {"total": 2, "processed": 2, "failed": 0, "error": None}
+    assert done == {"total": 2, "processed": 2, "failed": 0, "error": None, "usage": {
+        "calls": 2, "prompt_tokens": 200, "output_tokens": 20, "thinking_tokens": 100, "total_tokens": 320}}
     events, done = _fake_scene_run(monkeypatch, rows, status="failed")
     assert "delete" not in events and not done
 
@@ -107,7 +109,7 @@ def test_scenes_are_replaced_only_after_naming_and_only_by_the_current_run(monke
 def test_failed_naming_is_counted_and_saved_as_other(monkeypatch):
     rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 30), (11, 40, 30)])]
     _, done = _fake_scene_run(monkeypatch, rows, name=None)
-    assert done == {"total": 2, "processed": 0, "failed": 2, "error": None}
+    assert {key: done[key] for key in ("total", "processed", "failed", "error")} == {"total": 2, "processed": 0, "failed": 2, "error": None}
 
 
 def test_samples_skip_flagged_photos_and_similar_duplicates():

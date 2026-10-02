@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Callable, Optional
 
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.config import (
     GEMINI_FLASH_MODEL,
@@ -20,7 +20,7 @@ from app.config import (
     GEMINI_QUALITY_MAX_RETRIES,
     GEMINI_QUALITY_TIMEOUT_SECONDS,
 )
-from app.gemini_client import get_client
+from app.gemini_client import get_client, is_retryable
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,21 @@ def _build_usage(response) -> Optional[dict]:
     return {
         "prompt_token_count": getattr(usage, "prompt_token_count", None),
         "candidates_token_count": getattr(usage, "candidates_token_count", None),
+        # thinking 토큰은 candidates에 포함되지 않지만 출력 단가로 과금된다 — 따로 세지 않으면 비용이 안 보인다.
+        "thoughts_token_count": getattr(usage, "thoughts_token_count", None),
         "total_token_count": getattr(usage, "total_token_count", None),
+    }
+
+
+def sum_usage(usages: list[dict]) -> dict:
+    """호출별 usage 합계(실행 기록용). 출력 비용 = candidates + thoughts."""
+    total = lambda key: sum(usage.get(key) or 0 for usage in usages)  # noqa: E731
+    return {
+        "calls": len(usages),
+        "prompt_tokens": total("prompt_token_count"),
+        "output_tokens": total("candidates_token_count"),
+        "thinking_tokens": total("thoughts_token_count"),
+        "total_tokens": total("total_token_count"),
     }
 
 
@@ -118,9 +132,12 @@ async def _assess_one(client, image_bytes: bytes, mime_type: str, customer: bool
             return assessment, _build_usage(response)
         except Exception as e:
             last_exc = e
-            if attempt < GEMINI_QUALITY_MAX_RETRIES:
+            # 일시적 오류만 재시도. 응답 JSON이 스키마에 안 맞으면 한 번만 다시 묻는다(같은 요청을 계속 반복하지 않는다).
+            retry = is_retryable(e) or (isinstance(e, ValidationError) and attempt == 0)
+            if attempt < GEMINI_QUALITY_MAX_RETRIES and retry:
                 await asyncio.sleep(2**attempt)
                 continue
+            raise
     raise last_exc  # type: ignore[misc]
 
 

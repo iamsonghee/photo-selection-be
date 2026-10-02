@@ -8,9 +8,10 @@ import asyncio
 import logging
 from typing import Callable, List, Optional
 
+import httpx
 import numpy as np
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 from app.config import (
     GEMINI_API_KEY,
@@ -29,6 +30,14 @@ _client_lock = asyncio.Lock()
 
 class GeminiNotConfigured(Exception):
     pass
+
+
+def is_retryable(exc: Exception) -> bool:
+    """일시적 오류만 다시 시도한다: 429·5xx·timeout·네트워크. 400대(잘못된 요청·모델·인증·이미지)는 다시 보내도
+    같은 결과라 재시도하면 장애 때 호출 수(=비용)만 늘어난다."""
+    if isinstance(exc, errors.APIError):
+        return exc.code == 429 or (exc.code or 0) >= 500
+    return isinstance(exc, (asyncio.TimeoutError, httpx.TransportError))
 
 
 async def get_client() -> genai.Client:
@@ -83,9 +92,10 @@ async def _embed_one(client: genai.Client, image_bytes: bytes, mime_type: str):
             return vec, _extract_usage(response)
         except Exception as e:
             last_exc = e
-            if attempt < GEMINI_MAX_RETRIES:
+            if attempt < GEMINI_MAX_RETRIES and is_retryable(e):
                 await asyncio.sleep(2**attempt)
                 continue
+            raise
     raise last_exc  # type: ignore[misc]
 
 

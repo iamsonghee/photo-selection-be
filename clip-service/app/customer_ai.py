@@ -14,7 +14,7 @@ from app.config import (GEMINI_EMBEDDING_DIMENSION, GEMINI_EMBEDDING_MODEL,
 from app.db import get_supabase
 from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
-from app.gemini_quality_client import assess_images
+from app.gemini_quality_client import _build_usage, assess_images, sum_usage
 from app.grouping import group_by_similarity
 from app.scenes import CLOSE_GAP_SECONDS, SCENE_SETTINGS, scene_gap, scene_taken_at, split_scenes
 
@@ -83,12 +83,13 @@ def _progress(db, run_id: str, total: int, start: int, settings: Optional[dict] 
     return tick
 
 
-def _done(db, run_id, total, processed, failed, error=None):
+def _done(db, run_id, total, processed, failed, error=None, usage: Optional[dict] = None):
     # 진행 중일 때만 닫는다 — 멈춘 것으로 이미 닫힌 실행이 늦게 끝나 failed를 completed로 되돌리지 않게.
     db.table("customer_ai_runs").update({
         "status": "failed" if error else "completed", "image_count": total,
         "processed_count": processed, "failed_count": failed, "error": error,
         "completed_at": _now(), "updated_at": _now(),
+        **({"usage": usage} if usage is not None else {}),
     }).eq("id", run_id).eq("status", "processing").execute()
 
 
@@ -129,7 +130,7 @@ class _SceneName(BaseModel):
     confident: bool
 
 
-async def _name_scene(client, images: list[bytes], names: list[str]) -> Optional[str]:
+async def _name_scene(client, images: list[bytes], names: list[str], usages: Optional[list[dict]] = None) -> Optional[str]:
     """한 장면의 대표 사진들을 보고 촬영 종류별 장면 목록 중 하나를 고른다. 맞는 게 없거나 확신이 없으면 기타 장면,
     호출이 실패하면 None(이름만 못 붙인 것 — 장면은 그대로 쓰고 기타 장면으로 저장, 실패 수로 센다)."""
     prompt = (
@@ -143,6 +144,8 @@ async def _name_scene(client, images: list[bytes], names: list[str]) -> Optional
             contents=[prompt, *[types.Part.from_bytes(data=image, mime_type="image/jpeg") for image in images]],
             config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=_SceneName, temperature=0),
         )
+        if usages is not None and (usage := _build_usage(response)):
+            usages.append(usage)
         result = _SceneName.model_validate_json(response.text)
         name = result.name.strip()
         return name if result.confident and name in names else OTHER_SCENE
@@ -238,13 +241,14 @@ async def run_scene(run_id: str, project_id: str, scene_names: Optional[list[str
         to_name = [index for index, scene in enumerate(scenes) if scene_names and scene_taken_at(scene[0])]
         tick = _progress(db, run_id, len(to_name), 0, settings=settings, every=1)
         failed = 0
+        usages: list[dict] = []
         if to_name:
             client = await get_client()
             flagged = _flagged_photos(db, project_id)
             for index in to_name:
                 sample = pick_samples(scenes[index], flagged)
                 images = [image for image in await download_all([photo["preview_url"] for photo in sample]) if image]
-                name = await _name_scene(client, images, scene_names) if images else None
+                name = await _name_scene(client, images, scene_names, usages) if images else None
                 failed += name is None
                 names[index] = name or OTHER_SCENE
                 tick()
@@ -253,7 +257,7 @@ async def run_scene(run_id: str, project_id: str, scene_names: Optional[list[str
         if not _still_running(db, run_id):
             return
         _replace_scenes(db, project_id, scenes, names)
-        _done(db, run_id, len(to_name), len(to_name) - failed, failed)
+        _done(db, run_id, len(to_name), len(to_name) - failed, failed, usage=sum_usage(usages))
     except Exception as exc:
         _done(db, run_id, 0, 0, 0, str(exc)[:500])
 
@@ -301,7 +305,7 @@ async def run_quality(run_id: str, project_id: str):
         tick = _progress(db, run_id, reused + len(rows), reused, settings={
             "model": GEMINI_FLASH_MODEL, "promptVersion": CUSTOMER_QUALITY_PROMPT_VERSION})
         images = await download_all([row["preview_url"] for row in rows])
-        assessments, _ = await assess_images(images, on_each=tick, customer=True)
+        assessments, usages = await assess_images(images, on_each=tick, customer=True)
         payload = [{"project_id": project_id, "photo_id": row["id"], "model": GEMINI_FLASH_MODEL,
                     "prompt_version": CUSTOMER_QUALITY_PROMPT_VERSION,
                     "eyes_closed": value.eyes_closed.value, "blur_or_shake": value.blur_or_shake.value,
@@ -316,6 +320,6 @@ async def run_quality(run_id: str, project_id: str):
         # 이전 프롬프트 판정은 지운다 — 프로젝트 조회가 버전 구분 없이 사진별 판정을 읽어서 남으면 섞인다.
         db.table("customer_quality_assessments").delete().eq("project_id", project_id) \
             .neq("prompt_version", CUSTOMER_QUALITY_PROMPT_VERSION).execute()
-        _done(db, run_id, reused + len(rows), reused + len(payload), len(rows) - len(payload))
+        _done(db, run_id, reused + len(rows), reused + len(payload), len(rows) - len(payload), usage=sum_usage(usages))
     except Exception as exc:
         _done(db, run_id, reused + len(rows), reused, len(rows), str(exc)[:500])
