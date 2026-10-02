@@ -16,12 +16,13 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import (
     GEMINI_CUSTOMER_QUALITY_SERVICE_TIER,
+    GEMINI_FLEX_TIMEOUT_SECONDS,
     GEMINI_FLASH_MODEL,
     GEMINI_QUALITY_CONCURRENCY,
     GEMINI_QUALITY_MAX_RETRIES,
     GEMINI_QUALITY_TIMEOUT_SECONDS,
 )
-from app.gemini_client import get_client, is_retryable
+from app.gemini_client import get_client, is_retryable, retry_delay
 
 logger = logging.getLogger(__name__)
 
@@ -106,11 +107,13 @@ def _build_usage(response) -> Optional[dict]:
     }
 
 
-def sum_usage(usages: list[dict]) -> dict:
-    """호출별 usage 합계(실행 기록용). 출력 비용 = candidates + thoughts."""
+def sum_usage(usages: list[dict], stats: Optional[dict] = None) -> dict:
+    """호출별 usage 합계(실행 기록용). 출력 비용 = candidates + thoughts. calls는 성공해 usage를 받은 응답 수,
+    attempts·failed_attempts는 실제로 보낸 요청 수와 그중 실패 수(실패·타임아웃 요청도 과금될 수 있어 따로 센다)."""
     total = lambda key: sum(usage.get(key) or 0 for usage in usages)  # noqa: E731
     return {
         "calls": len(usages),
+        **({"attempts": stats.get("attempts", 0), "failed_attempts": stats.get("failed_attempts", 0)} if stats is not None else {}),
         "prompt_tokens": total("prompt_token_count"),
         "output_tokens": total("candidates_token_count"),
         "thinking_tokens": total("thoughts_token_count"),
@@ -118,11 +121,14 @@ def sum_usage(usages: list[dict]) -> dict:
     }
 
 
-async def _assess_one(client, image_bytes: bytes, mime_type: str, customer: bool = False):
+async def _assess_one(client, image_bytes: bytes, mime_type: str, customer: bool = False, stats: Optional[dict] = None):
     schema, prompt = (CustomerPhotoAssessment, _CUSTOMER_PROMPT) if customer else (PhotoQualityAssessment, _PROMPT)
     tier = {"service_tier": GEMINI_CUSTOMER_QUALITY_SERVICE_TIER} if customer and _SUPPORTS_SERVICE_TIER else {}
+    flex = tier.get("service_tier") == "flex"
+    stats = stats if stats is not None else {}
     last_exc: Optional[Exception] = None
     for attempt in range(GEMINI_QUALITY_MAX_RETRIES + 1):
+        stats["attempts"] = stats.get("attempts", 0) + 1
         try:
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
@@ -138,16 +144,19 @@ async def _assess_one(client, image_bytes: bytes, mime_type: str, customer: bool
                         **tier,
                     ),
                 ),
-                timeout=GEMINI_QUALITY_TIMEOUT_SECONDS,
+                timeout=GEMINI_FLEX_TIMEOUT_SECONDS if flex else GEMINI_QUALITY_TIMEOUT_SECONDS,
             )
             assessment = schema.model_validate_json(response.text)
             return assessment, _build_usage(response)
         except Exception as e:
             last_exc = e
+            stats["failed_attempts"] = stats.get("failed_attempts", 0) + 1
             # 일시적 오류만 재시도. 응답 JSON이 스키마에 안 맞으면 한 번만 다시 묻는다(같은 요청을 계속 반복하지 않는다).
-            retry = is_retryable(e) or (isinstance(e, ValidationError) and attempt == 0)
+            # Flex 타임아웃은 이미 오래 기다린 것이라 다시 보내지 않는다. Flex 혼잡(429)은 더 길게 기다린다.
+            retry = (is_retryable(e) and not (flex and isinstance(e, asyncio.TimeoutError))) \
+                or (isinstance(e, ValidationError) and attempt == 0)
             if attempt < GEMINI_QUALITY_MAX_RETRIES and retry:
-                await asyncio.sleep(2**attempt)
+                await asyncio.sleep(retry_delay(e, attempt, base=5.0 if flex else 1.0))
                 continue
             raise
     raise last_exc  # type: ignore[misc]
@@ -157,6 +166,7 @@ async def assess_images(
     images: list[Optional[bytes]],
     on_each: Optional[Callable[[], None]] = None,
     customer: bool = False,
+    stats: Optional[dict] = None,
 ) -> tuple[list[Optional[PhotoQualityAssessment]], list[dict]]:
     """순서를 보존하며 이미지별 품질 판정. 다운로드 실패(None) 또는 판정 실패 항목은 None.
     반환: (판정 리스트, 실제 usage_metadata 리스트)."""
@@ -171,7 +181,7 @@ async def assess_images(
             return None
         async with sem:
             try:
-                assessment, usage = await _assess_one(client, img, "image/jpeg", customer)
+                assessment, usage = await _assess_one(client, img, "image/jpeg", customer, stats)
                 if usage:
                     usages.append(usage)
                 return assessment

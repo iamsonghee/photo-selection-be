@@ -105,6 +105,9 @@ GEMINI_QUALITY_TIMEOUT_SECONDS = _env_float("GEMINI_QUALITY_TIMEOUT_SECONDS", 30
 # 요청 타임아웃(GEMINI_QUALITY_TIMEOUT_SECONDS=30초)·재시도와 맞지 않는다 — 2026-10-03 실측은 20장·120초 타임아웃뿐.
 # 운영과 같은 조건으로 재측정하고 Flex 전용 타임아웃을 정하기 전까지 기본은 standard. 작가 판정은 항상 표준.
 GEMINI_CUSTOMER_QUALITY_SERVICE_TIER = os.getenv("GEMINI_CUSTOMER_QUALITY_SERVICE_TIER", "standard")
+# Flex 요청 하나의 제한시간(초). Flex는 처리 시작이 늦어질 수 있어 표준(GEMINI_QUALITY_TIMEOUT_SECONDS)과 따로 두고,
+# Flex 타임아웃은 재시도하지 않는다(이미 오래 기다렸고, 끊긴 요청도 과금될 수 있음). 실행은 heartbeat로 살아 있다고 기록한다.
+GEMINI_FLEX_TIMEOUT_SECONDS = _env_float("GEMINI_FLEX_TIMEOUT_SECONDS", 600.0, 30.0, 1800.0)
 # 셀프 고객 분석 중 사진을 내려받는 실행(유사컷·품질)을 프로세스당 몇 개까지 동시에 돌릴지. 메모리 상한 ≈ 이 수 × 배치(40장).
 # 넘는 실행은 기다린다(대기 중에도 heartbeat를 기록해 멈춘 실행으로 닫히지 않음). 장면 실행은 가벼워 제한하지 않는다.
 CUSTOMER_AI_HEAVY_RUNS = _env_int("CUSTOMER_AI_HEAVY_RUNS", 2, 1, 8)

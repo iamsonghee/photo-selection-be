@@ -5,7 +5,9 @@
 API 키와 이미지 바이트, 임베딩 값은 절대 로그에 남기지 않는다.
 """
 import asyncio
+import json
 import logging
+import re
 from typing import Callable, List, Optional
 
 import httpx
@@ -38,6 +40,25 @@ def is_retryable(exc: Exception) -> bool:
     if isinstance(exc, errors.APIError):
         return exc.code == 429 or (exc.code or 0) >= 500
     return isinstance(exc, (asyncio.TimeoutError, httpx.TransportError))
+
+
+_RETRY_DELAY = re.compile(r'"retryDelay":\s*"(\d+(?:\.\d+)?)s"')
+
+
+def retry_delay(exc: Exception, attempt: int, base: float = 1.0, cap: float = 60.0) -> float:
+    """다시 보내기 전 기다릴 초. 서버가 알려 준 대기(Retry-After 헤더 또는 오류 본문 RetryInfo.retryDelay)를 따르고,
+    없으면 base × 2^attempt. 혼잡(429)인데 1~2초 만에 다시 보내면 또 거절돼 시도만 늘어난다."""
+    seconds: Optional[float] = None
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    try:
+        if headers and headers.get("retry-after"):
+            seconds = float(headers.get("retry-after"))
+    except (TypeError, ValueError):
+        seconds = None
+    if seconds is None and isinstance(exc, errors.APIError):
+        match = _RETRY_DELAY.search(json.dumps(exc.details, default=str))
+        seconds = float(match.group(1)) if match else None
+    return min(cap, seconds if seconds is not None else base * 2 ** attempt)
 
 
 async def get_client() -> genai.Client:
@@ -93,7 +114,7 @@ async def _embed_one(client: genai.Client, image_bytes: bytes, mime_type: str):
         except Exception as e:
             last_exc = e
             if attempt < GEMINI_MAX_RETRIES and is_retryable(e):
-                await asyncio.sleep(2**attempt)
+                await asyncio.sleep(retry_delay(e, attempt))
                 continue
             raise
     raise last_exc  # type: ignore[misc]

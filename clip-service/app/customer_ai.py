@@ -15,7 +15,7 @@ from google.genai import types
 from pydantic import BaseModel
 
 from app.config import (CUSTOMER_AI_HEAVY_RUNS, GEMINI_EMBEDDING_DIMENSION, GEMINI_EMBEDDING_MODEL,
-                        GEMINI_EMBEDDING_VERSION, GEMINI_FLASH_MODEL,
+                        GEMINI_EMBEDDING_VERSION, GEMINI_FLASH_MODEL, GEMINI_FLEX_TIMEOUT_SECONDS,
                         GEMINI_QUALITY_PROMPT_VERSION, GEMINI_QUALITY_TIMEOUT_SECONDS,
                         GEMINI_SIMILARITY_THRESHOLD)
 from app.db import get_supabase
@@ -367,6 +367,7 @@ async def _run_quality(db, run_id: str, project_id: str):
     다시 정리할 때 새 사진만), 나머지를 BATCH_PHOTOS장씩 내려받아 판정하고 바로 저장한다."""
     total = processed = 0
     usages: list[dict] = []
+    stats: dict = {}  # 실제 보낸 요청·실패한 요청 수(재시도·타임아웃 포함)
     try:
         rows = _all_rows(lambda: db.table("customer_photos").select("id,order_index,preview_url")
                          .eq("project_id", project_id).order("order_index").order("id"))
@@ -377,13 +378,14 @@ async def _run_quality(db, run_id: str, project_id: str):
         total, processed = len(rows), len(rows) - len(pending)
         tick = _progress(db, run_id, total, processed, settings={
             "model": GEMINI_FLASH_MODEL, "promptVersion": CUSTOMER_QUALITY_PROMPT_VERSION,
-            "serviceTier": customer_service_tier(), "timeoutSeconds": GEMINI_QUALITY_TIMEOUT_SECONDS,
+            "serviceTier": customer_service_tier(),
+            "timeoutSeconds": GEMINI_FLEX_TIMEOUT_SECONDS if customer_service_tier() == "flex" else GEMINI_QUALITY_TIMEOUT_SECONDS,
             "image": "preview-1200", "batchPhotos": BATCH_PHOTOS})
         for start in range(0, len(pending), BATCH_PHOTOS):
             batch = pending[start:start + BATCH_PHOTOS]
             _ensure_running(db, run_id)
             images = await download_all([row["preview_url"] for row in batch])
-            assessments, batch_usages = await assess_images(images, on_each=tick, customer=True)
+            assessments, batch_usages = await assess_images(images, on_each=tick, customer=True, stats=stats)
             usages += batch_usages
             payload = [{"project_id": project_id, "photo_id": row["id"], "model": GEMINI_FLASH_MODEL,
                         "prompt_version": CUSTOMER_QUALITY_PROMPT_VERSION,
@@ -402,8 +404,8 @@ async def _run_quality(db, run_id: str, project_id: str):
             .neq("prompt_version", CUSTOMER_QUALITY_PROMPT_VERSION).execute()
         db.table("customer_quality_assessments").delete().eq("project_id", project_id) \
             .neq("model", GEMINI_FLASH_MODEL).execute()
-        _done(db, run_id, total, processed, total - processed, usage=sum_usage(usages))
+        _done(db, run_id, total, processed, total - processed, usage=sum_usage(usages, stats))
     except _Superseded:
         return
     except Exception as exc:
-        _done(db, run_id, total, processed, total - processed, str(exc)[:500], usage=sum_usage(usages))
+        _done(db, run_id, total, processed, total - processed, str(exc)[:500], usage=sum_usage(usages, stats))
