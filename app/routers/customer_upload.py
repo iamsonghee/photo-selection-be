@@ -306,6 +306,15 @@ async def upload_customer_photos(
     }
 
 
+# PostgREST는 `in.(...)` 목록을 URL에 싣는다 — 사진 ID 약 600개(≈24KB)를 넘으면 400으로 거절해
+# 전체 선택 삭제(최대 2000장)가 실패했다. 목록 조회·삭제는 이 크기로 나눠 보낸다.
+ID_CHUNK = 200
+
+
+def _chunks(ids: list[str]) -> list[list[str]]:
+    return [ids[start:start + ID_CHUNK] for start in range(0, len(ids), ID_CHUNK)]
+
+
 @router.delete("/photos")
 async def delete_customer_photos(
     body: CustomerPhotoDeleteRequest,
@@ -318,25 +327,18 @@ async def delete_customer_photos(
     if not photo_ids:
         raise HTTPException(status_code=400, detail="삭제할 사진이 없습니다.")
 
-    photos = (
-        supabase.table("customer_photos")
-        .select("id")
-        .eq("project_id", project["id"])
-        .in_("id", photo_ids)
-        .execute()
-    ).data or []
-    owned_ids = [row["id"] for row in photos]
+    owned_ids = [row["id"] for chunk in _chunks(photo_ids) for row in (
+        supabase.table("customer_photos").select("id").eq("project_id", project["id"]).in_("id", chunk).execute()
+    ).data or []]
     if len(owned_ids) != len(photo_ids):
         raise HTTPException(status_code=403, detail="이 프로젝트의 사진이 아닙니다.")
 
-    versions = (
-        supabase.table("customer_photo_versions")
-        .select("id")
-        .in_("photo_id", owned_ids)
-        .execute()
-    ).data or []
+    versions = [row for chunk in _chunks(owned_ids) for row in (
+        supabase.table("customer_photo_versions").select("id").in_("photo_id", chunk).execute()
+    ).data or []]
     try:
-        supabase.table("customer_photos").delete().eq("project_id", project["id"]).in_("id", owned_ids).execute()
+        for chunk in _chunks(owned_ids):
+            supabase.table("customer_photos").delete().eq("project_id", project["id"]).in_("id", chunk).execute()
         remaining = (
             supabase.table("customer_photos")
             .select("id", count="exact")
