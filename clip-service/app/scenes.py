@@ -17,6 +17,11 @@ MIN_SCENE_PHOTOS = 10
 MAX_SCENES = 8
 MIN_PHOTOS_FOR_SCENES = 20
 MIN_TIMED_RATIO = 0.8
+# 이보다 짧은 공백은 "이어진 촬영": 작은 장면은 공백이 더 짧은 이웃에 붙이되, 양쪽(첫·마지막 장면은 한쪽) 공백이
+# 모두 이 이상이면 작아도 따로 둔다(입장·케이크 커팅처럼 짧은 장면). 같은 이름 장면 병합도 이 공백 미만일 때만.
+CLOSE_GAP_SECONDS = 10 * 60
+# 따로 떨어져 있어도 이보다 적으면(한두 장 튄 사진) 장면으로 두지 않고 가까운 쪽에 붙인다.
+MIN_ISOLATED_PHOTOS = 3
 
 
 def _time(value: Optional[str]) -> Optional[datetime]:
@@ -33,6 +38,30 @@ def scene_taken_at(photo: dict) -> Optional[str]:
     return None if photo.get("taken_at_source") == "file" else photo.get("taken_at")
 
 
+def scene_gap(before: list[dict], after: list[dict]) -> float:
+    """시간순으로 붙은 두 장면 사이 공백(초)."""
+    return (_time(scene_taken_at(after[0])) - _time(scene_taken_at(before[-1]))).total_seconds()
+
+
+def _merge_small(ranges: list[list[dict]]) -> list[list[dict]]:
+    """작은 장면을 공백이 더 짧은 이웃에 붙인다(같으면 앞). 양쪽 공백이 모두 CLOSE_GAP 이상이면 그대로 둔다."""
+    while len(ranges) > 1:
+        for i, part in enumerate(ranges):
+            if len(part) >= MIN_SCENE_PHOTOS:
+                continue
+            before = scene_gap(ranges[i - 1], part) if i > 0 else None
+            after = scene_gap(part, ranges[i + 1]) if i < len(ranges) - 1 else None
+            if len(part) >= MIN_ISOLATED_PHOTOS and all(gap is None or gap >= CLOSE_GAP_SECONDS for gap in (before, after)):
+                continue
+            j = i - 1 if after is None or (before is not None and before <= after) else i + 1
+            lo, hi = min(i, j), max(i, j)
+            ranges[lo:hi + 1] = [ranges[lo] + ranges[hi]]
+            break
+        else:
+            break
+    return ranges
+
+
 def split_scenes(photos: list[dict]) -> Optional[list[list[dict]]]:
     """photos: {"id", "order_index", "taken_at", "taken_at_source"}. 반환: 장면별 사진 목록(시간순, 촬영 시각 없는 사진은 맨 끝 장면).
     장면으로 나눌 근거가 부족하면(사진이 적거나 촬영 시각 대부분이 없으면) None."""
@@ -46,18 +75,8 @@ def split_scenes(photos: list[dict]) -> Optional[list[list[dict]]]:
     cuts = sorted(index for index, _ in sorted(
         [item for item in gaps if item[1] >= SCENE_GAP_SECONDS], key=lambda item: -item[1])[:MAX_SCENES - 1])
 
-    ranges: list[list[dict]] = []
-    start = 0
-    for cut in [*cuts, len(ordered)]:
-        part = ordered[start:cut]
-        start = cut
-        # 너무 작은 장면은 바로 앞 장면에 붙인다(첫 장면이면 아래에서 다음 장면과 합친다).
-        if len(part) < MIN_SCENE_PHOTOS and ranges:
-            ranges[-1].extend(part)
-        else:
-            ranges.append(part)
-    if len(ranges) > 1 and len(ranges[0]) < MIN_SCENE_PHOTOS:
-        ranges[0:2] = [ranges[0] + ranges[1]]
+    bounds = [0, *cuts, len(ordered)]
+    ranges = _merge_small([ordered[a:b] for a, b in zip(bounds, bounds[1:])])
 
     untimed = sorted((photo for photo in photos if not _time(scene_taken_at(photo))), key=lambda photo: photo["order_index"])
     if untimed:

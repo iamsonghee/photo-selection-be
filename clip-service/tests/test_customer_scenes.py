@@ -1,3 +1,8 @@
+import json
+from pathlib import Path
+
+import pytest
+
 from app.customer_ai import merge_same_named
 from app.scenes import split_scenes
 
@@ -14,37 +19,44 @@ def _photos(blocks):
     return photos
 
 
-def test_splits_on_long_gaps_like_the_frontend():
-    scenes = split_scenes(_photos([(11, 0, 30), (11, 40, 30), (12, 30, 30)]))
-    assert [len(scene) for scene in scenes] == [30, 30, 30]
-    assert scenes[1][0]["id"] == "p30"
+# 공용 골든 케이스 — FE tests/customer-scenes.test.mjs 도 같은 파일(복사본)을 읽는다(경계 규칙 드리프트 방지).
+FIXTURE = Path(__file__).parent / "fixtures" / "scene-cases.json"
+CASES = json.loads(FIXTURE.read_text(encoding="utf-8"))["cases"]
 
 
-def test_event_snap_splits_on_short_breaks():
-    # 돌잔치 스냅 실데이터 패턴: 쉬지 않고 찍다가 순서가 바뀔 때만 4~5분 쉰다(10분 공백 없음).
-    scenes = split_scenes(_photos([(10, 0, 30), (10, 15, 30), (10, 30, 30)]))
-    assert [len(scene) for scene in scenes] == [30, 30, 30]
-
-
-def test_small_scenes_merge_into_neighbours_and_untimed_go_last():
-    photos = _photos([(11, 0, 5), (11, 30, 25), (12, 30, 4)]) + [{"id": "x", "order_index": 99, "taken_at": None}]
+@pytest.mark.parametrize("case", CASES, ids=[case["name"] for case in CASES])
+def test_golden_scene_cases(case):
+    photos = []
+    for block in case["blocks"]:
+        start, count, source = block[0], block[1], (block[2] if len(block) > 2 else "exif")
+        h, m, sec = map(int, start.split(":"))
+        for i in range(count):
+            t = h * 3600 + m * 60 + sec + i * 20
+            photos.append({"id": f"c{len(photos)}", "order_index": len(photos), "taken_at_source": source,
+                           "taken_at": f"2026-10-03T{t // 3600:02}:{t // 60 % 60:02}:{t % 60:02}"})
+    photos += [{"id": f"c{len(photos) + i}", "order_index": len(photos) + i, "taken_at": None} for i in range(case.get("untimed", 0))]
     scenes = split_scenes(photos)
-    # 5장(첫 장면) → 다음 장면과 합침, 4장(마지막) → 앞 장면에 붙음, 촬영 시각 없는 1장은 맨 끝 장면.
-    assert [len(scene) for scene in scenes] == [34, 1]
-    assert scenes[-1][0]["id"] == "x"
+    assert (None if scenes is None else [len(scene) for scene in scenes]) == case["expected"]
 
 
-def test_too_few_or_mostly_untimed_photos_have_no_scenes():
-    assert split_scenes(_photos([(11, 0, 19)])) is None
-    untimed = [{"id": f"u{i}", "order_index": i, "taken_at": None} for i in range(30)]
-    assert split_scenes(_photos([(11, 0, 20)]) + untimed) is None
+def test_untimed_photos_go_last_in_upload_order():
+    photos = _photos([(11, 0, 30)]) + [{"id": f"x{i}", "order_index": 99 - i, "taken_at": None} for i in range(2)]
+    assert [photo["id"] for photo in split_scenes(photos)[-1]] == ["x1", "x0"]
 
 
-def test_adjacent_same_named_scenes_merge():
-    a, b, c, d, e = ([{"id": n}] for n in "abcde")
-    scenes, names = merge_same_named([a, b, c, d, e], ["하객", "하객", "돌잡이", "하객", None])
-    assert names == ["하객", "돌잡이", "하객", None]
-    assert [[photo["id"] for photo in scene] for scene in scenes] == [["a", "b"], ["c"], ["d"], ["e"]]
+def test_same_named_scenes_merge_only_when_close_in_time():
+    # 하객(11:00) ─5분─ 하객 → 합침 / ─30분─ 하객 → 다른 시점이라 따로. 이름 없음·기타 장면은 합치지 않는다.
+    a, b, c, d = (_photos([(11, minute, 10)]) for minute in (0, 8, 45, 50))
+    for scene, prefix in zip((a, b, c, d), "abcd"):
+        for photo in scene:
+            photo["id"] = prefix + photo["id"]
+    scenes, names = merge_same_named([a, b, c, d], ["하객", "하객", "하객", "기타 장면"])
+    assert names == ["하객", "하객", "기타 장면"]
+    assert [len(scene) for scene in scenes] == [20, 10, 10]
+    scenes, names = merge_same_named([c, d], ["기타 장면", "기타 장면"])
+    assert names == ["기타 장면", "기타 장면"]
+    scenes, names = merge_same_named([a, b], [None, None])
+    assert names == [None, None]
 
 
 def test_scene_progress_fills_second_half(monkeypatch):
@@ -69,21 +81,6 @@ def test_scene_progress_fills_second_half(monkeypatch):
     steps = []
     asyncio.run(customer_ai._save_scenes(MagicMock(), "run", "p", rows, ["하객"], lambda step=1: steps.append(step)))
     assert sum(steps) == len(rows)
-
-
-def test_file_modified_times_are_not_used_for_scene_boundaries():
-    # EXIF가 없어 파일 수정 시각으로 대신한 사진(HEIC·카카오톡)은 경계 계산에서 빠지고 "촬영 시각 없음" 장면으로 간다.
-    photos = _photos([(11, 0, 30), (11, 40, 30)])
-    fake = [{"id": f"f{i}", "order_index": 100 + i, "taken_at": "2026-10-03T11:20:00", "taken_at_source": "file"} for i in range(5)]
-    scenes = split_scenes(photos + fake)
-    assert [len(scene) for scene in scenes] == [30, 30, 5]
-    assert scenes[-1][0]["id"] == "f0"
-
-
-def test_file_modified_times_do_not_count_as_timed():
-    exif = _photos([(11, 0, 20)])
-    fake = [{"id": f"f{i}", "order_index": 100 + i, "taken_at": "2026-10-03T12:00:00", "taken_at_source": "file"} for i in range(10)]
-    assert split_scenes(exif + fake) is None  # 20/30 = 67% < 80%
 
 
 def test_scenes_are_replaced_only_after_naming_and_only_by_the_current_run(monkeypatch):

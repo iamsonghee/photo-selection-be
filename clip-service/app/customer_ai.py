@@ -16,7 +16,7 @@ from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
 from app.gemini_quality_client import assess_images
 from app.grouping import group_by_similarity
-from app.scenes import scene_taken_at, split_scenes
+from app.scenes import CLOSE_GAP_SECONDS, scene_gap, scene_taken_at, split_scenes
 
 logger = logging.getLogger(__name__)
 OTHER_SCENE = "기타 장면"
@@ -132,12 +132,14 @@ async def _name_scene(client, images: list[bytes], names: list[str]) -> str:
 
 
 def merge_same_named(scenes: list[list[dict]], names: list[Optional[str]]) -> tuple[list[list[dict]], list[Optional[str]]]:
-    """바로 붙은 장면의 이름이 같으면 한 장면으로 합친다 — 시간 공백이 한 장면을 잘못 나눈 경우(예: 하객, 하객).
-    떨어져 있는 같은 이름은 실제로 다른 시점이라 그대로 둔다. 이름 없는 장면은 합치지 않는다."""
+    """바로 붙은 장면의 이름이 같고 사이 공백이 짧으면(CLOSE_GAP 미만) 한 장면으로 합친다 — 시간 공백이 한 장면을
+    잘못 나눈 경우(예: 하객, 하객). 공백이 길면 이름이 같아도 다른 시점이라 그대로 둔다(이름 오판이 시간 경계를 없애지 않게).
+    이름 없는 장면·기타 장면은 합치지 않는다."""
     merged: list[list[dict]] = []
     merged_names: list[Optional[str]] = []
     for scene, name in zip(scenes, names):
-        if name is not None and merged_names and merged_names[-1] == name:
+        if (name not in (None, OTHER_SCENE) and merged_names and merged_names[-1] == name
+                and scene_gap(merged[-1], scene) < CLOSE_GAP_SECONDS):
             merged[-1] = merged[-1] + scene
         else:
             merged.append(scene)
