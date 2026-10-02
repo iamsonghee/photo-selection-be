@@ -101,9 +101,13 @@ GEMINI_QUALITY_PROMPT_VERSION = os.getenv("GEMINI_QUALITY_PROMPT_VERSION", "v1")
 GEMINI_QUALITY_CONCURRENCY = _env_int("GEMINI_QUALITY_CONCURRENCY", 4, 1, 16)
 GEMINI_QUALITY_MAX_RETRIES = _env_int("GEMINI_QUALITY_MAX_RETRIES", 2, 0, 5)
 GEMINI_QUALITY_TIMEOUT_SECONDS = _env_float("GEMINI_QUALITY_TIMEOUT_SECONDS", 30.0, 5.0, 120.0)
-# 셀프 고객 품질 판정의 Gemini 서비스 티어. flex는 표준가의 절반 — 백그라운드 분석이라 지연이 불규칙해도 된다
-# (2026-10-03 실측: 150장 비교에서 판정·지연 차이 없음). "standard"로 되돌릴 수 있다. 작가 판정은 표준(비용 추정이 표준가 기준).
-GEMINI_CUSTOMER_QUALITY_SERVICE_TIER = os.getenv("GEMINI_CUSTOMER_QUALITY_SERVICE_TIER", "flex")
+# 셀프 고객 품질 판정의 Gemini 서비스 티어. "flex"는 표준가의 절반이지만 지연이 가변적(best-effort)이라
+# 요청 타임아웃(GEMINI_QUALITY_TIMEOUT_SECONDS=30초)·재시도와 맞지 않는다 — 2026-10-03 실측은 20장·120초 타임아웃뿐.
+# 운영과 같은 조건으로 재측정하고 Flex 전용 타임아웃을 정하기 전까지 기본은 standard. 작가 판정은 항상 표준.
+GEMINI_CUSTOMER_QUALITY_SERVICE_TIER = os.getenv("GEMINI_CUSTOMER_QUALITY_SERVICE_TIER", "standard")
+# 셀프 고객 분석 중 사진을 내려받는 실행(유사컷·품질)을 프로세스당 몇 개까지 동시에 돌릴지. 메모리 상한 ≈ 이 수 × 배치(40장).
+# 넘는 실행은 기다린다(대기 중에도 heartbeat를 기록해 멈춘 실행으로 닫히지 않음). 장면 실행은 가벼워 제한하지 않는다.
+CUSTOMER_AI_HEAVY_RUNS = _env_int("CUSTOMER_AI_HEAVY_RUNS", 2, 1, 8)
 # gemini-3.5-flash-lite 표준가(1M 토큰당 USD). 실제 비용은 usage_metadata 실사용량으로 계산하므로
 # 이 값은 참고용 단가일 뿐이며, 한 곳에서만 관리해 코드 곳곳에 하드코딩하지 않는다.
 GEMINI_FLASH_INPUT_PRICE_PER_1M = _env_float("GEMINI_FLASH_INPUT_PRICE_PER_1M", 0.30, 0.0, 100.0)

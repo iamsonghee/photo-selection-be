@@ -88,6 +88,11 @@ _CUSTOMER_PROMPT = _PROMPT.replace("주어진 JSON 스키마 형식으로만 응
 _SUPPORTS_SERVICE_TIER = "service_tier" in types.GenerateContentConfig.model_fields
 
 
+def customer_service_tier() -> str:
+    """셀프 고객 판정에 실제로 쓰는 서비스 티어(실행 settings 기록용)."""
+    return GEMINI_CUSTOMER_QUALITY_SERVICE_TIER if _SUPPORTS_SERVICE_TIER else "standard"
+
+
 def _build_usage(response) -> Optional[dict]:
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
