@@ -20,6 +20,8 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
+# 공개 주소를 바꾼 뒤에도 DB에 남은 예전 주소(예: pub-….r2.dev)의 key를 읽을 수 있게 허용할 예전 주소들(쉼표 구분).
+R2_LEGACY_PUBLIC_URLS = os.getenv("R2_LEGACY_PUBLIC_URLS", "")
 
 
 _r2_client = None
@@ -148,12 +150,14 @@ _ALLOWED_KEY_PATTERNS = [
 PRESIGN_EXPIRES_SECONDS = 3600
 
 
-def _r2_allowed_hostname() -> str:
-    """R2_PUBLIC_URL 환경변수에서 허용 hostname 추출."""
-    raw = (R2_PUBLIC_URL or "").rstrip("/")
-    if not raw:
-        return ""
-    return _urlparse.urlparse(raw).netloc
+def _r2_allowed_hostnames() -> set[str]:
+    """R2_PUBLIC_URL + R2_LEGACY_PUBLIC_URLS 에서 허용 hostname 추출(비어 있으면 검사하지 않음)."""
+    hosts = set()
+    for raw in [R2_PUBLIC_URL or "", *R2_LEGACY_PUBLIC_URLS.split(",")]:
+        raw = raw.strip().rstrip("/")
+        if raw:
+            hosts.add(_urlparse.urlparse(raw).netloc)
+    return hosts
 
 
 def r2_key_from_url(url: str) -> str:
@@ -165,9 +169,9 @@ def r2_key_from_url(url: str) -> str:
     except Exception as exc:
         raise ValueError(f"Invalid URL: {url!r}") from exc
 
-    allowed = _r2_allowed_hostname()
-    if allowed and parsed.netloc != allowed:
-        raise ValueError(f"R2 domain not allowed: {parsed.netloc!r} (expected {allowed!r})")
+    allowed = _r2_allowed_hostnames()
+    if allowed and parsed.netloc not in allowed:
+        raise ValueError(f"R2 domain not allowed: {parsed.netloc!r} (expected one of {sorted(allowed)!r})")
 
     key = _urlparse.unquote(parsed.path).lstrip("/")
     if not key:
