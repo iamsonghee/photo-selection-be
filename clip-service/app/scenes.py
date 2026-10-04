@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -15,7 +16,9 @@ from typing import Optional
 SCENE_GAP_SECONDS = 3 * 60
 MIN_SCENE_PHOTOS = 10
 MAX_SCENES = 8
-MIN_PHOTOS_FOR_SCENES = 100
+# 골라낸 사진만 올리면(수십 장) 사진 간격이 몇 분씩이라 시간 공백으로 장소 경계를 못 찾는다. FE 같은 이름 상수와 같은 값.
+# SCENE_MIN_PHOTOS(env)는 적은 샘플로 장면 분석을 시험할 때만 낮춘다(로컬 clip-service) — 운영에는 두지 않는다.
+MIN_PHOTOS_FOR_SCENES = int(os.getenv("SCENE_MIN_PHOTOS", "100"))
 MIN_TIMED_RATIO = 0.8
 # 이보다 짧은 공백은 "이어진 촬영": 작은 장면은 공백이 더 짧은 이웃에 붙이되, 양쪽(첫·마지막 장면은 한쪽) 공백이
 # 모두 이 이상이면 작아도 따로 둔다(입장·케이크 커팅처럼 짧은 장면). 같은 이름 장면 병합도 이 공백 미만일 때만(한쪽이 작은 장면이면 공백 무관).
