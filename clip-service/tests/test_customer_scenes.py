@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from app.customer_ai import merge_same_named
+from app.customer_ai import absorb_placeless, merge_same_named
 from app.scenes import split_scenes
 
 
@@ -35,7 +35,7 @@ def test_golden_scene_cases(case):
             photos.append({"id": f"c{len(photos)}", "order_index": len(photos), "taken_at_source": source,
                            "taken_at": f"2026-10-03T{t // 3600:02}:{t // 60 % 60:02}:{t % 60:02}"})
     photos += [{"id": f"c{len(photos) + i}", "order_index": len(photos) + i, "taken_at": None} for i in range(case.get("untimed", 0))]
-    scenes = split_scenes(photos)
+    scenes = split_scenes(photos, case.get("gapSeconds", 180))
     assert (None if scenes is None else [len(scene) for scene in scenes]) == case["expected"]
 
 
@@ -135,3 +135,20 @@ def test_repeated_names_get_numbers_in_order():
     from app.customer_ai import number_repeated
     assert number_repeated(["야외", "실내·카페", "야외", "기타 장면", "기타 장면", None]) == \
         ["야외 1", "실내·카페", "야외 2", "기타 장면", "기타 장면", None]
+
+
+def test_small_placeless_scene_joins_closer_neighbor():
+    # 디테일 10장(11:00) ─5분─ 거실 30장 ─30분─ 침실 → 디테일은 거실로. 큰 클로즈업·떨어진 기타 장면·이름 없는 장면은 그대로.
+    detail, living, bedroom = _photos([(11, 0, 10)]), _photos([(11, 8, 30)]), _photos([(12, 0, 30)])
+    for scene, prefix in zip((detail, living, bedroom), "dlb"):
+        for photo in scene:
+            photo["id"] = prefix + photo["id"]
+    scenes, names = absorb_placeless([detail, living, bedroom], ["클로즈업·디테일", "거실", "침실·침대"])
+    assert names == ["거실", "침실·침대"] and [len(scene) for scene in scenes] == [40, 30]
+    scenes, names = absorb_placeless([detail, living, bedroom], ["거실", "기타 장면", "침실·침대"])
+    assert names == ["거실", "기타 장면", "침실·침대"]  # 30장 — 작지 않음
+    far = _photos([(13, 0, 5)])
+    assert absorb_placeless([bedroom, far], ["침실·침대", "기타 장면"])[1] == ["침실·침대", "기타 장면"]  # 공백 10분 이상
+    assert absorb_placeless([detail, living], ["기타 장면", None])[1] == ["기타 장면", None]
+    scenes, names = merge_same_named(*absorb_placeless([detail, living], ["기타 장면", "거실"]))
+    assert names == ["거실"] and len(scenes[0]) == 40

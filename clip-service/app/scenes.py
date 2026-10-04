@@ -69,8 +69,9 @@ def _merge_small(ranges: list[list[dict]]) -> list[list[dict]]:
     return ranges
 
 
-def split_scenes(photos: list[dict]) -> Optional[list[list[dict]]]:
+def split_scenes(photos: list[dict], gap_seconds: float = SCENE_GAP_SECONDS) -> Optional[list[list[dict]]]:
     """photos: {"id", "order_index", "taken_at", "taken_at_source"}. 반환: 장면별 사진 목록(시간순, 촬영 시각 없는 사진은 맨 끝 장면).
+    gap_seconds: 이 이상 공백에서 나눈다 — 촬영 종류별 값(FE 카탈로그, 예: 홈스냅은 방을 옮겨도 1~2분만 쉰다).
     장면으로 나눌 근거가 부족하면(사진이 적거나 촬영 시각 대부분이 없으면) None."""
     timed = [photo for photo in photos if _time(scene_taken_at(photo))]
     if len(photos) < MIN_PHOTOS_FOR_SCENES or len(timed) < len(photos) * MIN_TIMED_RATIO:
@@ -80,7 +81,7 @@ def split_scenes(photos: list[dict]) -> Optional[list[list[dict]]]:
     gaps = [(index, (_time(scene_taken_at(photo)) - _time(scene_taken_at(ordered[index - 1]))).total_seconds())
             for index, photo in enumerate(ordered) if index > 0]
     cuts = sorted(index for index, _ in sorted(
-        [item for item in gaps if item[1] >= SCENE_GAP_SECONDS], key=lambda item: -item[1])[:MAX_SCENES - 1])
+        [item for item in gaps if item[1] >= gap_seconds], key=lambda item: -item[1])[:MAX_SCENES - 1])
 
     bounds = [0, *cuts, len(ordered)]
     ranges = _merge_small([ordered[a:b] for a, b in zip(bounds, bounds[1:])])

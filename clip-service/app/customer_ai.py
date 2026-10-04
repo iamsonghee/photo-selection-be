@@ -27,6 +27,10 @@ from app.scenes import CLOSE_GAP_SECONDS, MIN_SCENE_PHOTOS, SCENE_SETTINGS, scen
 
 logger = logging.getLogger(__name__)
 OTHER_SCENE = "기타 장면"
+# 장소를 알 수 없는 이름 — 작으면 이웃 장면에 붙인다(`absorb_placeless`). "클로즈업·디테일"은 FE 홈스냅 카탈로그 이름과 같아야 한다.
+PLACELESS_SCENES = {OTHER_SCENE, "클로즈업·디테일"}
+# 이보다 적은 장소 없는 장면만 이웃에 붙인다 — 큰 디테일 컷 묶음은 따로 둔다(2026-10-05 홈스냅: 워밍업 디테일 컷 10장).
+PLACELESS_ABSORB_PHOTOS = 20
 # 셀프 고객 판정은 인물 구성(people)까지 묻는 별도 프롬프트라 버전을 따로 둔다 — 작가 판정 캐시와 섞이지 않게.
 CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
 SCENE_SAMPLE_PHOTOS = 3
@@ -223,6 +227,31 @@ def merge_same_named(scenes: list[list[dict]], names: list[Optional[str]]) -> tu
     return merged, merged_names
 
 
+def absorb_placeless(scenes: list[list[dict]], names: list[Optional[str]]) -> tuple[list[list[dict]], list[Optional[str]]]:
+    """장소 없는 작은 장면(기타 장면·클로즈업, PLACELESS_ABSORB_PHOTOS 미만)을 공백이 더 짧은 이웃 장면(CLOSE_GAP 미만)에
+    붙이고 이웃 이름을 따른다 — 배경 없는 디테일 컷은 사진만으로 장소를 못 고르지만(같은 사진에 답이 흔들림) 바로 앞뒤에서
+    이어 찍은 것이라 그 장소다. 이웃도 장소 없는 장면이거나 이름이 없으면(촬영 시각 없는 장면) 붙이지 않는다."""
+    scenes, names = list(scenes), list(names)
+    absorbed = True
+    while absorbed:
+        absorbed = False
+        for i, (scene, name) in enumerate(zip(scenes, names)):
+            if name not in PLACELESS_SCENES or len(scene) >= PLACELESS_ABSORB_PHOTOS:
+                continue
+            gaps = [(scene_gap(scenes[j], scene) if j < i else scene_gap(scene, scenes[j]), j) for j in (i - 1, i + 1)
+                    if 0 <= j < len(scenes) and names[j] is not None and names[j] not in PLACELESS_SCENES]
+            gaps = [item for item in gaps if item[0] < CLOSE_GAP_SECONDS]
+            if not gaps:
+                continue
+            j = min(gaps)[1]
+            lo = min(i, j)
+            scenes[lo:lo + 2] = [scenes[lo] + scenes[lo + 1]]
+            names[lo:lo + 2] = [names[j]]
+            absorbed = True
+            break
+    return scenes, names
+
+
 def number_repeated(names: list[Optional[str]]) -> list[Optional[str]]:
     """같은 이름이 (합치지 않고) 두 번 이상 남으면 순서대로 번호를 붙인다 — "야외", "야외" → "야외 1", "야외 2".
     순서 정보는 모델이 아니라 여기서 붙인다(모델은 사진으로 보이는 이름만 고른다). 기타 장면·이름 없음은 그대로."""
@@ -277,25 +306,25 @@ def _replace_scenes(db, project_id: str, scenes: list[list[dict]], names: list[O
             db.table("customer_photos").update({"scene_id": saved["id"]}).in_("id", ids[start:start + 200]).execute()
 
 
-async def run_scene(run_id: str, project_id: str, scene_names: Optional[list[str]] = None):
+async def run_scene(run_id: str, project_id: str, scene_names: Optional[list[str]] = None, gap_seconds: Optional[int] = None):
     db = get_supabase()
     async with _heartbeat(db, run_id):
-        await _run_scene(db, run_id, project_id, scene_names)
+        await _run_scene(db, run_id, project_id, scene_names, gap_seconds or SCENE_SETTINGS["gapSeconds"])
 
 
-async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[list[str]]):
+async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[list[str]], gap_seconds: int):
     """장면 정리: 촬영 시각 공백으로 나누고(이름 목록이 있으면 장면당 대표 사진 몇 장으로 이름을 붙여) 저장한다.
     전체 사진 임베딩이 필요 없어 유사컷 분석과 따로 돈다. 진행 수는 이름 붙일 장면 수 기준.
     이름 붙이기(Gemini·다운로드)를 다 끝낸 뒤에 기존 장면을 바꾼다 — 도중에 서비스가 재시작돼도 기존 장면은 남는다.
     나눌 근거가 없으면(사진이 적거나 촬영 시각 대부분이 없으면) 장면을 지운다."""
-    settings = {**SCENE_SETTINGS, "catalog": scene_names or [], "nameModel": GEMINI_FLASH_MODEL,
+    settings = {**SCENE_SETTINGS, "gapSeconds": gap_seconds, "catalog": scene_names or [], "nameModel": GEMINI_FLASH_MODEL,
                 "namePromptVersion": SCENE_NAME_PROMPT_VERSION, "sampleSelection": "quality+similarity-dedupe",
-                "repeatedNames": "numbered"}
+                "repeatedNames": "numbered", "absorbPlaceless": PLACELESS_ABSORB_PHOTOS}
     try:
         rows = capture_order(_all_rows(lambda: db.table("customer_photos")
                                        .select("id,order_index,preview_url,taken_at,taken_at_source,similarity_group_id")
                                        .eq("project_id", project_id).order("id")))
-        scenes = split_scenes(rows) or []
+        scenes = split_scenes(rows, gap_seconds) or []
         names: list[Optional[str]] = [None] * len(scenes)
         to_name = [index for index, scene in enumerate(scenes) if scene_names and scene_taken_at(scene[0])]
         tick = _progress(db, run_id, len(to_name), 0, settings=settings, every=1)
@@ -312,7 +341,7 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
                 failed += name is None
                 names[index] = name or OTHER_SCENE
                 tick()
-            scenes, names = merge_same_named(scenes, names)
+            scenes, names = merge_same_named(*absorb_placeless(scenes, names))
             names = number_repeated(names)
         _ensure_running(db, run_id)
         _replace_scenes(db, project_id, scenes, names)

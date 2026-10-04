@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from postgrest.exceptions import APIError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app import analyzer, customer_ai, gemini_analyzer, gemini_matcher, gemini_quality_analyzer, state
 from app import gemini_state, gemini_quality_state
@@ -41,6 +41,8 @@ class CustomerAnalyzeRequest(BaseModel):
     project_id: str
     # 촬영 종류별 장면 이름 목록(FE가 관리). 장면 정리(kind=scene)에서 주면 장면에 이름을 붙인다.
     scene_names: list[str] | None = None
+    # 촬영 종류별 장면 경계 공백(초, FE 카탈로그). 없으면 기본값(scenes.SCENE_GAP_SECONDS).
+    scene_gap_seconds: int | None = Field(default=None, ge=30, le=1800)
 
 
 class AnalyzeGeminiRequest(BaseModel):
@@ -110,7 +112,7 @@ def analyze_customer(kind: str, req: CustomerAnalyzeRequest, background_tasks: B
         current = _latest_customer_run(db, req.project_id, kind)
         raise HTTPException(status_code=409, detail={"error": "already_processing", "run_id": current and current["id"]})
     if kind == "scene":
-        background_tasks.add_task(customer_ai.run_scene, run["id"], req.project_id, req.scene_names)
+        background_tasks.add_task(customer_ai.run_scene, run["id"], req.project_id, req.scene_names, req.scene_gap_seconds)
     elif kind == "similarity":
         background_tasks.add_task(customer_ai.run_similarity, run["id"], req.project_id)
     else:
