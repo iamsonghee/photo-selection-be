@@ -12,7 +12,7 @@ from datetime import date
 from typing import Optional
 from uuid import UUID
 
-ADMIN_EMAILS = ["realsong88@gmail.com", "hilee6461@gmail.com"]
+ADMIN_EMAILS = ["realsong88@gmail.com", "hilee6461@gmail.com", "ych2174@gmail.com"]
 
 # 베타 사용자 기본 한도(override 없음, 전원 동일) — app_settings 조회 실패 시 폴백
 DEFAULT_BETA_MAX_PHOTOS_PER_PROJECT = 2000
