@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
+from app.beta_policy import ADMIN_EMAILS
 from app.database import get_supabase
 from app.dependencies import verify_supabase_jwt
 from app.env_utils import env_int
@@ -64,6 +65,16 @@ def _get_customer_account_photo_count(supabase, owner_id: str) -> int:
         .execute()
     )
     return sum(max(0, int(row.get("photo_count") or 0)) for row in (result.data or []))
+
+
+def _customer_photo_limit(supabase, owner_id: str) -> Optional[int]:
+    """계정 전체 사진 한도. 관리자(ADMIN_EMAILS)는 무제한(None) — DB 트리거·FE 이용량도 같은 기준."""
+    try:
+        email = supabase.auth.admin.get_user_by_id(owner_id).user.email
+    except Exception as e:
+        logger.warning("customer owner email lookup failed: %s", e)
+        email = None
+    return None if email in ADMIN_EMAILS else MAX_PHOTOS_PER_CUSTOMER_ACCOUNT
 
 
 def _require_photo_set_mutable(project: dict) -> None:
@@ -238,15 +249,16 @@ async def upload_customer_photos(
     already_saved = _existing_photo_ids(supabase, project_id, photo_ids)
     new_count = len(files) - sum(photo_id in already_saved for photo_id in photo_ids)
 
-    account_photo_count = _get_customer_account_photo_count(supabase, project["owner_id"])
-    remaining = max(0, MAX_PHOTOS_PER_CUSTOMER_ACCOUNT - account_photo_count)
-    if new_count > remaining:
-        raise HTTPException(
-            status_code=403,
-            detail={"error": "limit_exceeded", "max": MAX_PHOTOS_PER_CUSTOMER_ACCOUNT,
-                    "remaining": remaining,
-                    "message": f"{new_count}장을 선택했어요. 셀프 고객 전체 한도에서 {remaining}장까지 추가할 수 있습니다. 파일을 다시 선택해 주세요."},
-        )
+    limit = _customer_photo_limit(supabase, project["owner_id"])
+    if limit is not None:
+        remaining = max(0, limit - _get_customer_account_photo_count(supabase, project["owner_id"]))
+        if new_count > remaining:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "limit_exceeded", "max": limit,
+                        "remaining": remaining,
+                        "message": f"{new_count}장을 선택했어요. 셀프 고객 전체 한도에서 {remaining}장까지 추가할 수 있습니다. 파일을 다시 선택해 주세요."},
+            )
 
     marks["authorized"] = time.perf_counter()
     # (files 내 위치, contents, 원본 파일명, (taken_at, taken_at_source), photo_id). 실패 보고는 위치로 한다 — 이름은 겹칠 수 있다.
@@ -363,7 +375,7 @@ async def upload_customer_photos(
                 status_code=403,
                 detail={"error": "limit_exceeded", "max": MAX_PHOTOS_PER_CUSTOMER_ACCOUNT,
                         "remaining": remaining,
-                        "message": f"다른 업로드가 먼저 완료되어 전체 한도에 도달했어요. 현재 {remaining}장까지 추가할 수 있습니다."},
+                        "message": f"전체 사진 한도({MAX_PHOTOS_PER_CUSTOMER_ACCOUNT:,}장)를 넘어 이번 사진을 올리지 못했어요. 지금은 {remaining:,}장까지 더 올릴 수 있어요."},
             ) from e
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e
 

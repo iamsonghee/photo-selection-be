@@ -27,6 +27,16 @@ class CustomerUploadTest(unittest.TestCase):
             customer_upload._log_upload_timing("p1", 2, 2, 0, 0, slow, {"resize": [], "r2": []})
         self.assertEqual(logged.records[0].levelname, "WARNING")
 
+    def test_admin_owner_has_no_photo_limit(self):
+        supabase = MagicMock()
+        supabase.auth.admin.get_user_by_id.return_value.user.email = customer_upload.ADMIN_EMAILS[0]
+        self.assertIsNone(customer_upload._customer_photo_limit(supabase, "owner"))
+        supabase.auth.admin.get_user_by_id.return_value.user.email = "someone@example.com"
+        self.assertEqual(customer_upload._customer_photo_limit(supabase, "owner"), customer_upload.MAX_PHOTOS_PER_CUSTOMER_ACCOUNT)
+        # 이메일 조회 실패 시 무제한으로 열지 않는다.
+        supabase.auth.admin.get_user_by_id.side_effect = RuntimeError("down")
+        self.assertEqual(customer_upload._customer_photo_limit(supabase, "owner"), customer_upload.MAX_PHOTOS_PER_CUSTOMER_ACCOUNT)
+
     def test_taken_at_ignores_missing_or_invalid_payload(self):
         self.assertEqual(customer_upload._parse_taken_at(None, 2), [None, None])
         self.assertEqual(customer_upload._parse_taken_at("not json", 1), [None])

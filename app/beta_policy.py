@@ -5,7 +5,8 @@
 FE의 /admin/settings에서 관리자가 값을 바꾸면 재배포 없이 즉시 반영된다.
 아래 DEFAULT_* 상수는 그 테이블 조회가 실패했을 때만 쓰는 폴백 값이다.
 
-ADMIN_EMAILS는 photo-selection-fe/src/lib/admin-emails.ts의 ADMIN_EMAILS와 반드시 같은 값을 유지할 것
+ADMIN_EMAILS는 photo-selection-fe/src/lib/admin-emails.ts의 ADMIN_EMAILS, 그리고 DB 함수
+enforce_customer_account_photo_limit(셀프 고객 사진 한도 관리자 제외)의 목록과 반드시 같은 값을 유지할 것
 (이 값은 이번 설정 실시간화 범위에서 제외 — 여전히 하드코딩 유지).
 """
 from datetime import date
