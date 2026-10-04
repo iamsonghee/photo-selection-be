@@ -40,7 +40,7 @@ def test_golden_scene_cases(case):
 
 
 def test_untimed_photos_go_last_in_upload_order():
-    photos = _photos([(11, 0, 30)]) + [{"id": f"x{i}", "order_index": 99 - i, "taken_at": None} for i in range(2)]
+    photos = _photos([(11, 0, 100)]) + [{"id": f"x{i}", "order_index": 99 - i, "taken_at": None} for i in range(2)]
     assert [photo["id"] for photo in split_scenes(photos)[-1]] == ["x1", "x0"]
 
 
@@ -105,7 +105,7 @@ def _fake_scene_run(monkeypatch, rows, status="processing", name="하객", flagg
 
 def test_scenes_are_replaced_only_after_naming_and_only_by_the_current_run(monkeypatch):
     # 기존 장면은 이름 붙이기(오래 걸림)가 끝난 뒤에 지운다. 멈춘 것으로 닫힌 실행은 장면을 건드리지 않는다.
-    rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 30), (11, 40, 30)])]
+    rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 50), (11, 40, 50)])]
     events, done = _fake_scene_run(monkeypatch, rows)
     assert events.index("delete") > max(i for i, event in enumerate(events) if event == "name")
     assert events.count("tick") == 2  # 진행 수 = 이름 붙일 장면 수
@@ -116,7 +116,7 @@ def test_scenes_are_replaced_only_after_naming_and_only_by_the_current_run(monke
 
 
 def test_failed_naming_is_counted_and_saved_as_other(monkeypatch):
-    rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 30), (11, 40, 30)])]
+    rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 50), (11, 40, 50)])]
     _, done = _fake_scene_run(monkeypatch, rows, name=None)
     assert {key: done[key] for key in ("total", "processed", "failed", "error")} == {"total": 2, "processed": 0, "failed": 2, "error": None}
 
@@ -152,3 +152,9 @@ def test_small_placeless_scene_joins_closer_neighbor():
     assert absorb_placeless([detail, living], ["기타 장면", None])[1] == ["기타 장면", None]
     scenes, names = merge_same_named(*absorb_placeless([detail, living], ["기타 장면", "거실"]))
     assert names == ["거실"] and len(scenes[0]) == 40
+    # 사진이 적은 프로젝트: 15장 기타 장면은 15장 야외의 절반 이상이라 붙이지 않는다(2026-10-05 30장 홈스냅에서 침실이 야외로 먹힘).
+    bed, outdoor = _photos([(11, 0, 15)]), _photos([(11, 12, 15)])
+    for scene, prefix in zip((bed, outdoor), "bo"):
+        for photo in scene:
+            photo["id"] = prefix + photo["id"]
+    assert absorb_placeless([bed, outdoor], ["기타 장면", "야외·산책"])[1] == ["기타 장면", "야외·산책"]

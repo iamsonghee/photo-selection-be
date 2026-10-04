@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 OTHER_SCENE = "기타 장면"
 # 장소를 알 수 없는 이름 — 작으면 이웃 장면에 붙인다(`absorb_placeless`). "클로즈업·디테일"은 FE 홈스냅 카탈로그 이름과 같아야 한다.
 PLACELESS_SCENES = {OTHER_SCENE, "클로즈업·디테일"}
-# 이보다 적은 장소 없는 장면만 이웃에 붙인다 — 큰 디테일 컷 묶음은 따로 둔다(2026-10-05 홈스냅: 워밍업 디테일 컷 10장).
+# 이보다 적고 붙을 이웃의 절반보다 작은 장소 없는 장면만 이웃에 붙인다 — 큰 디테일 컷 묶음은 따로 둔다(2026-10-05 홈스냅:
+# 워밍업 디테일 컷 10장 → 거실 116장). 이웃 비율 조건이 없으면 사진이 적은 프로젝트(30장)에서 15장짜리 장면이 통째로 옆 장소에 먹힌다.
 PLACELESS_ABSORB_PHOTOS = 20
 # 셀프 고객 판정은 인물 구성(people)까지 묻는 별도 프롬프트라 버전을 따로 둔다 — 작가 판정 캐시와 섞이지 않게.
 CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
@@ -228,7 +229,7 @@ def merge_same_named(scenes: list[list[dict]], names: list[Optional[str]]) -> tu
 
 
 def absorb_placeless(scenes: list[list[dict]], names: list[Optional[str]]) -> tuple[list[list[dict]], list[Optional[str]]]:
-    """장소 없는 작은 장면(기타 장면·클로즈업, PLACELESS_ABSORB_PHOTOS 미만)을 공백이 더 짧은 이웃 장면(CLOSE_GAP 미만)에
+    """장소 없는 작은 장면(기타 장면·클로즈업, PLACELESS_ABSORB_PHOTOS 미만이고 이웃의 절반 미만)을 공백이 더 짧은 이웃 장면(CLOSE_GAP 미만)에
     붙이고 이웃 이름을 따른다 — 배경 없는 디테일 컷은 사진만으로 장소를 못 고르지만(같은 사진에 답이 흔들림) 바로 앞뒤에서
     이어 찍은 것이라 그 장소다. 이웃도 장소 없는 장면이거나 이름이 없으면(촬영 시각 없는 장면) 붙이지 않는다."""
     scenes, names = list(scenes), list(names)
@@ -239,7 +240,8 @@ def absorb_placeless(scenes: list[list[dict]], names: list[Optional[str]]) -> tu
             if name not in PLACELESS_SCENES or len(scene) >= PLACELESS_ABSORB_PHOTOS:
                 continue
             gaps = [(scene_gap(scenes[j], scene) if j < i else scene_gap(scene, scenes[j]), j) for j in (i - 1, i + 1)
-                    if 0 <= j < len(scenes) and names[j] is not None and names[j] not in PLACELESS_SCENES]
+                    if 0 <= j < len(scenes) and names[j] is not None and names[j] not in PLACELESS_SCENES
+                    and len(scene) * 2 < len(scenes[j])]
             gaps = [item for item in gaps if item[0] < CLOSE_GAP_SECONDS]
             if not gaps:
                 continue
@@ -319,7 +321,7 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
     나눌 근거가 없으면(사진이 적거나 촬영 시각 대부분이 없으면) 장면을 지운다."""
     settings = {**SCENE_SETTINGS, "gapSeconds": gap_seconds, "catalog": scene_names or [], "nameModel": GEMINI_FLASH_MODEL,
                 "namePromptVersion": SCENE_NAME_PROMPT_VERSION, "sampleSelection": "quality+similarity-dedupe",
-                "repeatedNames": "numbered", "absorbPlaceless": PLACELESS_ABSORB_PHOTOS}
+                "repeatedNames": "numbered", "absorbPlaceless": {"maxPhotos": PLACELESS_ABSORB_PHOTOS, "maxNeighborRatio": 0.5}}
     try:
         rows = capture_order(_all_rows(lambda: db.table("customer_photos")
                                        .select("id,order_index,preview_url,taken_at,taken_at_source,similarity_group_id")

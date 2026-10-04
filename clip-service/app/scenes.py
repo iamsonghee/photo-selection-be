@@ -15,7 +15,7 @@ from typing import Optional
 SCENE_GAP_SECONDS = 3 * 60
 MIN_SCENE_PHOTOS = 10
 MAX_SCENES = 8
-MIN_PHOTOS_FOR_SCENES = 20
+MIN_PHOTOS_FOR_SCENES = 100
 MIN_TIMED_RATIO = 0.8
 # 이보다 짧은 공백은 "이어진 촬영": 작은 장면은 공백이 더 짧은 이웃에 붙이되, 양쪽(첫·마지막 장면은 한쪽) 공백이
 # 모두 이 이상이면 작아도 따로 둔다(입장·케이크 커팅처럼 짧은 장면). 같은 이름 장면 병합도 이 공백 미만일 때만(한쪽이 작은 장면이면 공백 무관).
