@@ -80,6 +80,7 @@ class OriginalReservationTest(unittest.TestCase):
                     original_filenames=[self.body.filename], original_file_sizes=[self.body.file_size],
                     original_last_modifieds=[self.body.last_modified], original_content_types=[self.body.content_type],
                     source_widths=[100], source_heights=[100], client_upload_ids=[str(self.body.client_upload_id)],
+                    taken_ats=[], taken_at_sources=[],
                     photographer_id=self.photographer,
                 ))
         self.assertEqual(raised.exception.status_code, 409)

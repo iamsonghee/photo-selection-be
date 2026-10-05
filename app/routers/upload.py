@@ -492,6 +492,17 @@ async def presign_original_upload(
     }
 
 
+_TAKEN_AT_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+
+
+def _parse_taken_at(value: str, source: str) -> tuple[Optional[str], Optional[str]]:
+    """브라우저가 원본에서 읽은 촬영 시각("YYYY-MM-DDTHH:mm:ss", 시간대 없음)과 출처("exif" | "file").
+    형식이 틀리면 버린다 — 분석 보조 정보일 뿐이라 업로드를 실패시키지 않는다(customer_upload와 같은 규칙)."""
+    if not value or not _TAKEN_AT_PATTERN.match(value):
+        return None, None
+    return value, source if source in {"exif", "file"} else None
+
+
 @router.post("/photos")
 async def upload_photos(
     project_id: str = Form(...),
@@ -505,6 +516,8 @@ async def upload_photos(
     source_widths: list[int] = Form(default=[]),
     source_heights: list[int] = Form(default=[]),
     client_upload_ids: list[str] = Form(default=[]),
+    taken_ats: list[str] = Form(default=[]),
+    taken_at_sources: list[str] = Form(default=[]),
     photographer_id: UUID = Depends(get_current_photographer),
 ):
     """
@@ -529,6 +542,8 @@ async def upload_photos(
     valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, compressed_filename, file_size)
     # 목록 source metadata + 원본 복구 매칭 메타 (valid와 1:1 대응, original_* Form 필드 기반)
     meta: list[tuple[str, str, Optional[int], Optional[int], Optional[str], Optional[int], Optional[int]]] = []
+    # 원본 촬영 시각 (taken_at, taken_at_source) — valid와 1:1. 지금은 저장만 하고 나중에 이미지 분석에 쓴다.
+    taken: list[tuple[Optional[str], Optional[str]]] = []
     rejected_filenames: list[str] = []
     for i, f in enumerate(files):
         f.filename = _normalize_filename(f.filename)
@@ -568,6 +583,10 @@ async def upload_photos(
             except (ValueError, AttributeError):
                 raise HTTPException(status_code=400, detail="invalid client_upload_id")
         meta.append((orig_fn, orig_ct, orig_sz, orig_lm, client_upload_id, source_width, source_height))
+        taken.append(_parse_taken_at(
+            taken_ats[i] if i < len(taken_ats) else "",
+            taken_at_sources[i] if i < len(taken_at_sources) else "",
+        ))
 
     if not valid:
         raise HTTPException(
@@ -695,7 +714,7 @@ async def upload_photos(
         client_upload_id,
         source_width,
         source_height,
-    ) in zip(results, valid, meta):
+    ), (taken_at, taken_at_source) in zip(results, valid, meta, taken):
         if isinstance(r, Exception):
             logger.error(f"에러내용: {r}")
             logger.warning("process task failed: %s", r)
@@ -721,6 +740,8 @@ async def upload_photos(
                 "source_height": (source_height or decoded_height) if has_source_metadata else None,
                 "source_content_type": (orig_ct or None) if has_source_metadata else None,
                 "source_last_modified": orig_lm if has_source_metadata else None,
+                "taken_at": taken_at,
+                "taken_at_source": taken_at_source,
             }
             if client_upload_id:
                 row["client_upload_id"] = client_upload_id
