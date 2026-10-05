@@ -12,10 +12,14 @@ from datetime import datetime
 from typing import Optional
 
 # 3분: 행사 스냅(돌잔치 등)은 쉬지 않고 찍다가 순서가 바뀔 때만 3~10분 쉰다. 본식처럼 공백이 많으면
-# MAX_SCENES 안에서 큰 공백부터 자르므로 기준이 낮아도 장면이 과하게 쪼개지지 않는다.
+# 장면 상한(max_scenes) 안에서 큰 공백부터 자르므로 기준이 낮아도 장면이 과하게 쪼개지지 않는다.
 SCENE_GAP_SECONDS = 3 * 60
 MIN_SCENE_PHOTOS = 10
-MAX_SCENES = 8
+# 장면 상한: 사진 PHOTOS_PER_SCENE장당 1개(최소 MIN_MAX_SCENES, 최대 MAX_MAX_SCENES). 고정 8개였을 때 1,572장 홈스냅(장소 12곳)이
+# 상한에 막혔다(2026-10-05). 상한은 화면 길이·장면 이름 호출 수 안전장치이고, 실제 경계는 공백 기준이 정한다.
+PHOTOS_PER_SCENE = 40
+MIN_MAX_SCENES = 8
+MAX_MAX_SCENES = 30
 # 골라낸 사진만 올리면(수십 장) 사진 간격이 몇 분씩이라 시간 공백으로 장소 경계를 못 찾는다. FE 같은 이름 상수와 같은 값.
 # SCENE_MIN_PHOTOS(env)는 적은 샘플로 장면 분석을 시험할 때만 낮춘다(로컬 clip-service) — 운영에는 두지 않는다.
 MIN_PHOTOS_FOR_SCENES = int(os.getenv("SCENE_MIN_PHOTOS", "100"))
@@ -26,10 +30,10 @@ CLOSE_GAP_SECONDS = 10 * 60
 # 따로 떨어져 있어도 이보다 적으면(한두 장 튄 사진) 장면으로 두지 않고 가까운 쪽에 붙인다.
 MIN_ISOLATED_PHOTOS = 3
 # 장면 나누기 규칙 버전 — 규칙을 바꾸면 올린다. 실행 settings에 기준값과 함께 남아 검수 채점에서 설정끼리 비교한다.
-SCENE_ALGORITHM_VERSION = "gap-v2"  # v2: 파일 수정 시각 제외, 작은 장면은 가까운 이웃에, 같은 이름은 짧은 공백일 때만
+SCENE_ALGORITHM_VERSION = "gap-v3"  # v2: 파일 수정 시각 제외, 작은 장면은 가까운 이웃에, 같은 이름은 짧은 공백일 때만. v3: 장면 상한을 사진 수에 비례
 SCENE_SETTINGS = {
     "algorithm": SCENE_ALGORITHM_VERSION, "gapSeconds": SCENE_GAP_SECONDS, "minScenePhotos": MIN_SCENE_PHOTOS,
-    "maxScenes": MAX_SCENES, "minPhotos": MIN_PHOTOS_FOR_SCENES, "minTimedRatio": MIN_TIMED_RATIO,
+    "maxScenes": {"photosPerScene": PHOTOS_PER_SCENE, "min": MIN_MAX_SCENES, "max": MAX_MAX_SCENES}, "minPhotos": MIN_PHOTOS_FOR_SCENES, "minTimedRatio": MIN_TIMED_RATIO,
     "closeGapSeconds": CLOSE_GAP_SECONDS, "minIsolatedPhotos": MIN_ISOLATED_PHOTOS, "sameNameMerge": "close-gap-or-small",
 }
 
@@ -51,6 +55,10 @@ def scene_taken_at(photo: dict) -> Optional[str]:
 def scene_gap(before: list[dict], after: list[dict]) -> float:
     """시간순으로 붙은 두 장면 사이 공백(초)."""
     return (_time(scene_taken_at(after[0])) - _time(scene_taken_at(before[-1]))).total_seconds()
+
+
+def max_scenes(photo_count: int) -> int:
+    return min(MAX_MAX_SCENES, max(MIN_MAX_SCENES, photo_count // PHOTOS_PER_SCENE))
 
 
 def _merge_small(ranges: list[list[dict]]) -> list[list[dict]]:
@@ -84,7 +92,7 @@ def split_scenes(photos: list[dict], gap_seconds: float = SCENE_GAP_SECONDS) -> 
     gaps = [(index, (_time(scene_taken_at(photo)) - _time(scene_taken_at(ordered[index - 1]))).total_seconds())
             for index, photo in enumerate(ordered) if index > 0]
     cuts = sorted(index for index, _ in sorted(
-        [item for item in gaps if item[1] >= gap_seconds], key=lambda item: -item[1])[:MAX_SCENES - 1])
+        [item for item in gaps if item[1] >= gap_seconds], key=lambda item: -item[1])[:max_scenes(len(photos)) - 1])
 
     bounds = [0, *cuts, len(ordered)]
     ranges = _merge_small([ordered[a:b] for a, b in zip(bounds, bounds[1:])])
