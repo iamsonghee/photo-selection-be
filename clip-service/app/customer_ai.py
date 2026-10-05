@@ -57,6 +57,9 @@ SCENE_SAMPLE_PHOTOS = 3
 # 장면 이름 프롬프트 버전 — 프롬프트·응답 형식을 바꾸면 올린다(실행 settings에 남아 검수 채점에서 구분).
 SCENE_NAME_PROMPT_VERSION = "v2-confident"
 PAGE_ROWS = 1000  # PostgREST 최대 행 수 — 넘는 조회는 나눠 읽는다(셀프 고객 한도 5,000장)
+# 임베딩은 한 행이 JSON 약 62KB(3,072차원 double)라 1,000행이면 요청 하나가 약 62MB — Postgres가 이 JSON을 쿼리 하나 안에서
+# 만들다 운영 DB가 20분 멈췄다(2026-10-05, 1,285장 재정리). 한 요청 약 6MB로 나눠 읽는다.
+EMBEDDING_PAGE_ROWS = 100
 BATCH_PHOTOS = 40  # 한 번에 내려받아 판정·저장하는 사진 수(메모리: 1200px 미리보기 40장 ≈ 10MB)
 HEARTBEAT_SECONDS = 60
 
@@ -126,13 +129,13 @@ def _ensure_running(db, run_id: str):
         raise _Superseded()
 
 
-def _all_rows(query) -> list[dict]:
-    """query(): 매번 새 조회(정렬 포함)를 만드는 함수. PAGE_ROWS씩 끝까지 읽는다."""
+def _all_rows(query, page_rows: int = PAGE_ROWS) -> list[dict]:
+    """query(): 매번 새 조회(정렬 포함)를 만드는 함수. page_rows씩 끝까지 읽는다."""
     rows: list[dict] = []
     while True:
-        page = query().range(len(rows), len(rows) + PAGE_ROWS - 1).execute().data or []
+        page = query().range(len(rows), len(rows) + page_rows - 1).execute().data or []
         rows += page
-        if len(page) < PAGE_ROWS:
+        if len(page) < page_rows:
             return rows
 
 
@@ -179,7 +182,7 @@ async def _embeddings(db, run_id: str, project_id: str, rows: list[dict], tick=N
         for row in _all_rows(lambda: db.table("customer_ai_embeddings").select("photo_id,embedding")
                              .eq("project_id", project_id).eq("model", GEMINI_EMBEDDING_MODEL)
                              .eq("dimension", GEMINI_EMBEDDING_DIMENSION).eq("version", GEMINI_EMBEDDING_VERSION)
-                             .order("photo_id"))
+                             .order("photo_id"), page_rows=EMBEDDING_PAGE_ROWS)
     }
     missing = [row for row in rows if row["id"] not in stored]
     if tick:
