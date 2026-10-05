@@ -56,7 +56,7 @@ def quality_prompt_version(place_names: Optional[list[str]] = None) -> str:
 SCENE_SAMPLE_PHOTOS = 3
 # 장면 이름 프롬프트 버전 — 프롬프트·응답 형식을 바꾸면 올린다(실행 settings에 남아 검수 채점에서 구분).
 SCENE_NAME_PROMPT_VERSION = "v2-confident"
-PAGE_ROWS = 1000  # PostgREST 최대 행 수 — 넘는 조회는 나눠 읽는다(셀프 고객 한도 2,000장)
+PAGE_ROWS = 1000  # PostgREST 최대 행 수 — 넘는 조회는 나눠 읽는다(셀프 고객 한도 5,000장)
 BATCH_PHOTOS = 40  # 한 번에 내려받아 판정·저장하는 사진 수(메모리: 1200px 미리보기 40장 ≈ 10MB)
 HEARTBEAT_SECONDS = 60
 

@@ -29,7 +29,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # 1차 범위 상한(사용자 결정) — 등급별 쿼터 테이블 없이 상수 하나로 충분하다(YAGNI).
-MAX_PHOTOS_PER_CUSTOMER_ACCOUNT = 2000
+MAX_PHOTOS_PER_CUSTOMER_ACCOUNT = 5000
 
 UPLOAD_CONCURRENCY = env_int("CUSTOMER_UPLOAD_CONCURRENCY", 5, 1, 12)
 IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
@@ -393,7 +393,7 @@ async def upload_customer_photos(
 
 
 # PostgREST는 `in.(...)` 목록을 URL에 싣는다 — 사진 ID 약 600개(≈24KB)를 넘으면 400으로 거절해
-# 전체 선택 삭제(최대 2000장)가 실패했다. 목록 조회·삭제는 이 크기로 나눠 보낸다.
+# 전체 선택 삭제(최대 5,000장)가 실패했다. 목록 조회·삭제는 이 크기로 나눠 보낸다.
 ID_CHUNK = 200
 
 
