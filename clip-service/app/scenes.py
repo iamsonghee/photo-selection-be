@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from datetime import datetime
 from typing import Optional
 
@@ -101,3 +102,66 @@ def split_scenes(photos: list[dict], gap_seconds: float = SCENE_GAP_SECONDS) -> 
     if untimed:
         ranges.append(untimed)
     return ranges
+
+
+# 장소 기준 장면(홈스냅): 사진마다 판정한 장소가 바뀌는 곳에서 나눈다 — 방을 쉬지 않고 옮기면 시간 공백으로는 못 잡는다.
+# 라벨은 앞뒤 PLACE_WINDOW장 다수결로 고르고, PLACE_MIN_RUN장보다 짧은 구간은 긴 이웃에 붙인다(한두 장 오판정이 장면을 쪼개지 않게).
+# 2026-10-05 실촬영 두 건(459장·1,572장)을 4장마다 판정한 실험(창 7·최소 3 → 사진 기준 약 29장·12장)에서 정한 값이다.
+PLACE_WINDOW = 29
+PLACE_MIN_RUN = 12
+
+
+def split_by_place(photos: list[dict], places: dict[str, Optional[str]], placeless: set[str],
+                   fallback_name: str) -> Optional[tuple[list[list[dict]], list[Optional[str]]]]:
+    """photos: split_scenes와 같은 형식. places: 사진 ID → 판정한 장소(없으면 판정 안 됨). placeless: 장소를 알 수 없다는 라벨.
+    CLOSE_GAP 이상 시간 공백은 장소와 상관없이 항상 나눈다(저녁 식당처럼 짧아도 따로 이동한 경우).
+    반환: (장면별 사진, 장면 이름 = 장소). 장면 근거가 부족하거나(split_scenes와 같은 기준) 장소 판정이 촬영 시각 있는 사진의
+    MIN_TIMED_RATIO보다 적으면 None — 시간 기준으로 나눈다."""
+    timed = [photo for photo in photos if _time(scene_taken_at(photo))]
+    if len(photos) < MIN_PHOTOS_FOR_SCENES or len(timed) < len(photos) * MIN_TIMED_RATIO:
+        return None
+    if sum(bool(places.get(photo["id"])) and places[photo["id"]] not in placeless for photo in timed) < len(timed) * MIN_TIMED_RATIO:
+        return None
+    ordered = sorted(timed, key=lambda photo: (_time(scene_taken_at(photo)), photo["order_index"]))
+    cuts = [i for i in range(1, len(ordered)) if scene_gap(ordered[i - 1:i], ordered[i:i + 1]) >= CLOSE_GAP_SECONDS]
+    scenes: list[list[dict]] = []
+    names: list[Optional[str]] = []
+    # 공백 사이에 한두 장만 남은 덩어리는 시간 기준과 같은 규칙으로 가까운 쪽에 붙인다.
+    for block in _merge_small([ordered[a:b] for a, b in zip([0, *cuts], [*cuts, len(ordered)])]):
+        known = [places.get(photo["id"]) if places.get(photo["id"]) not in placeless else None for photo in block]
+        if not any(known):
+            scenes.append(block)
+            names.append(fallback_name)
+            continue
+        filled, last = [], next(label for label in known if label)
+        for label in known:  # 판정 없음·장소 없음은 바로 앞 장소를 따른다(맨 앞은 처음 나오는 장소)
+            last = label or last
+            filled.append(last)
+        half = PLACE_WINDOW // 2
+        smooth = [Counter(filled[max(0, i - half):i + half + 1]).most_common(1)[0][0] for i in range(len(filled))]
+        runs: list[list] = []  # [시작, 끝(미포함), 장소]
+        for i, label in enumerate(smooth):
+            if runs and runs[-1][2] == label:
+                runs[-1][1] = i + 1
+            else:
+                runs.append([i, i + 1, label])
+        while len(runs) > 1 and min(end - start for start, end, _ in runs) < PLACE_MIN_RUN:
+            k = min(range(len(runs)), key=lambda i: runs[i][1] - runs[i][0])
+            j = max((i for i in (k - 1, k + 1) if 0 <= i < len(runs)), key=lambda i: runs[i][1] - runs[i][0])
+            lo, hi = min(k, j), max(k, j)
+            runs[lo:hi + 1] = [[runs[lo][0], runs[hi][1], runs[j][2]]]
+            merged: list[list] = []
+            for run in runs:
+                if merged and merged[-1][2] == run[2]:
+                    merged[-1][1] = run[1]
+                else:
+                    merged.append(run)
+            runs = merged
+        for start, end, label in runs:
+            scenes.append(block[start:end])
+            names.append(label)
+    untimed = sorted((photo for photo in photos if not _time(scene_taken_at(photo))), key=lambda photo: photo["order_index"])
+    if untimed:
+        scenes.append(untimed)
+        names.append(None)
+    return scenes, names

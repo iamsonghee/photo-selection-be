@@ -9,10 +9,10 @@ API 키와 이미지 바이트, 판정 원문(raw_response)은 절대 로그에 
 import asyncio
 import logging
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 from google.genai import types
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, create_model
 
 from app.config import (
     GEMINI_CUSTOMER_QUALITY_SERVICE_TIER,
@@ -85,6 +85,24 @@ _CUSTOMER_PROMPT = _PROMPT.replace("주어진 JSON 스키마 형식으로만 응
 주어진 JSON 스키마 형식으로만 응답하세요.""")
 
 
+UNKNOWN_PLACE = "알 수 없음"
+
+
+def customer_schema(place_names: Optional[list[str]] = None):
+    """셀프 고객 판정 스키마·프롬프트. place_names가 있으면 사진을 찍은 장소(목록 중 하나 또는 UNKNOWN_PLACE)도 묻는다 —
+    홈스냅 장면을 장소가 바뀌는 곳에서 나누기 위함. 같은 호출에 붙여 사진을 한 번만 보낸다(입력 토큰 +약 9%)."""
+    if not place_names:
+        return CustomerPhotoAssessment, _CUSTOMER_PROMPT
+    places = [*place_names, UNKNOWN_PLACE]
+    schema = create_model("CustomerPlaceAssessment", __base__=CustomerPhotoAssessment, place=(Literal[tuple(places)], ...))
+    end = "주어진 JSON 스키마 형식으로만 응답하세요."
+    prompt = _CUSTOMER_PROMPT.replace(end, f"""- place: 이 사진을 찍은 장소를 배경을 보고 목록 중 하나로 고르세요. 배경이 거의 안 보여 장소를 알 수 없으면 "{UNKNOWN_PLACE}".
+  목록: {", ".join(places)}
+
+{end}""")
+    return schema, prompt
+
+
 # ponytail: 운영(Python 3.11)의 SDK는 service_tier를 받지만 로컬 Python 3.9용 SDK(1.47)에는 없다 — 없으면 표준으로 보낸다.
 _SUPPORTS_SERVICE_TIER = "service_tier" in types.GenerateContentConfig.model_fields
 
@@ -121,8 +139,9 @@ def sum_usage(usages: list[dict], stats: Optional[dict] = None) -> dict:
     }
 
 
-async def _assess_one(client, image_bytes: bytes, mime_type: str, customer: bool = False, stats: Optional[dict] = None):
-    schema, prompt = (CustomerPhotoAssessment, _CUSTOMER_PROMPT) if customer else (PhotoQualityAssessment, _PROMPT)
+async def _assess_one(client, image_bytes: bytes, mime_type: str, customer: bool = False, stats: Optional[dict] = None,
+                      place_names: Optional[list[str]] = None):
+    schema, prompt = customer_schema(place_names) if customer else (PhotoQualityAssessment, _PROMPT)
     tier = {"service_tier": GEMINI_CUSTOMER_QUALITY_SERVICE_TIER} if customer and _SUPPORTS_SERVICE_TIER else {}
     flex = tier.get("service_tier") == "flex"
     stats = stats if stats is not None else {}
@@ -167,6 +186,7 @@ async def assess_images(
     on_each: Optional[Callable[[], None]] = None,
     customer: bool = False,
     stats: Optional[dict] = None,
+    place_names: Optional[list[str]] = None,
 ) -> tuple[list[Optional[PhotoQualityAssessment]], list[dict]]:
     """순서를 보존하며 이미지별 품질 판정. 다운로드 실패(None) 또는 판정 실패 항목은 None.
     반환: (판정 리스트, 실제 usage_metadata 리스트)."""
@@ -181,7 +201,7 @@ async def assess_images(
             return None
         async with sem:
             try:
-                assessment, usage = await _assess_one(client, img, "image/jpeg", customer, stats)
+                assessment, usage = await _assess_one(client, img, "image/jpeg", customer, stats, place_names)
                 if usage:
                     usages.append(usage)
                 return assessment

@@ -43,6 +43,8 @@ class CustomerAnalyzeRequest(BaseModel):
     scene_names: list[str] | None = None
     # 촬영 종류별 장면 경계 공백(초, FE 카탈로그). 없으면 기본값(scenes.SCENE_GAP_SECONDS).
     scene_gap_seconds: int | None = Field(default=None, ge=30, le=1800)
+    # 흔들림 확인(kind=quality)에서 사진마다 장소도 물을 목록(FE 카탈로그, 홈스냅). 있으면 장면을 장소 기준으로 다시 나눈다.
+    place_names: list[str] | None = None
 
 
 class AnalyzeGeminiRequest(BaseModel):
@@ -116,7 +118,7 @@ def analyze_customer(kind: str, req: CustomerAnalyzeRequest, background_tasks: B
     elif kind == "similarity":
         background_tasks.add_task(customer_ai.run_similarity, run["id"], req.project_id)
     else:
-        background_tasks.add_task(customer_ai.run_quality, run["id"], req.project_id)
+        background_tasks.add_task(customer_ai.run_quality, run["id"], req.project_id, req.place_names)
     return {"status": "processing", "run_id": run["id"]}
 
 

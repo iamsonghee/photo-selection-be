@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from app.customer_ai import absorb_placeless, merge_same_named
-from app.scenes import split_scenes
+from app.scenes import split_by_place, split_scenes
 
 
 def _photos(blocks):
@@ -68,7 +68,7 @@ def test_same_named_small_scene_merges_even_after_long_gap():
     assert names == ["하객"] and [len(scene) for scene in scenes] == [15]
 
 
-def _fake_scene_run(monkeypatch, rows, status="processing", name="하객", flagged=()):
+def _fake_scene_run(monkeypatch, rows, status="processing", name="하객", flagged=(), placed=None, cache=()):
     """run_scene을 DB·Gemini 없이 돌린다. 반환: 일어난 일 순서(events)와 _done 호출 인자."""
     import asyncio
     from unittest.mock import MagicMock
@@ -93,6 +93,8 @@ def _fake_scene_run(monkeypatch, rows, status="processing", name="하객", flagg
     monkeypatch.setattr(customer_ai, "get_supabase", lambda: db)
     monkeypatch.setattr(customer_ai, "_all_rows", lambda query: rows)
     monkeypatch.setattr(customer_ai, "_flagged_photos", lambda db, project_id: set(flagged))
+    monkeypatch.setattr(customer_ai, "_place_scenes", lambda *args, **kwargs: placed)
+    monkeypatch.setattr(customer_ai, "_name_cache", lambda *args, **kwargs: dict(cache))
     monkeypatch.setattr(customer_ai, "get_client", fake_client)
     monkeypatch.setattr(customer_ai, "download_all", fake_download)
     monkeypatch.setattr(customer_ai, "_name_scene", fake_name)
@@ -158,3 +160,57 @@ def test_small_placeless_scene_joins_closer_neighbor():
         for photo in scene:
             photo["id"] = prefix + photo["id"]
     assert absorb_placeless([bed, outdoor], ["기타 장면", "야외·산책"])[1] == ["기타 장면", "야외·산책"]
+
+
+def test_scene_run_uses_place_scenes_without_naming_calls(monkeypatch):
+    # 흔들림 확인에서 장소까지 판정했으면(홈스냅) Gemini 이름 호출 없이 장소 기준 장면을 저장한다.
+    rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 50), (11, 40, 50)])]
+    events, done = _fake_scene_run(monkeypatch, rows, placed=([rows[:50], rows[50:]], ["거실", "침실·침대"]))
+    assert "name" not in events and "delete" in events
+    assert {key: done[key] for key in ("total", "processed", "failed", "error")} == {"total": 0, "processed": 0, "failed": 0, "error": None}
+
+
+def _labeled(blocks):
+    """blocks: [(시, 분, 장수, 장소)] — 블록 안 20초 간격. 반환: (사진, 사진 ID → 장소)."""
+    photos = _photos([block[:3] for block in blocks])
+    places, n = {}, 0
+    for *_, count, place in blocks:
+        for photo in photos[n:n + count]:
+            places[photo["id"]] = place
+        n += count
+    return photos, places
+
+
+PLACELESS = {"알 수 없음", "클로즈업·디테일"}
+
+
+def test_split_by_place_cuts_where_place_changes_without_time_gap():
+    # 쉬지 않고 거실(60) → 주방(50) → 서재(40): 시간 공백이 없어도 장소가 바뀐 곳에서 나눈다.
+    photos, places = _labeled([(11, 0, 60, "거실"), (11, 20, 50, "주방·식탁"), (11, 36, 40, "서재·책장")])
+    scenes, names = split_by_place(photos, places, PLACELESS, "기타 장면")
+    assert names == ["거실", "주방·식탁", "서재·책장"] and [len(scene) for scene in scenes] == [60, 50, 40]
+
+
+def test_split_by_place_ignores_stray_labels_and_fills_placeless():
+    # 거실 중간의 오판정 3장·장소 없는 디테일 5장은 장면을 쪼개지 않는다.
+    photos, places = _labeled([(11, 0, 40, "거실"), (11, 14, 3, "침실·침대"), (11, 15, 5, "클로즈업·디테일"), (11, 17, 60, "거실")])
+    scenes, names = split_by_place(photos, places, PLACELESS, "기타 장면")
+    assert names == ["거실"] and len(scenes[0]) == 108
+
+
+def test_split_by_place_always_cuts_long_time_gaps_and_needs_enough_labels():
+    # 30분 떨어진 저녁 식당 11장은 짧아도 따로. 장소 판정이 80% 미만이면 None(시간 기준으로).
+    photos, places = _labeled([(17, 0, 100, "야외·산책"), (18, 0, 11, "식당·카페")])
+    scenes, names = split_by_place(photos, places, PLACELESS, "기타 장면")
+    assert names == ["야외·산책", "식당·카페"] and [len(scene) for scene in scenes] == [100, 11]
+    sparse = {key: value for i, (key, value) in enumerate(places.items()) if i % 2}
+    assert split_by_place(photos, sparse, PLACELESS, "기타 장면") is None
+
+
+def test_rerun_reuses_names_of_unchanged_scenes(monkeypatch):
+    # 지난 정리와 사진 구성이 같은 장면은 이름을 다시 묻지 않는다(바뀐 장면만 Gemini).
+    from app.customer_ai import scene_key
+    rows = [dict(photo, preview_url="u") for photo in _photos([(11, 0, 50), (11, 40, 50)])]
+    events, done = _fake_scene_run(monkeypatch, rows, cache={scene_key(rows[:50]): "돌잡이"})
+    assert events.count("name") == 1 and events.count("tick") == 2
+    assert {key: done[key] for key in ("total", "processed", "failed")} == {"total": 2, "processed": 2, "failed": 0}

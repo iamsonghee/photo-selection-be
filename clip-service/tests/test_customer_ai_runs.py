@@ -26,7 +26,7 @@ def _quality_run(monkeypatch, photo_count, status_after=None, fail_query=False):
         calls["download"].append(len(urls))
         return [b"x" for _ in urls]
 
-    async def assess(images, on_each=None, customer=False, stats=None):
+    async def assess(images, on_each=None, customer=False, stats=None, place_names=None):
         calls["assess"] += 1
         value = SimpleNamespace(eyes_closed=SimpleNamespace(value="ok"), blur_or_shake=SimpleNamespace(value="ok"),
                                 focus_issue=SimpleNamespace(value="ok"), face_occluded=SimpleNamespace(value="ok"),

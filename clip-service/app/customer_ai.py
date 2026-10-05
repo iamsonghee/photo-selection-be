@@ -5,6 +5,8 @@
 사진을 내려받는 실행은 BATCH_PHOTOS장씩 내려받기 → 판정 → 저장하고, 프로세스당 CUSTOMER_AI_HEAVY_RUNS개까지만 동시에 돈다.
 """
 import asyncio
+import hashlib
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -21,9 +23,10 @@ from app.config import (CUSTOMER_AI_HEAVY_RUNS, GEMINI_EMBEDDING_DIMENSION, GEMI
 from app.db import get_supabase
 from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
-from app.gemini_quality_client import _build_usage, assess_images, customer_service_tier, sum_usage
+from app.gemini_quality_client import UNKNOWN_PLACE, _build_usage, assess_images, customer_service_tier, sum_usage
 from app.grouping import group_by_similarity
-from app.scenes import CLOSE_GAP_SECONDS, MIN_SCENE_PHOTOS, SCENE_SETTINGS, scene_gap, scene_taken_at, split_scenes
+from app.scenes import (CLOSE_GAP_SECONDS, MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS, scene_gap, scene_taken_at,
+                        split_by_place, split_scenes)
 
 logger = logging.getLogger(__name__)
 OTHER_SCENE = "기타 장면"
@@ -34,6 +37,22 @@ PLACELESS_SCENES = {OTHER_SCENE, "클로즈업·디테일"}
 PLACELESS_ABSORB_PHOTOS = 20
 # 셀프 고객 판정은 인물 구성(people)까지 묻는 별도 프롬프트라 버전을 따로 둔다 — 작가 판정 캐시와 섞이지 않게.
 CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
+# 장소 기준 장면(홈스냅)에서 실행 settings에 남기는 값 — 시간 기준 장면과 검수 채점에서 구분.
+PLACE_SCENE_SETTINGS = {"boundary": "place", "placeWindow": PLACE_WINDOW, "placeMinRun": PLACE_MIN_RUN, "hardCutSeconds": CLOSE_GAP_SECONDS}
+
+
+def place_list(names: Optional[list[str]]) -> Optional[list[str]]:
+    """장면 이름 목록 중 장소인 것만(클로즈업·디테일 같은 장소 없는 이름은 뺀다 — 장소를 모르면 "알 수 없음"으로 받는다)."""
+    places = [name for name in names or [] if name not in PLACELESS_SCENES]
+    return places or None
+
+
+def quality_prompt_version(place_names: Optional[list[str]] = None) -> str:
+    """장소도 묻는 판정은 장소 목록마다 버전이 다르다 — 목록이 바뀌면 다시 판정한다(같은 목록이면 캐시 재사용)."""
+    if not place_names:
+        return CUSTOMER_QUALITY_PROMPT_VERSION
+    digest = hashlib.sha1(json.dumps(place_names, ensure_ascii=False).encode()).hexdigest()[:8]
+    return f"{CUSTOMER_QUALITY_PROMPT_VERSION}-place-{digest}"
 SCENE_SAMPLE_PHOTOS = 3
 # 장면 이름 프롬프트 버전 — 프롬프트·응답 형식을 바꾸면 올린다(실행 settings에 남아 검수 채점에서 구분).
 SCENE_NAME_PROMPT_VERSION = "v2-confident"
@@ -287,11 +306,56 @@ def pick_samples(scene: list[dict], flagged: set[str], count: int = SCENE_SAMPLE
 
 def _flagged_photos(db, project_id: str) -> set[str]:
     """이미 판정된 사진 중 흔들림·초점·눈 감음이 likely인 사진(대표 사진에서 뺀다)."""
+    # 판정은 사진마다 현재 모델 한 행만 남는다(_run_quality가 정리) — 장소를 묻는 버전도 같은 값을 쓰도록 버전은 거르지 않는다.
     rows = _all_rows(lambda: db.table("customer_quality_assessments").select("photo_id,eyes_closed,blur_or_shake,focus_issue")
-                     .eq("project_id", project_id).eq("model", GEMINI_FLASH_MODEL)
-                     .eq("prompt_version", CUSTOMER_QUALITY_PROMPT_VERSION).order("photo_id"))
+                     .eq("project_id", project_id).eq("model", GEMINI_FLASH_MODEL).order("photo_id"))
     return {row["photo_id"] for row in rows
             if "likely" in (row.get("eyes_closed"), row.get("blur_or_shake"), row.get("focus_issue"))}
+
+
+def _place_scenes(db, project_id: str, place_names: Optional[list[str]], rows: Optional[list[dict]] = None):
+    """흔들림 확인에서 사진마다 판정한 장소로 나눈 장면(이름 = 장소, 반복은 번호). 장소 판정이 없거나 부족하거나(흔들림 확인을
+    껐거나 아직 진행 중) 지금 촬영 종류의 장소 목록과 맞지 않으면(촬영 종류를 바꾼 뒤) None — 시간 기준 장면을 쓴다."""
+    place_names = place_list(place_names)
+    if not place_names:
+        return None
+    labels = {row["photo_id"]: row.get("place") for row in _all_rows(lambda: db.table("customer_quality_assessments")
+              .select("photo_id,place:raw_response->>place").eq("project_id", project_id)
+              .eq("model", GEMINI_FLASH_MODEL).eq("prompt_version", quality_prompt_version(place_names)).order("photo_id"))}
+    if rows is None:
+        rows = _all_rows(lambda: db.table("customer_photos").select("id,order_index,taken_at,taken_at_source")
+                         .eq("project_id", project_id).order("id"))
+    placed = split_by_place(rows, labels, PLACELESS_SCENES | {UNKNOWN_PLACE}, OTHER_SCENE)
+    return placed and (placed[0], number_repeated(placed[1]))
+
+
+def scene_key(scene: list[dict]) -> str:
+    """장면 사진 구성의 짧은 지문 — 다시 정리할 때 구성이 같은 장면은 이름을 다시 묻지 않는다(nameCache)."""
+    return hashlib.sha1(",".join(sorted(photo["id"] for photo in scene)).encode()).hexdigest()[:16]
+
+
+def _name_cache(db, project_id: str, settings: dict) -> dict[str, str]:
+    """최근 완료한 장면 실행이 붙인 이름(장면 지문 → 이름). 이름 목록·모델·프롬프트가 같을 때만 쓴다(바뀌면 다시 묻는다)."""
+    try:
+        data = db.table("customer_ai_runs").select("settings").eq("project_id", project_id).eq("kind", "scene") \
+            .eq("status", "completed").order("created_at", desc=True).limit(1).execute().data
+        previous = data[0]["settings"] if isinstance(data, list) and data else None
+    except Exception as exc:  # 캐시는 비용 절약일 뿐 — 못 읽으면 다시 묻는다
+        logger.warning("scene name cache read failed: %s", exc)
+        return {}
+    if not isinstance(previous, dict) or any(previous.get(key) != settings[key] for key in ("catalog", "nameModel", "namePromptVersion")):
+        return {}
+    cache = previous.get("nameCache")
+    return cache if isinstance(cache, dict) else {}
+
+
+def _mark_place_scenes(db, project_id: str):
+    """흔들림 확인이 장면을 장소 기준으로 바꿨음을 최근 장면 실행 settings에 남긴다 — 검수 화면이 장면을 만든 설정을 그 실행에서 읽는다."""
+    latest = db.table("customer_ai_runs").select("id,settings").eq("project_id", project_id).eq("kind", "scene") \
+        .eq("status", "completed").order("created_at", desc=True).limit(1).execute().data
+    if latest:
+        db.table("customer_ai_runs").update({"settings": {**(latest[0]["settings"] or {}), **PLACE_SCENE_SETTINGS}}) \
+            .eq("id", latest[0]["id"]).execute()
 
 
 def _replace_scenes(db, project_id: str, scenes: list[list[dict]], names: list[Optional[str]]):
@@ -326,27 +390,48 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
         rows = capture_order(_all_rows(lambda: db.table("customer_photos")
                                        .select("id,order_index,preview_url,taken_at,taken_at_source,similarity_group_id")
                                        .eq("project_id", project_id).order("id")))
+        placed = _place_scenes(db, project_id, scene_names, rows)
+        if placed:  # 흔들림 확인에서 장소까지 판정했으면 그걸로 나누고 이름도 붙인다(Gemini 이름 호출 없음)
+            _progress(db, run_id, 0, 0, settings={**settings, **PLACE_SCENE_SETTINGS}, every=1)
+            _ensure_running(db, run_id)
+            _replace_scenes(db, project_id, *placed)
+            _done(db, run_id, 0, 0, 0, usage=sum_usage([]))
+            return
         scenes = split_scenes(rows, gap_seconds) or []
         names: list[Optional[str]] = [None] * len(scenes)
         to_name = [index for index, scene in enumerate(scenes) if scene_names and scene_taken_at(scene[0])]
         tick = _progress(db, run_id, len(to_name), 0, settings=settings, every=1)
         failed = 0
         usages: list[dict] = []
+        named: dict[str, str] = {}  # 이번에 이름을 받은(또는 캐시에서 쓴) 장면 지문 → 이름 — 다음 실행의 캐시
         if to_name:
-            client = await get_client()
-            flagged = _flagged_photos(db, project_id)
+            cache = _name_cache(db, project_id, settings)
+            client = flagged = None
             for index in to_name:
+                key = scene_key(scenes[index])
+                if key in cache:  # 지난 정리와 사진 구성이 같은 장면은 Gemini를 다시 부르지 않는다
+                    names[index] = named[key] = cache[key]
+                    tick()
+                    continue
                 _ensure_running(db, run_id)
+                if client is None:
+                    client, flagged = await get_client(), _flagged_photos(db, project_id)
                 sample = pick_samples(scenes[index], flagged)
                 images = [image for image in await download_all([photo["preview_url"] for photo in sample]) if image]
                 name = await _name_scene(client, images, scene_names, usages) if images else None
                 failed += name is None
                 names[index] = name or OTHER_SCENE
+                if name is not None:
+                    named[key] = name
                 tick()
             scenes, names = merge_same_named(*absorb_placeless(scenes, names))
             names = number_repeated(names)
         _ensure_running(db, run_id)
-        _replace_scenes(db, project_id, scenes, names)
+        # 이름을 붙이는 사이 흔들림 확인(장소 판정)이 끝났으면 장소 기준 장면이 더 정확하다 — 그걸 저장한다.
+        placed = _place_scenes(db, project_id, scene_names, rows)
+        _replace_scenes(db, project_id, *(placed or (scenes, names)))
+        db.table("customer_ai_runs").update({"settings": {**settings, **(PLACE_SCENE_SETTINGS if placed else {}), "nameCache": named}}) \
+            .eq("id", run_id).execute()
         _done(db, run_id, len(to_name), len(to_name) - failed, failed, usage=sum_usage(usages))
     except _Superseded:
         return
@@ -389,15 +474,19 @@ async def _run_similarity(db, run_id: str, project_id: str):
         _done(db, run_id, len(rows), 0, len(rows), str(exc)[:500])
 
 
-async def run_quality(run_id: str, project_id: str):
+async def run_quality(run_id: str, project_id: str, place_names: Optional[list[str]] = None):
     db = get_supabase()
     async with _heartbeat(db, run_id), _heavy_slot():
-        await _run_quality(db, run_id, project_id)
+        await _run_quality(db, run_id, project_id, place_names)
 
 
-async def _run_quality(db, run_id: str, project_id: str):
+async def _run_quality(db, run_id: str, project_id: str, place_names: Optional[list[str]] = None):
     """흔들림·눈 감음·인물 구성 판정. 같은 모델·프롬프트 버전으로 이미 판정한 사진은 다시 부르지 않고(사진을 추가하고
-    다시 정리할 때 새 사진만), 나머지를 BATCH_PHOTOS장씩 내려받아 판정하고 바로 저장한다."""
+    다시 정리할 때 새 사진만), 나머지를 BATCH_PHOTOS장씩 내려받아 판정하고 바로 저장한다.
+    place_names(홈스냅)가 있으면 사진을 찍은 장소도 같은 호출에서 묻고, 끝나면 장면을 장소 기준으로 다시 나눈다 —
+    장면 정리는 기다리지 않고 시간 기준 장면을 먼저 보여주고, 이 판정이 끝나면 더 정확한 장면으로 바뀐다."""
+    place_names = place_list(place_names)
+    version = quality_prompt_version(place_names)
     total = processed = 0
     usages: list[dict] = []
     stats: dict = {}  # 실제 보낸 요청·실패한 요청 수(재시도·타임아웃 포함)
@@ -406,11 +495,11 @@ async def _run_quality(db, run_id: str, project_id: str):
                          .eq("project_id", project_id).order("order_index").order("id"))
         done = {row["photo_id"] for row in _all_rows(lambda: db.table("customer_quality_assessments").select("photo_id")
                 .eq("project_id", project_id).eq("model", GEMINI_FLASH_MODEL)
-                .eq("prompt_version", CUSTOMER_QUALITY_PROMPT_VERSION).order("photo_id"))}
+                .eq("prompt_version", version).order("photo_id"))}
         pending = [row for row in rows if row["id"] not in done]
         total, processed = len(rows), len(rows) - len(pending)
         tick = _progress(db, run_id, total, processed, settings={
-            "model": GEMINI_FLASH_MODEL, "promptVersion": CUSTOMER_QUALITY_PROMPT_VERSION,
+            "model": GEMINI_FLASH_MODEL, "promptVersion": version, "placeNames": place_names or [],
             "serviceTier": customer_service_tier(),
             "timeoutSeconds": GEMINI_FLEX_TIMEOUT_SECONDS if customer_service_tier() == "flex" else GEMINI_QUALITY_TIMEOUT_SECONDS,
             "image": "preview-1200", "batchPhotos": BATCH_PHOTOS})
@@ -418,10 +507,10 @@ async def _run_quality(db, run_id: str, project_id: str):
             batch = pending[start:start + BATCH_PHOTOS]
             _ensure_running(db, run_id)
             images = await download_all([row["preview_url"] for row in batch])
-            assessments, batch_usages = await assess_images(images, on_each=tick, customer=True, stats=stats)
+            assessments, batch_usages = await assess_images(images, on_each=tick, customer=True, stats=stats, place_names=place_names)
             usages += batch_usages
             payload = [{"project_id": project_id, "photo_id": row["id"], "model": GEMINI_FLASH_MODEL,
-                        "prompt_version": CUSTOMER_QUALITY_PROMPT_VERSION,
+                        "prompt_version": version,
                         "eyes_closed": value.eyes_closed.value, "blur_or_shake": value.blur_or_shake.value,
                         "focus_issue": value.focus_issue.value, "face_occluded": value.face_occluded.value,
                         "primary_subject_detected": value.primary_subject_detected, "notes": value.notes,
@@ -434,9 +523,14 @@ async def _run_quality(db, run_id: str, project_id: str):
             processed += len(payload)
         # 사진마다 현재 모델·프롬프트 판정 한 행만 남긴다 — 프로젝트 조회가 사진별로 한 행을 고르므로 남으면 섞인다.
         db.table("customer_quality_assessments").delete().eq("project_id", project_id) \
-            .neq("prompt_version", CUSTOMER_QUALITY_PROMPT_VERSION).execute()
+            .neq("prompt_version", version).execute()
         db.table("customer_quality_assessments").delete().eq("project_id", project_id) \
             .neq("model", GEMINI_FLASH_MODEL).execute()
+        placed = _place_scenes(db, project_id, place_names)
+        if placed:
+            _ensure_running(db, run_id)
+            _replace_scenes(db, project_id, *placed)
+            _mark_place_scenes(db, project_id)
         _done(db, run_id, total, processed, total - processed, usage=sum_usage(usages, stats))
     except _Superseded:
         return
