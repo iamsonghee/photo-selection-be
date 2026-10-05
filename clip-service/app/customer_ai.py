@@ -57,7 +57,7 @@ SCENE_SAMPLE_PHOTOS = 3
 # 장면 이름 프롬프트 버전 — 프롬프트·응답 형식을 바꾸면 올린다(실행 settings에 남아 검수 채점에서 구분).
 SCENE_NAME_PROMPT_VERSION = "v2-confident"
 PAGE_ROWS = 1000  # PostgREST 최대 행 수 — 넘는 조회는 나눠 읽는다(셀프 고객 한도 3,000장)
-# 임베딩은 한 행이 JSON 약 62KB(3,072차원 double)라 1,000행이면 요청 하나가 약 62MB — Postgres가 이 JSON을 쿼리 하나 안에서
+# 임베딩은 3,072차원일 때 한 행이 JSON 약 62KB(지금 기본 768차원은 약 16KB)라 1,000행이면 요청 하나가 약 62MB — Postgres가 이 JSON을 쿼리 하나 안에서
 # 만들다 운영 DB가 20분 멈췄다(2026-10-05, 1,285장 재정리). 한 요청 약 6MB로 나눠 읽는다.
 EMBEDDING_PAGE_ROWS = 100
 BATCH_PHOTOS = 40  # 한 번에 내려받아 판정·저장하는 사진 수(메모리: 1200px 미리보기 40장 ≈ 10MB)
