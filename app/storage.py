@@ -244,18 +244,20 @@ def build_content_disposition(display_name: str) -> str:
     return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
 
 
-def generate_presigned_put_url(key: str, content_type: str, expires: int = PRESIGN_EXPIRES_SECONDS) -> str:
+def generate_presigned_put_url(
+    key: str, content_type: str, expires: int = PRESIGN_EXPIRES_SECONDS, content_length: Optional[int] = None,
+) -> str:
     """브라우저가 R2에 직접 PUT할 수 있는 presigned URL 생성.
     content_type은 브라우저 PUT 요청의 Content-Type 헤더와 정확히 일치해야 한다.
+    content_length를 주면 서명에 포함돼 다른 크기의 PUT은 거절된다(용량 한도 우회 방지).
     """
     if not R2_BUCKET_NAME:
         raise ValueError("R2_BUCKET_NAME must be set in .env")
     client = get_r2_client()
-    return client.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type},
-        ExpiresIn=expires,
-    )
+    params = {"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type}
+    if content_length is not None:
+        params["ContentLength"] = content_length
+    return client.generate_presigned_url("put_object", Params=params, ExpiresIn=expires)
 
 
 def get_r2_object_bytes_sync(key: str) -> bytes:
