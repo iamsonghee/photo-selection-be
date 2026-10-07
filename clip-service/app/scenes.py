@@ -12,6 +12,8 @@ from collections import Counter
 from datetime import datetime
 from typing import Optional
 
+import numpy as np
+
 # 3분: 행사 스냅(돌잔치 등)은 쉬지 않고 찍다가 순서가 바뀔 때만 3~10분 쉰다. 본식처럼 공백이 많으면
 # 장면 상한(max_scenes) 안에서 큰 공백부터 자르므로 기준이 낮아도 장면이 과하게 쪼개지지 않는다.
 SCENE_GAP_SECONDS = 3 * 60
@@ -102,6 +104,38 @@ def split_scenes(photos: list[dict], gap_seconds: float = SCENE_GAP_SECONDS) -> 
     if untimed:
         ranges.append(untimed)
     return ranges
+
+
+# 내용 기준 장면: 촬영 시각이 없으면(포토샵 내보내기 보정본 등 — EXIF에 시각이 빠짐) 업로드 순서(= 파일명 순서)로 늘어놓고
+# 앞뒤 CONTENT_WINDOW장 평균 임베딩의 코사인 유사도가 가장 크게 떨어지는 곳부터 자른다. 2026-10-07 웨딩 스튜디오 2,249장
+# (EXIF 시각 없음)에서 사람이 본 콘셉트·의상·세트 경계 25개 중 23개를 잡았고, 나머지 자른 곳도 같은 콘셉트 안의 세팅 전환이었다.
+# ponytail: 한 프로젝트로 정한 값. 정답 경계 데이터가 더 모이면 기준값을 다시 맞춘다.
+CONTENT_WINDOW = 10
+CONTENT_CUT_SIMILARITY = 0.92
+CONTENT_MIN_SCENE_PHOTOS = 30
+
+
+def split_by_content(photos: list[dict], vectors: list) -> Optional[list[list[dict]]]:
+    """photos: split_scenes와 같은 형식, vectors: 같은 순서의 임베딩(없으면 None). 사진이 적거나 임베딩이 없는 사진이 있으면 None.
+    반환: 업로드 순서 장면 목록."""
+    if len(photos) < MIN_PHOTOS_FOR_SCENES or any(vector is None for vector in vectors):
+        return None
+    order = sorted(range(len(photos)), key=lambda i: photos[i]["order_index"])
+    unit = np.asarray([vectors[i] for i in order], dtype=np.float64)
+    unit /= np.linalg.norm(unit, axis=1, keepdims=True)
+    window = CONTENT_WINDOW
+    scores = []
+    for i in range(window, len(order) - window + 1):
+        before, after = unit[i - window:i].mean(0), unit[i:i + window].mean(0)
+        scores.append((float(before @ after / np.linalg.norm(before) / np.linalg.norm(after)), i))
+    cuts: list[int] = []
+    for score, i in sorted(scores):
+        if score >= CONTENT_CUT_SIMILARITY or len(cuts) >= max_scenes(len(photos)) - 1:
+            break
+        if all(abs(i - cut) >= CONTENT_MIN_SCENE_PHOTOS for cut in (0, *cuts, len(order))):
+            cuts.append(i)
+    bounds = [0, *sorted(cuts), len(order)]
+    return [[photos[order[k]] for k in range(a, b)] for a, b in zip(bounds, bounds[1:])]
 
 
 # 장소 기준 장면(홈스냅): 사진마다 판정한 장소가 바뀌는 곳에서 나눈다 — 방을 쉬지 않고 옮기면 시간 공백으로는 못 잡는다.

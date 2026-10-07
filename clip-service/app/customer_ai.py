@@ -25,7 +25,8 @@ from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
 from app.gemini_quality_client import UNKNOWN_PLACE, _build_usage, assess_images, customer_service_tier, sum_usage
 from app.grouping import group_by_similarity
-from app.scenes import (CLOSE_GAP_SECONDS, MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS, scene_gap, scene_taken_at,
+from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_CUT_SIMILARITY, CONTENT_MIN_SCENE_PHOTOS, CONTENT_WINDOW, MIN_PHOTOS_FOR_SCENES,
+                        MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS, scene_gap, scene_taken_at, split_by_content,
                         split_by_place, split_scenes)
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,9 @@ PLACELESS_ABSORB_PHOTOS = 20
 # 셀프 고객 판정은 인물 구성(people)까지 묻는 별도 프롬프트라 버전을 따로 둔다 — 작가 판정 캐시와 섞이지 않게.
 CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
 # 장소 기준 장면(홈스냅)에서 실행 settings에 남기는 값 — 시간 기준 장면과 검수 채점에서 구분.
+# 내용 기준 장면(촬영 시각 없음)에서 실행 settings에 남기는 값.
+CONTENT_SCENE_SETTINGS = {"boundary": "content", "contentWindow": CONTENT_WINDOW, "contentCutSimilarity": CONTENT_CUT_SIMILARITY,
+                          "contentMinScenePhotos": CONTENT_MIN_SCENE_PHOTOS, "embeddingModel": GEMINI_EMBEDDING_MODEL}
 PLACE_SCENE_SETTINGS = {"boundary": "place", "placeWindow": PLACE_WINDOW, "placeMinRun": PLACE_MIN_RUN, "hardCutSeconds": CLOSE_GAP_SECONDS}
 
 
@@ -391,7 +395,7 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
                 "repeatedNames": "numbered", "absorbPlaceless": {"maxPhotos": PLACELESS_ABSORB_PHOTOS, "maxNeighborRatio": 0.5}}
     try:
         rows = capture_order(_all_rows(lambda: db.table("customer_photos")
-                                       .select("id,order_index,preview_url,taken_at,taken_at_source,similarity_group_id")
+                                       .select("id,order_index,preview_url,thumb_url,taken_at,taken_at_source,similarity_group_id")
                                        .eq("project_id", project_id).order("id")))
         placed = _place_scenes(db, project_id, scene_names, rows)
         if placed:  # 흔들림 확인에서 장소까지 판정했으면 그걸로 나누고 이름도 붙인다(Gemini 이름 호출 없음)
@@ -400,9 +404,19 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
             _replace_scenes(db, project_id, *placed)
             _done(db, run_id, 0, 0, 0, usage=sum_usage([]))
             return
-        scenes = split_scenes(rows, gap_seconds) or []
+        scenes = split_scenes(rows, gap_seconds)
+        by_content = False
+        if scenes is None and len(rows) >= MIN_PHOTOS_FOR_SCENES:
+            # 촬영 시각이 없으면(보정본 등) 업로드 순서에서 사진 내용이 바뀌는 곳으로 나눈다. 임베딩은 유사컷과 같은 캐시라
+            # 유사컷이 끝났으면 다시 계산하지 않는다. 없으면 내려받아 계산하므로 무거운 실행 자리를 기다린다.
+            async with _heavy_slot():
+                scenes = split_by_content(rows, await _embeddings(db, run_id, project_id, rows))
+            by_content = scenes is not None
+            if by_content:
+                settings.update(CONTENT_SCENE_SETTINGS)
+        scenes = scenes or []
         names: list[Optional[str]] = [None] * len(scenes)
-        to_name = [index for index, scene in enumerate(scenes) if scene_names and scene_taken_at(scene[0])]
+        to_name = [index for index, scene in enumerate(scenes) if scene_names and (by_content or scene_taken_at(scene[0]))]
         tick = _progress(db, run_id, len(to_name), 0, settings=settings, every=1)
         failed = 0
         usages: list[dict] = []
@@ -427,7 +441,8 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
                 if name is not None:
                     named[key] = name
                 tick()
-            scenes, names = merge_same_named(*absorb_placeless(scenes, names))
+            if not by_content:  # 둘 다 시간 공백으로 합칠지 정한다 — 내용 기준 장면은 이웃이 같은 이름이어도 내용이 달라 나뉜 것이라 그대로 둔다
+                scenes, names = merge_same_named(*absorb_placeless(scenes, names))
             names = number_repeated(names)
         _ensure_running(db, run_id)
         # 이름을 붙이는 사이 흔들림 확인(장소 판정)이 끝났으면 장소 기준 장면이 더 정확하다 — 그걸 저장한다.

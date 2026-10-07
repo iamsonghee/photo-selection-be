@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from app.customer_ai import absorb_placeless, merge_same_named
-from app.scenes import split_by_place, split_scenes
+from app.scenes import split_by_content, split_by_place, split_scenes
 
 
 def _photos(blocks):
@@ -214,3 +214,22 @@ def test_rerun_reuses_names_of_unchanged_scenes(monkeypatch):
     events, done = _fake_scene_run(monkeypatch, rows, cache={scene_key(rows[:50]): "돌잡이"})
     assert events.count("name") == 1 and events.count("tick") == 2
     assert {key: done[key] for key in ("total", "processed", "failed")} == {"total": 2, "processed": 2, "failed": 0}
+
+
+def test_split_by_content_cuts_where_content_changes_in_upload_order():
+    # 촬영 시각 없는 보정본: 업로드 순서 0~59 / 60~139 / 140~199 세 콘셉트(임베딩 방향이 다름). order_index를 섞어 넣어도 순서대로 자른다.
+    blocks = [(0, 60), (1, 80), (2, 60)]
+    photos, vectors = [], []
+    for axis, count in blocks:
+        for _ in range(count):
+            vector = [0.0] * 3
+            vector[axis] = 1.0
+            photos.append({"id": f"p{len(photos)}", "order_index": len(photos), "taken_at": None})
+            vectors.append(vector)
+    photos.reverse()
+    vectors.reverse()
+    scenes = split_by_content(photos, vectors)
+    assert [len(scene) for scene in scenes] == [60, 80, 60]
+    assert [photo["order_index"] for photo in scenes[0]] == list(range(60))
+    assert split_by_content(photos[:50], vectors[:50]) is None
+    assert split_by_content(photos, [None, *vectors[1:]]) is None
