@@ -18,13 +18,12 @@ from pydantic import BaseModel
 
 from app.config import (CUSTOMER_AI_HEAVY_RUNS, GEMINI_EMBEDDING_DIMENSION, GEMINI_EMBEDDING_MODEL,
                         GEMINI_EMBEDDING_VERSION, GEMINI_FLASH_MODEL, GEMINI_FLEX_TIMEOUT_SECONDS,
-                        GEMINI_QUALITY_PROMPT_VERSION, GEMINI_QUALITY_TIMEOUT_SECONDS,
-                        GEMINI_SIMILARITY_THRESHOLD)
+                        GEMINI_QUALITY_PROMPT_VERSION, GEMINI_QUALITY_TIMEOUT_SECONDS)
 from app.db import get_supabase
 from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
 from app.gemini_quality_client import UNKNOWN_PLACE, _build_usage, assess_images, customer_service_tier, sum_usage
-from app.grouping import group_by_similarity
+from app.grouping import (SHOT_ANCHOR_MARGIN, SHOT_MAX, SHOT_MAX_GAP_SECONDS, SHOT_MIN, SHOT_PERCENTILE, group_shots)
 from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_CUT_SIMILARITY, CONTENT_MIN_SCENE_PHOTOS, CONTENT_WINDOW, MIN_PHOTOS_FOR_SCENES,
                         MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS, scene_gap, scene_taken_at, split_by_content,
                         split_by_place, split_scenes)
@@ -174,8 +173,17 @@ def _done(db, run_id, total, processed, failed, error=None, usage: Optional[dict
 
 def capture_order(rows: list[dict]) -> list[dict]:
     """촬영 시각순(없으면 뒤로, 같으면 업로드 순). 유사컷은 인접한 사진끼리만 비교하므로
-    업로드 순서가 아니라 실제로 연달아 찍은 순서로 늘어놓아야 연속 촬영을 놓치지 않는다."""
-    return sorted(rows, key=lambda row: (row.get("taken_at") is None, row.get("taken_at") or "", row["order_index"]))
+    업로드 순서가 아니라 실제로 연달아 찍은 순서로 늘어놓아야 연속 촬영을 놓치지 않는다.
+    파일 수정 시각은 촬영 시각이 아니라 뺀다 — 보정본을 한꺼번에 내보내면 같은 초 안에서 순서가 섞인다(업로드 = 파일명 순서가 맞다)."""
+    return sorted(rows, key=lambda row: (scene_taken_at(row) is None, scene_taken_at(row) or "", row["order_index"]))
+
+
+def _shot_time(row: dict) -> Optional[float]:
+    value = scene_taken_at(row)
+    try:
+        return datetime.fromisoformat(value.replace("Z", "")).timestamp() if value else None
+    except ValueError:
+        return None
 
 
 async def _embeddings(db, run_id: str, project_id: str, rows: list[dict], tick=None) -> list[Optional[np.ndarray]]:
@@ -468,17 +476,19 @@ async def _run_similarity(db, run_id: str, project_id: str):
     rows = []
     try:
         rows = capture_order(_all_rows(lambda: db.table("customer_photos")
-                                       .select("id,order_index,thumb_url,taken_at")
+                                       .select("id,order_index,thumb_url,taken_at,taken_at_source")
                                        .eq("project_id", project_id).order("id")))
         tick = _progress(db, run_id, len(rows), 0, settings={
             "embeddingModel": GEMINI_EMBEDDING_MODEL, "embeddingDimension": GEMINI_EMBEDDING_DIMENSION,
-            "embeddingVersion": GEMINI_EMBEDDING_VERSION, "similarityThreshold": GEMINI_SIMILARITY_THRESHOLD,
+            "embeddingVersion": GEMINI_EMBEDDING_VERSION, "grouping": "adaptive-anchor-gap",
+            "shotPercentile": SHOT_PERCENTILE, "shotMin": SHOT_MIN, "shotMax": SHOT_MAX,
+            "shotAnchorMargin": SHOT_ANCHOR_MARGIN, "shotMaxGapSeconds": SHOT_MAX_GAP_SECONDS,
         })
         vectors = await _embeddings(db, run_id, project_id, rows, tick)
         _ensure_running(db, run_id)
         db.table("customer_photos").update({"similarity_group_id": None}).eq("project_id", project_id).execute()
         db.table("customer_photo_groups").delete().eq("project_id", project_id).execute()
-        for members in group_by_similarity(vectors, GEMINI_SIMILARITY_THRESHOLD):
+        for members in group_shots(vectors, [_shot_time(row) for row in rows]):
             ids = [rows[index]["id"] for index in members]
             group = db.table("customer_photo_groups").insert({
                 "project_id": project_id, "representative_photo_id": ids[0], "photo_count": len(ids)
