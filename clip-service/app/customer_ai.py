@@ -28,6 +28,8 @@ from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_CUT_SIMILARITY, CONTENT_MAX_S
                         CONTENT_MIN_SCENE_PHOTOS, CONTENT_WINDOW, MIN_PHOTOS_FOR_SCENES,
                         MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS,
                         CONTENT_VISIBLE_MAX, CONTENT_VISIBLE_MIN, CONTENT_VISIBLE_TARGET,
+                        CONTENT_FILENAME_MIN_DIGITS, CONTENT_FILENAME_MAX_SPAN_FACTOR, content_order,
+                        CONTENT_GENERIC_PLACES,
                         scene_gap, scene_taken_at, size_content_sections, split_by_content, split_by_place, split_scenes)
 
 logger = logging.getLogger(__name__)
@@ -43,7 +45,7 @@ CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
 # 내용 기준 장면(촬영 시각 없음) 묘사: 이름 목록에서 고르면 웨딩 촬영은 실내가 전부 "스튜디오"가 됐다(2,249장에서 30개 중 24개).
 # 작은 구간의 배경·의상 묘사는 큰 구간의 분리 후보를 고를 때 쓴다. 앞 표현을 넘겨야 같은 세트를 같은 말로 적는다. 대표 사진은 이름 고르기(3장)보다
 # 많이 본다 — 3장으로는 어두운 유리창 너머 브라운 수트를 검정 턱시도로 읽었다.
-DESCRIBE_PROMPT_VERSION = "describe-v6-general-props"
+DESCRIBE_PROMPT_VERSION = "describe-v7-specific-background"
 DESCRIBE_SAMPLE_PHOTOS = 5
 SECTION_PROMPT_VERSION = "sections-v3-outfit-continuity"
 SECTION_SAMPLE_PHOTOS = 2
@@ -54,7 +56,9 @@ CONTENT_SCENE_SETTINGS = {"boundary": "content", "contentWindow": CONTENT_WINDOW
                           "sampleCount": DESCRIBE_SAMPLE_PHOTOS, "sectionPromptVersion": SECTION_PROMPT_VERSION,
                           "sectionSampleCount": SECTION_SAMPLE_PHOTOS, "visibleTarget": CONTENT_VISIBLE_TARGET,
                           "visibleMax": CONTENT_VISIBLE_MAX, "visibleMinSplit": CONTENT_VISIBLE_MIN,
-                          "visibleGrouping": "adaptive-anchor-gap"}
+                          "visibleGrouping": "adaptive-anchor-gap", "contentOrder": "single-dense-filename-sequence-else-upload",
+                          "filenameMinDigits": CONTENT_FILENAME_MIN_DIGITS, "filenameMaxSpanFactor": CONTENT_FILENAME_MAX_SPAN_FACTOR,
+                          "samePlaceCutSimilarity": CONTENT_CUT_SIMILARITY, "genericPlaces": sorted(CONTENT_GENERIC_PLACES)}
 PLACE_SCENE_SETTINGS = {"boundary": "place", "placeWindow": PLACE_WINDOW, "placeMinRun": PLACE_MIN_RUN, "hardCutSeconds": CLOSE_GAP_SECONDS}
 
 
@@ -276,6 +280,9 @@ async def _describe_scene(client, images: list[bytes], places: list[str], outfit
         "같은 배경이어도 하트 풍선·하트 티셔츠·꽃잎·리본·부케 같은 소품이 바뀌면 반드시 그 소품으로 새 place를 쓰세요. "
         "눈에 띄는 소품이 하나라도 있으면 흰 벽·흰 커튼 같은 일반 배경보다 소품을 우선하세요. 대표 사진에 보이지 않는 기존 표현은 쓰지 말고, "
         "인물 한 명의 작은 장신구보다 여러 대표 사진에 공통으로 보이는 특징을 고르세요. "
+        "'야외 정원', '실내' 같은 넓은 장소보다 사진에 공통으로 보이는 구체적인 배경·구조·주요 소품을 적으세요. "
+        "같은 건물이나 공원 안이라도 배경 구조가 달라지면 다른 place입니다. "
+        "아래 기존 표현은 참고이지 선택 목록이 아닙니다. 기존 표현에 끼워 맞추거나 단순 확대·포즈 변화만으로 새 place를 만들지 마세요. "
         "의상도 같다고 확실할 때만 기존 표현을 그대로 쓰세요.\n"
         f"이미 쓴 장소: {', '.join(places) or '없음'}\n이미 쓴 의상: {', '.join(outfits) or '없음'}"
     )
@@ -509,7 +516,7 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
                 "repeatedNames": "numbered", "absorbPlaceless": {"maxPhotos": PLACELESS_ABSORB_PHOTOS, "maxNeighborRatio": 0.5}}
     try:
         rows = capture_order(_all_rows(lambda: db.table("customer_photos")
-                                       .select("id,order_index,preview_url,thumb_url,taken_at,taken_at_source,similarity_group_id")
+                                       .select("id,filename,order_index,preview_url,thumb_url,taken_at,taken_at_source,similarity_group_id")
                                        .eq("project_id", project_id).order("id")))
         placed = _place_scenes(db, project_id, scene_names, rows)
         if placed:  # 흔들림 확인에서 장소까지 판정했으면 그걸로 나누고 이름도 붙인다(Gemini 이름 호출 없음)
@@ -534,6 +541,8 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
                 for members in group_shots([vectors[row["id"]] for row in rows], [_shot_time(row) for row in rows]):
                     for index in members:
                         rows[index]["similarity_group_id"] = rows[members[0]]["id"]
+                # 유사컷은 기존 순서·기준으로 계산한 뒤, 장면 경계에만 파일 연번 복원을 적용한다.
+                rows = content_order(rows)
                 scenes = split_by_content(rows, [vectors[row["id"]] for row in rows])
         scenes = scenes or []
         names: list[Optional[str]] = [None] * len(scenes)

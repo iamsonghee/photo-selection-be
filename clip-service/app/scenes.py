@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections import Counter
 from datetime import datetime
 from typing import Optional
@@ -125,6 +126,29 @@ CONTENT_ABSORB_MIN_SIMILARITY = 0.925
 CONTENT_VISIBLE_TARGET = 60
 CONTENT_VISIBLE_MAX = 120
 CONTENT_VISIBLE_MIN = 20
+
+
+CONTENT_FILENAME_MIN_DIGITS = 4
+CONTENT_FILENAME_MAX_SPAN_FACTOR = 10
+# 세트를 특정하지 못한 넓은 묘사만 사진 내용으로 보완한다. 구체적인 같은 세트명은 포즈가 달라도 유지한다.
+CONTENT_GENERIC_PLACES = frozenset({"실내", "실내배경", "스튜디오", "야외", "야외배경", "야외정원", "정원", "알수없음"})
+
+
+def content_order(photos: list[dict]) -> list[dict]:
+    """촬영 시각이 없고 하나의 촘촘한 연속 번호일 때만 순서를 복원한다. 입력 행은 변경하지 않는다."""
+    if not photos or any(scene_taken_at(p) for p in photos):
+        return photos
+    matches = [re.fullmatch(r"([^\d]*)(\d{%d,})([^\d]*)" % CONTENT_FILENAME_MIN_DIGITS,
+                           p.get("filename") or p.get("original_filename") or "") for p in photos]
+    if any(m is None for m in matches):
+        return photos
+    signatures = {(m[1].casefold(), len(m[2]), m[3].casefold()) for m in matches}
+    numbers = [int(m[2]) for m in matches]
+    # ponytail: 단일 카메라의 촘촘한 연번 추정. 여러 체계·중복·큰 번호 공백은 원래 순서를 유지한다.
+    if (len(signatures) != 1 or len(set(numbers)) != len(numbers)
+            or max(numbers) - min(numbers) > len(photos) * CONTENT_FILENAME_MAX_SPAN_FACTOR):
+        return photos
+    return [{**photo, "order_index": i} for i, (_, photo) in enumerate(sorted(zip(numbers, photos), key=lambda pair: pair[0]))]
 
 
 def split_by_content(photos: list[dict], vectors: list) -> Optional[list[list[dict]]]:
@@ -251,9 +275,9 @@ def size_content_sections(scenes: list[list[dict]], descriptions: list[Optional[
                 if similarity >= CONTENT_MERGE_SIMILARITY:
                     continue  # 이름 오판만으로 같은 세트를 자르지 않는다.
                 changed = before and after and before["place"] != after["place"]
-                if before and after and not changed:
-                    continue
-                if not (before and after) and similarity >= CONTENT_CUT_SIMILARITY:
+                generic = before and after and all("".join(d["place"].split()) in CONTENT_GENERIC_PLACES for d in (before, after))
+                # 구체적인 같은 세트명은 유지. 넓은 장소명·묘사 누락만 사진 변화로 보완한다.
+                if not changed and (before and after and not generic or similarity >= CONTENT_CUT_SIMILARITY):
                     continue
                 left = visible_photo_count([p for scene in scenes[lo:cut] for p in scene])
                 right = visible_photo_count([p for scene in scenes[cut:hi] for p in scene])

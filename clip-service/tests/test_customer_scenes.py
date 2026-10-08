@@ -325,11 +325,59 @@ def test_content_sections_keep_outfit_continuity_but_preserve_distinct_activitie
     assert [len(scene) for scene in merged] == [140]
 
 
+def test_content_order_restores_only_unambiguous_sequence_without_mutating_rows():
+    from app.scenes import content_order
+    rows = [{"id": str(i), "filename": f"IMG_{number}work.jpg", "order_index": i, "taken_at_source": "file"}
+            for i, number in enumerate((1003, 1001, 1002))]
+    ordered = content_order(rows)
+    assert [r["id"] for r in ordered] == ["1", "2", "0"]
+    assert [r["order_index"] for r in ordered] == [0, 1, 2]
+    assert [r["order_index"] for r in rows] == [0, 1, 2]
+    assert ordered[0] is not rows[1]
+
+
+@pytest.mark.parametrize("filenames", [
+    ["IMG_1002.jpg", "DSC_1001.jpg"],  # 카메라 체계가 다름
+    ["IMG_1001.jpg", "IMG_1001.jpg"],  # 번호 중복
+    ["IMG_9999.jpg", "IMG_0001.jpg"],  # 번호 순환·큰 공백
+    ["IMG_2.jpg", "IMG_1.jpg"],  # 짧은 번호는 수동 이름일 수 있음
+    ["20261008_1002.jpg", "20261007_1001.jpg"],  # 여러 숫자 체계
+    [None, "IMG_1001.jpg"],
+])
+def test_content_order_keeps_ambiguous_filenames(filenames):
+    from app.scenes import content_order
+    rows = [{"id": str(i), "filename": name, "order_index": i} for i, name in enumerate(filenames)]
+    assert content_order(rows) is rows
+
+
+def test_content_order_does_not_override_capture_times():
+    from app.scenes import content_order
+    rows = [{"id": str(i), "filename": f"IMG_{1002-i}.jpg", "order_index": i, "taken_at": "2026-10-08T12:00:00"}
+            for i in range(2)]
+    assert content_order(rows) is rows
+
+
+def test_large_same_named_background_can_split_but_small_or_similar_sets_stay():
+    from app.scenes import size_content_sections
+    scenes = [[{"id": f"s{i}p{j}"} for j in range(70)] for i in range(2)]
+    descriptions = [{"place": "야외 정원", "outfits": ["드레스"]}] * 2
+    vectors = {p["id"]: [1-i, i] for i, scene in enumerate(scenes) for p in scene}
+    plan = [{"start": 0, "name": "드레스"}]
+    result, _ = size_content_sections(scenes, descriptions, plan, vectors, outfit_based=True)
+    assert [len(s) for s in result] == [70, 70]
+    small = [s[:15] for s in scenes]
+    assert [len(s) for s in size_content_sections(small, descriptions, plan, vectors)[0]] == [30]
+    similar = {p["id"]: [1, 0] for scene in scenes for p in scene}
+    assert [len(s) for s in size_content_sections(scenes, descriptions, plan, similar)[0]] == [140]
+    specific = [{"place": "격자창 창가", "outfits": ["드레스"]}] * 2
+    assert [len(s) for s in size_content_sections(scenes, specific, plan, vectors)[0]] == [140]
+
+
 @pytest.mark.parametrize("valid", [True, False])
 def test_content_scene_run_counts_groups_before_similarity_is_saved_and_rejects_bad_plan(monkeypatch, valid):
     from app import customer_ai
     rows = [{"id": f"p{i}", "order_index": i, "taken_at_source": "file", "taken_at": None,
-             "thumb_url": "u", "preview_url": "u", "similarity_group_id": None} for i in range(100)]
+             "filename": f"IMG_{1100-i}.jpg", "thumb_url": "u", "preview_url": "u", "similarity_group_id": None} for i in range(100)]
     saved = []
 
     async def embeddings(*args):
@@ -341,6 +389,7 @@ def test_content_scene_run_counts_groups_before_similarity_is_saved_and_rejects_
     async def plan(client, scenes, *args):
         from app.scenes import visible_photo_count
         assert visible_photo_count(scenes[0]) == 1
+        assert scenes[0][0]["id"] == "p99" and scenes[0][-1]["id"] == "p0"
         return {"basis": "outfit", "sections": [{"start": 0 if valid else 1, "name": "수트"}]}
 
     monkeypatch.setattr(customer_ai, "_embeddings", embeddings)
@@ -351,5 +400,6 @@ def test_content_scene_run_counts_groups_before_similarity_is_saved_and_rejects_
     if valid:
         assert saved[0][1] == ["수트"] and len(saved[0][0][0]) == 100
         assert done["error"] is None
+        assert rows[0]["id"] == "p0" and rows[0]["similarity_group_id"] is None
     else:
         assert saved == [] and "invalid content section boundaries" in done["error"]
