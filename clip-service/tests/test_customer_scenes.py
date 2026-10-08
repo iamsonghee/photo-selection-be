@@ -233,3 +233,21 @@ def test_split_by_content_cuts_where_content_changes_in_upload_order():
     assert [photo["order_index"] for photo in scenes[0]] == list(range(60))
     assert split_by_content(photos[:50], vectors[:50]) is None
     assert split_by_content(photos, [None, *vectors[1:]]) is None
+
+
+def test_merge_described_joins_same_look_and_keeps_distinct_sets():
+    from app.scenes import described_name, merge_described
+    axis = lambda k: [1.0 if i == k else 0.0 for i in range(4)]
+    scenes = [[{"id": f"s{i}p{j}"} for j in range(3)] for i in range(5)]
+    looks = [axis(0), axis(0), axis(1), [0.7, 0.71, 0, 0], axis(2)]  # 장면별 사진 방향
+    vectors = {photo["id"]: looks[i] for i, scene in enumerate(scenes) for photo in scene}
+    descriptions = [{"place": "흰 벽", "outfits": ["흰 드레스", "검정 턱시도"]},
+                    {"place": "흰 벽", "outfits": ["검정 턱시도"]},  # 신랑 단독 — 커플 컷과 합친다
+                    {"place": "주황 계단", "outfits": ["흰 드레스"]},
+                    {"place": "주황 계단", "outfits": ["흰 드레스"]},  # 이름은 같지만 사진 평균 차이가 커서(0.71) 따로
+                    None]
+    merged, merged_descriptions = merge_described(scenes, descriptions, vectors)
+    assert [len(scene) for scene in merged] == [6, 3, 3, 3]
+    assert described_name(merged_descriptions[0]) == "흰 벽 · 흰 드레스, 검정 턱시도"
+    assert described_name({"place": "유리 천장 방", "outfits": []}) == "유리 천장 방"
+    assert merged_descriptions[3] is None

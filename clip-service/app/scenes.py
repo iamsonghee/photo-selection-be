@@ -107,17 +107,22 @@ def split_scenes(photos: list[dict], gap_seconds: float = SCENE_GAP_SECONDS) -> 
 
 
 # 내용 기준 장면: 촬영 시각이 없으면(포토샵 내보내기 보정본 등 — EXIF에 시각이 빠짐) 업로드 순서(= 파일명 순서)로 늘어놓고
-# 앞뒤 CONTENT_WINDOW장 평균 임베딩의 코사인 유사도가 가장 크게 떨어지는 곳부터 자른다. 2026-10-07 웨딩 스튜디오 2,249장
-# (EXIF 시각 없음)에서 사람이 본 콘셉트·의상·세트 경계 25개 중 23개를 잡았고, 나머지 자른 곳도 같은 콘셉트 안의 세팅 전환이었다.
-# ponytail: 한 프로젝트로 정한 값. 정답 경계 데이터가 더 모이면 기준값을 다시 맞춘다.
-CONTENT_WINDOW = 10
+# 앞뒤 CONTENT_WINDOW장 평균 임베딩의 코사인 유사도가 크게 떨어지는 곳마다 잘게 자른 뒤, AI가 본 장소·의상이 같은 이웃을 합친다
+# (`merge_described`). 사진 수로 장면 수를 정하면 촬영마다 틀렸다(2026-10-07): 흰 세트를 길게 찍은 2,249장은 너무 잘게,
+# 세트 27곳을 15~40장씩 찍은 636장은 세트 절반을 놓쳤다. 잘게 자르면 636장에서 세트 경계 26개 중 24개를 잡는다.
+# ponytail: 웨딩 스튜디오 두 건으로 정한 값. 정답 경계 데이터가 더 모이면 기준값을 다시 맞춘다.
+CONTENT_WINDOW = 5
 CONTENT_CUT_SIMILARITY = 0.92
-CONTENT_MIN_SCENE_PHOTOS = 30
+CONTENT_MIN_SCENE_PHOTOS = 10
+CONTENT_MAX_SCENES = 60  # 장면마다 AI 호출 1번 — 비용 상한
+# 이웃 합치기: 장소·의상이 같아도 사진 평균이 이보다 다르면 따로(예: 같은 흰 벽에서 하트 풍선 소품), 이름이 달라도 이 이상 같으면 합친다.
+DESCRIBED_MERGE_MIN_SIMILARITY = 0.85
+CONTENT_MERGE_SIMILARITY = 0.95
 
 
 def split_by_content(photos: list[dict], vectors: list) -> Optional[list[list[dict]]]:
     """photos: split_scenes와 같은 형식, vectors: 같은 순서의 임베딩(없으면 None). 사진이 적거나 임베딩이 없는 사진이 있으면 None.
-    반환: 업로드 순서 장면 목록."""
+    반환: 업로드 순서 장면 목록(잘게 — 이름을 붙인 뒤 merge_described로 합친다)."""
     if len(photos) < MIN_PHOTOS_FOR_SCENES or any(vector is None for vector in vectors):
         return None
     order = sorted(range(len(photos)), key=lambda i: photos[i]["order_index"])
@@ -130,12 +135,48 @@ def split_by_content(photos: list[dict], vectors: list) -> Optional[list[list[di
         scores.append((float(before @ after / np.linalg.norm(before) / np.linalg.norm(after)), i))
     cuts: list[int] = []
     for score, i in sorted(scores):
-        if score >= CONTENT_CUT_SIMILARITY or len(cuts) >= max_scenes(len(photos)) - 1:
+        if score >= CONTENT_CUT_SIMILARITY or len(cuts) >= CONTENT_MAX_SCENES - 1:
             break
         if all(abs(i - cut) >= CONTENT_MIN_SCENE_PHOTOS for cut in (0, *cuts, len(order))):
             cuts.append(i)
     bounds = [0, *sorted(cuts), len(order)]
     return [[photos[order[k]] for k in range(a, b)] for a, b in zip(bounds, bounds[1:])]
+
+
+def _centroid(scene: list[dict], vectors: dict) -> np.ndarray:
+    mean = np.asarray([vectors[photo["id"]] for photo in scene], dtype=np.float64).mean(0)
+    return mean / np.linalg.norm(mean)
+
+
+def merge_described(scenes: list[list[dict]], descriptions: list[Optional[dict]],
+                    vectors: dict) -> tuple[list[list[dict]], list[Optional[dict]]]:
+    """잘게 자른 내용 기준 장면에서 이웃을 합친다. descriptions[i]: {"place": str, "outfits": [str]}(AI가 못 봤으면 None),
+    vectors: 사진 ID → 임베딩. 장소가 같고 의상이 한쪽에 포함되면(단독 컷 ⊂ 커플 컷) 사진 평균이 DESCRIBED_MERGE_MIN_SIMILARITY 이상일 때,
+    또는 이름과 상관없이 CONTENT_MERGE_SIMILARITY 이상이면 합친다. 합친 장면의 의상은 순서를 지켜 모은다."""
+    merged: list[list[dict]] = []
+    merged_descriptions: list[Optional[dict]] = []
+    for scene, description in zip(scenes, descriptions):
+        if merged:
+            previous = merged_descriptions[-1]
+            similarity = float(_centroid(merged[-1], vectors) @ _centroid(scene, vectors))
+            alike = (previous and description and previous["place"] == description["place"]
+                     and (set(previous["outfits"]) <= set(description["outfits"]) or set(description["outfits"]) <= set(previous["outfits"])))
+            if (alike and similarity >= DESCRIBED_MERGE_MIN_SIMILARITY) or similarity >= CONTENT_MERGE_SIMILARITY:
+                merged[-1] = merged[-1] + scene
+                if previous and description:
+                    previous["outfits"] = [*previous["outfits"], *(o for o in description["outfits"] if o not in previous["outfits"])]
+                merged_descriptions[-1] = previous or description
+                continue
+        merged.append(scene)
+        merged_descriptions.append(dict(description) if description else None)
+    return merged, merged_descriptions
+
+
+def described_name(description: Optional[dict]) -> Optional[str]:
+    """"주황 나무 계단 · 흰 드레스, 검정 턱시도". 인물이 없으면 장소만."""
+    if not description:
+        return None
+    return " · ".join(part for part in (description["place"], ", ".join(description["outfits"])) if part)
 
 
 # 장소 기준 장면(홈스냅): 사진마다 판정한 장소가 바뀌는 곳에서 나눈다 — 방을 쉬지 않고 옮기면 시간 공백으로는 못 잡는다.

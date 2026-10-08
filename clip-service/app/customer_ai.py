@@ -24,9 +24,10 @@ from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
 from app.gemini_quality_client import UNKNOWN_PLACE, _build_usage, assess_images, customer_service_tier, sum_usage
 from app.grouping import (SHOT_ANCHOR_MARGIN, SHOT_MAX, SHOT_MAX_GAP_SECONDS, SHOT_MIN, SHOT_PERCENTILE, group_shots)
-from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_CUT_SIMILARITY, CONTENT_MIN_SCENE_PHOTOS, CONTENT_WINDOW, MIN_PHOTOS_FOR_SCENES,
-                        MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS, scene_gap, scene_taken_at, split_by_content,
-                        split_by_place, split_scenes)
+from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_CUT_SIMILARITY, CONTENT_MAX_SCENES, CONTENT_MERGE_SIMILARITY,
+                        CONTENT_MIN_SCENE_PHOTOS, CONTENT_WINDOW, DESCRIBED_MERGE_MIN_SIMILARITY, MIN_PHOTOS_FOR_SCENES,
+                        MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS, described_name, merge_described,
+                        scene_gap, scene_taken_at, split_by_content, split_by_place, split_scenes)
 
 logger = logging.getLogger(__name__)
 OTHER_SCENE = "기타 장면"
@@ -38,9 +39,17 @@ PLACELESS_ABSORB_PHOTOS = 20
 # 셀프 고객 판정은 인물 구성(people)까지 묻는 별도 프롬프트라 버전을 따로 둔다 — 작가 판정 캐시와 섞이지 않게.
 CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
 # 장소 기준 장면(홈스냅)에서 실행 settings에 남기는 값 — 시간 기준 장면과 검수 채점에서 구분.
+# 내용 기준 장면(촬영 시각 없음) 묘사: 이름 목록에서 고르면 웨딩 촬영은 실내가 전부 "스튜디오"가 됐다(2,249장에서 30개 중 24개).
+# 장소·의상을 짧게 적게 하고 같은 것끼리 합친다. 앞 장면 표현을 넘겨야 같은 세트를 같은 말로 적는다. 대표 사진은 이름 고르기(3장)보다
+# 많이 본다 — 3장으로는 어두운 유리창 너머 브라운 수트를 검정 턱시도로 읽었다.
+DESCRIBE_PROMPT_VERSION = "describe-v1-place-outfits"
+DESCRIBE_SAMPLE_PHOTOS = 5
 # 내용 기준 장면(촬영 시각 없음)에서 실행 settings에 남기는 값.
 CONTENT_SCENE_SETTINGS = {"boundary": "content", "contentWindow": CONTENT_WINDOW, "contentCutSimilarity": CONTENT_CUT_SIMILARITY,
-                          "contentMinScenePhotos": CONTENT_MIN_SCENE_PHOTOS, "embeddingModel": GEMINI_EMBEDDING_MODEL}
+                          "contentMinScenePhotos": CONTENT_MIN_SCENE_PHOTOS, "contentMaxScenes": CONTENT_MAX_SCENES,
+                          "describedMergeMinSimilarity": DESCRIBED_MERGE_MIN_SIMILARITY, "contentMergeSimilarity": CONTENT_MERGE_SIMILARITY,
+                          "embeddingModel": GEMINI_EMBEDDING_MODEL, "namePromptVersion": DESCRIBE_PROMPT_VERSION,
+                          "sampleCount": DESCRIBE_SAMPLE_PHOTOS}
 PLACE_SCENE_SETTINGS = {"boundary": "place", "placeWindow": PLACE_WINDOW, "placeMinRun": PLACE_MIN_RUN, "hardCutSeconds": CLOSE_GAP_SECONDS}
 
 
@@ -244,6 +253,39 @@ async def _name_scene(client, images: list[bytes], names: list[str], usages: Opt
         return None
 
 
+class _SceneLook(BaseModel):
+    place: str
+    outfits: list[str]
+
+
+async def _describe_scene(client, images: list[bytes], places: list[str], outfits: list[str],
+                          usages: Optional[list[dict]] = None) -> Optional[dict]:
+    """한 장면의 대표 사진들을 보고 {"place", "outfits"}를 적는다. 호출이 실패하면 None."""
+    prompt = (
+        "다음 사진들은 한 촬영의 같은 장면에서 연달아 찍은 사진입니다. 고객이 장면을 구분할 수 있게 짧게 적으세요.\n"
+        "- place: 이 장면만의 배경·세트를 눈에 띄는 색·재질·소품으로 8자 안팎. 예: '주황 나무 계단', '유리 천장 방', '주황 격자문', "
+        "'하트 풍선', '야외 정원', '흰 커튼 창가'. '흰 벽'처럼 어디에나 있는 표현은 다른 특징이 정말 없을 때만.\n"
+        "- outfits: 보이는 주인공의 의상을 사람마다 색+종류 6자 안팎으로, 최대 2명. 신부·여성 먼저, 신랑·남성 다음. "
+        "예: ['흰 드레스', '검정 턱시도'], ['한복'], 한 사람만 보이면 그 사람만. 사람이 없으면 [].\n"
+        "앞 장면과 같은 장소·의상이라고 확실할 때만 아래 표현을 그대로(띄어쓰기까지) 다시 쓰고, 다르면 새 표현을 쓰세요.\n"
+        f"이미 쓴 장소: {', '.join(places) or '없음'}\n이미 쓴 의상: {', '.join(outfits) or '없음'}"
+    )
+    try:
+        response = await client.aio.models.generate_content(
+            model=GEMINI_FLASH_MODEL,
+            contents=[prompt, *[types.Part.from_bytes(data=image, mime_type="image/jpeg") for image in images]],
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=_SceneLook, temperature=0),
+        )
+        if usages is not None and (usage := _build_usage(response)):
+            usages.append(usage)
+        look = _SceneLook.model_validate_json(response.text)
+        place = look.place.strip()
+        return {"place": place, "outfits": [o.strip() for o in look.outfits if o.strip()][:2]} if place else None
+    except Exception as exc:
+        logger.warning("scene describing failed: %s", exc)
+        return None
+
+
 def merge_same_named(scenes: list[list[dict]], names: list[Optional[str]]) -> tuple[list[list[dict]], list[Optional[str]]]:
     """바로 붙은 장면의 이름이 같고 사이 공백이 짧으면(CLOSE_GAP 미만) 한 장면으로 합친다 — 시간 공백이 한 장면을
     잘못 나눈 경우(예: 하객, 하객). 공백이 길어도 한쪽이 작은 장면(MIN_SCENE_PHOTOS 미만)이면 합친다 — 작은 장면은
@@ -418,13 +460,16 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
             # 촬영 시각이 없으면(보정본 등) 업로드 순서에서 사진 내용이 바뀌는 곳으로 나눈다. 임베딩은 유사컷과 같은 캐시라
             # 유사컷이 끝났으면 다시 계산하지 않는다. 없으면 내려받아 계산하므로 무거운 실행 자리를 기다린다.
             async with _heavy_slot():
-                scenes = split_by_content(rows, await _embeddings(db, run_id, project_id, rows))
+                vectors = dict(zip((row["id"] for row in rows), await _embeddings(db, run_id, project_id, rows)))
+                scenes = split_by_content(rows, [vectors[row["id"]] for row in rows])
             by_content = scenes is not None
             if by_content:
                 settings.update(CONTENT_SCENE_SETTINGS)
         scenes = scenes or []
         names: list[Optional[str]] = [None] * len(scenes)
-        to_name = [index for index, scene in enumerate(scenes) if scene_names and (by_content or scene_taken_at(scene[0]))]
+        # 내용 기준 장면은 이름 목록 없이 장소·의상을 적으므로 촬영 종류와 상관없이 전부 묻는다.
+        to_name = [index for index, scene in enumerate(scenes) if by_content or (scene_names and scene_taken_at(scene[0]))]
+        descriptions: list[Optional[dict]] = [None] * len(scenes)
         tick = _progress(db, run_id, len(to_name), 0, settings=settings, every=1)
         failed = 0
         usages: list[dict] = []
@@ -436,20 +481,32 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
                 key = scene_key(scenes[index])
                 if key in cache:  # 지난 정리와 사진 구성이 같은 장면은 Gemini를 다시 부르지 않는다
                     names[index] = named[key] = cache[key]
+                    if by_content:
+                        descriptions[index] = json.loads(cache[key])
                     tick()
                     continue
                 _ensure_running(db, run_id)
                 if client is None:
                     client, flagged = await get_client(), _flagged_photos(db, project_id)
-                sample = pick_samples(scenes[index], flagged)
+                sample = pick_samples(scenes[index], flagged, DESCRIBE_SAMPLE_PHOTOS if by_content else SCENE_SAMPLE_PHOTOS)
                 images = [image for image in await download_all([photo["preview_url"] for photo in sample]) if image]
-                name = await _name_scene(client, images, scene_names, usages) if images else None
+                if by_content:  # 묘사는 캐시에 JSON 문자열로 남긴다(이름 캐시와 같은 자리)
+                    used = [d for d in descriptions if d]
+                    look = await _describe_scene(client, images, list(dict.fromkeys(d["place"] for d in used)),
+                                                 list(dict.fromkeys(o for d in used for o in d["outfits"])), usages) if images else None
+                    descriptions[index] = look
+                    name = json.dumps(look, ensure_ascii=False) if look else None
+                else:
+                    name = await _name_scene(client, images, scene_names, usages) if images else None
                 failed += name is None
                 names[index] = name or OTHER_SCENE
                 if name is not None:
                     named[key] = name
                 tick()
-            if not by_content:  # 둘 다 시간 공백으로 합칠지 정한다 — 내용 기준 장면은 이웃이 같은 이름이어도 내용이 달라 나뉜 것이라 그대로 둔다
+            if by_content:  # 잘게 자른 장면을 장소·의상이 같은(또는 사진이 거의 같은) 이웃끼리 합치고 "장소 · 의상"으로 부른다
+                scenes, descriptions = merge_described(scenes, descriptions, vectors)
+                names = [described_name(d) or OTHER_SCENE for d in descriptions]
+            else:
                 scenes, names = merge_same_named(*absorb_placeless(scenes, names))
             names = number_repeated(names)
         _ensure_running(db, run_id)
