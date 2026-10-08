@@ -118,6 +118,9 @@ CONTENT_MAX_SCENES = 60  # 장면마다 AI 호출 1번 — 비용 상한
 # 이웃 합치기: 장소·의상이 같아도 사진 평균이 이보다 다르면 따로(예: 같은 흰 벽에서 하트 풍선 소품), 이름이 달라도 이 이상 같으면 합친다.
 DESCRIBED_MERGE_MIN_SIMILARITY = 0.85
 CONTENT_MERGE_SIMILARITY = 0.95
+# 20장짜리 오판 조각도 흡수하되, 실제 짧은 세트는 남긴다. 636장 비교 촬영의 16장 야외 세트는 이웃과 0.920이었다.
+CONTENT_ABSORB_MAX_PHOTOS = 20
+CONTENT_ABSORB_MIN_SIMILARITY = 0.925
 
 
 def split_by_content(photos: list[dict], vectors: list) -> Optional[list[list[dict]]]:
@@ -169,6 +172,23 @@ def merge_described(scenes: list[list[dict]], descriptions: list[Optional[dict]]
                 continue
         merged.append(scene)
         merged_descriptions.append(dict(description) if description else None)
+    while len(merged) > 1:
+        candidates = []
+        for i, scene in enumerate(merged):
+            if len(scene) > CONTENT_ABSORB_MAX_PHOTOS:
+                continue
+            for j in (i - 1, i + 1):
+                if 0 <= j < len(merged):
+                    candidates.append((float(_centroid(scene, vectors) @ _centroid(merged[j], vectors)), i, j))
+        eligible = [item for item in candidates if item[0] >= CONTENT_ABSORB_MIN_SIMILARITY
+                    or not (merged_descriptions[item[1]] or {}).get("outfits")]
+        if not eligible:
+            break
+        _, i, j = max(eligible)
+        lo = min(i, j)
+        description = merged_descriptions[j] if len(merged[j]) >= len(merged[i]) else merged_descriptions[i]
+        merged[lo:lo + 2] = [merged[lo] + merged[lo + 1]]
+        merged_descriptions[lo:lo + 2] = [description]
     return merged, merged_descriptions
 
 

@@ -247,7 +247,33 @@ def test_merge_described_joins_same_look_and_keeps_distinct_sets():
                     {"place": "주황 계단", "outfits": ["흰 드레스"]},  # 이름은 같지만 사진 평균 차이가 커서(0.71) 따로
                     None]
     merged, merged_descriptions = merge_described(scenes, descriptions, vectors)
-    assert [len(scene) for scene in merged] == [6, 3, 3, 3]
+    assert [len(scene) for scene in merged] == [6, 3, 6]
     assert described_name(merged_descriptions[0]) == "흰 벽 · 흰 드레스, 검정 턱시도"
     assert described_name({"place": "유리 천장 방", "outfits": []}) == "유리 천장 방"
-    assert merged_descriptions[3] is None
+    assert described_name(merged_descriptions[2]) == "주황 계단 · 흰 드레스"
+
+
+def test_merge_described_absorbs_small_scene_into_more_similar_neighbor_and_keeps_real_short_set():
+    from app.scenes import merge_described
+    scenes = [[{"id": f"s{i}p{j}"} for j in range(count)] for i, count in enumerate((30, 10, 40, 15, 30))]
+    looks = ([1, 0, 0], [0.9, 0.1, 0], [0, 1, 0], [0, 0.8, 0.6], [0, 0, 1])
+    vectors = {photo["id"]: looks[i] for i, scene in enumerate(scenes) for photo in scene}
+    descriptions = [{"place": f"장면 {i}", "outfits": ["흰 드레스"]} for i in range(5)]
+
+    merged, descriptions = merge_described(scenes, descriptions, vectors)
+
+    assert [len(scene) for scene in merged] == [40, 40, 15, 30]
+    assert [description["place"] for description in descriptions] == ["장면 0", "장면 2", "장면 3", "장면 4"]
+
+
+def test_merge_described_absorbs_small_detail_scene_without_people():
+    from app.scenes import merge_described
+    scenes = [[{"id": f"s{i}p{j}"} for j in range(count)] for i, count in enumerate((30, 10, 30))]
+    vectors = {photo["id"]: vector for scene, vector in zip(scenes, ([1, 0], [0.8, 0.6], [0, 1])) for photo in scene}
+    descriptions = [{"place": "창가", "outfits": ["흰 드레스"]}, {"place": "반지", "outfits": []},
+                    {"place": "정원", "outfits": ["흰 드레스"]}]
+
+    merged, descriptions = merge_described(scenes, descriptions, vectors)
+
+    assert [len(scene) for scene in merged] == [40, 30]
+    assert descriptions[0]["place"] == "창가"

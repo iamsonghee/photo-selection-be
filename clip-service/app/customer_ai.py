@@ -24,7 +24,8 @@ from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
 from app.gemini_quality_client import UNKNOWN_PLACE, _build_usage, assess_images, customer_service_tier, sum_usage
 from app.grouping import (SHOT_ANCHOR_MARGIN, SHOT_MAX, SHOT_MAX_GAP_SECONDS, SHOT_MIN, SHOT_PERCENTILE, group_shots)
-from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_CUT_SIMILARITY, CONTENT_MAX_SCENES, CONTENT_MERGE_SIMILARITY,
+from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_ABSORB_MAX_PHOTOS, CONTENT_ABSORB_MIN_SIMILARITY,
+                        CONTENT_CUT_SIMILARITY, CONTENT_MAX_SCENES, CONTENT_MERGE_SIMILARITY,
                         CONTENT_MIN_SCENE_PHOTOS, CONTENT_WINDOW, DESCRIBED_MERGE_MIN_SIMILARITY, MIN_PHOTOS_FOR_SCENES,
                         MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS, described_name, merge_described,
                         scene_gap, scene_taken_at, split_by_content, split_by_place, split_scenes)
@@ -42,12 +43,14 @@ CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
 # 내용 기준 장면(촬영 시각 없음) 묘사: 이름 목록에서 고르면 웨딩 촬영은 실내가 전부 "스튜디오"가 됐다(2,249장에서 30개 중 24개).
 # 장소·의상을 짧게 적게 하고 같은 것끼리 합친다. 앞 장면 표현을 넘겨야 같은 세트를 같은 말로 적는다. 대표 사진은 이름 고르기(3장)보다
 # 많이 본다 — 3장으로는 어두운 유리창 너머 브라운 수트를 검정 턱시도로 읽었다.
-DESCRIBE_PROMPT_VERSION = "describe-v1-place-outfits"
+DESCRIBE_PROMPT_VERSION = "describe-v5-prop-priority"
 DESCRIBE_SAMPLE_PHOTOS = 5
 # 내용 기준 장면(촬영 시각 없음)에서 실행 settings에 남기는 값.
 CONTENT_SCENE_SETTINGS = {"boundary": "content", "contentWindow": CONTENT_WINDOW, "contentCutSimilarity": CONTENT_CUT_SIMILARITY,
                           "contentMinScenePhotos": CONTENT_MIN_SCENE_PHOTOS, "contentMaxScenes": CONTENT_MAX_SCENES,
                           "describedMergeMinSimilarity": DESCRIBED_MERGE_MIN_SIMILARITY, "contentMergeSimilarity": CONTENT_MERGE_SIMILARITY,
+                          "contentAbsorbMaxPhotos": CONTENT_ABSORB_MAX_PHOTOS,
+                          "contentAbsorbMinSimilarity": CONTENT_ABSORB_MIN_SIMILARITY,
                           "embeddingModel": GEMINI_EMBEDDING_MODEL, "namePromptVersion": DESCRIBE_PROMPT_VERSION,
                           "sampleCount": DESCRIBE_SAMPLE_PHOTOS}
 PLACE_SCENE_SETTINGS = {"boundary": "place", "placeWindow": PLACE_WINDOW, "placeMinRun": PLACE_MIN_RUN, "hardCutSeconds": CLOSE_GAP_SECONDS}
@@ -267,7 +270,12 @@ async def _describe_scene(client, images: list[bytes], places: list[str], outfit
         "'하트 풍선', '야외 정원', '흰 커튼 창가'. '흰 벽'처럼 어디에나 있는 표현은 다른 특징이 정말 없을 때만.\n"
         "- outfits: 보이는 주인공의 의상을 사람마다 색+종류 6자 안팎으로, 최대 2명. 신부·여성 먼저, 신랑·남성 다음. "
         "예: ['흰 드레스', '검정 턱시도'], ['한복'], 한 사람만 보이면 그 사람만. 사람이 없으면 [].\n"
-        "앞 장면과 같은 장소·의상이라고 확실할 때만 아래 표현을 그대로(띄어쓰기까지) 다시 쓰고, 다르면 새 표현을 쓰세요.\n"
+        "배경뿐 아니라 주요 소품과 연출까지 앞 장면과 같을 때만 아래 장소 표현을 그대로(띄어쓰기까지) 다시 쓰세요. "
+        "같은 배경이어도 하트 풍선·하트 티셔츠·꽃잎·리본·부케 같은 소품이 바뀌면 반드시 그 소품으로 새 place를 쓰세요. "
+        "눈에 띄는 소품이 하나라도 있으면 흰 벽·흰 커튼 같은 일반 배경보다 소품을 우선하세요. 대표 사진에 보이지 않는 기존 표현은 쓰지 말고, "
+        "분홍 꽃잎·리본이 보이면 place에 '분홍 꽃잎'을, 하트 무늬 소품·티셔츠가 보이면 '하트'를 반드시 포함하세요. "
+        "인물 한 명의 작은 장신구보다 여러 대표 사진에 공통으로 보이는 특징을 고르세요. "
+        "의상도 같다고 확실할 때만 기존 표현을 그대로 쓰세요.\n"
         f"이미 쓴 장소: {', '.join(places) or '없음'}\n이미 쓴 의상: {', '.join(outfits) or '없음'}"
     )
     try:
