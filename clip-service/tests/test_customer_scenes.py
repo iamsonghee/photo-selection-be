@@ -277,3 +277,79 @@ def test_merge_described_absorbs_small_detail_scene_without_people():
 
     assert [len(scene) for scene in merged] == [40, 30]
     assert descriptions[0]["place"] == "창가"
+
+
+def test_content_sections_use_collapsed_cards_and_keep_short_semantic_change():
+    from app.scenes import size_content_sections, visible_photo_count
+    scenes = [[{"id": f"s{i}p{j}", "similarity_group_id": f"s{i}g{j // 10}"}
+               for j in range(count)] for i, count in enumerate((400, 300, 50))]
+    vectors = {p["id"]: [1, 0] for scene in scenes for p in scene}
+    descriptions = [{"place": str(i), "outfits": []} for i in range(3)]
+    merged, names = size_content_sections(scenes, descriptions,
+                                         [{"start": 0, "name": "의상 A"}, {"start": 2, "name": "의상 B"}], vectors)
+    assert [len(scene) for scene in merged] == [700, 50]
+    assert [visible_photo_count(scene) for scene in merged] == [70, 5]
+    assert names == ["의상 A", "의상 B"]
+
+
+def test_content_sections_split_large_sections_only_at_meaningful_boundaries():
+    from app.scenes import size_content_sections, visible_photo_count
+    scenes = [[{"id": f"s{i}p{j}"} for j in range(count)] for i, count in enumerate((60, 60, 60, 130))]
+    descriptions = [{"place": str(i), "outfits": []} for i in range(3)] + [{"place": "같은 세트", "outfits": []}]
+    vectors = {p["id"]: [int(i == j) for j in range(4)] for i, scene in enumerate(scenes) for p in scene}
+    result, names = size_content_sections(scenes, descriptions,
+                                         [{"start": 0, "name": "의상 A"}, {"start": 3, "name": "의상 B"}], vectors)
+    assert [visible_photo_count(scene) for scene in result] == [60, 120, 130]
+    assert names == ["의상 A", "의상 A", "의상 B"]
+    assert [p["id"] for scene in result for p in scene] == [p["id"] for scene in scenes for p in scene]
+    with pytest.raises(ValueError):
+        size_content_sections(scenes, descriptions, [{"start": 1, "name": "누락"}], vectors)
+
+
+def test_content_sections_keep_outfit_continuity_but_preserve_distinct_activities():
+    from app.scenes import size_content_sections
+    scenes = [[{"id": f"s{i}p{j}"} for j in range(10)] for i in range(4)]
+    descriptions = [{"place": str(i), "outfits": outfits} for i, outfits in enumerate(
+        (["드레스", "수트"], ["드레스"], [], ["다른 드레스"]))]
+    sections = [{"start": i, "name": f"구간 {i}", "outfits": d["outfits"]} for i, d in enumerate(descriptions)]
+    vectors = {p["id"]: [1, 0] for scene in scenes for p in scene}
+    merged, names = size_content_sections(scenes, descriptions, sections, vectors, outfit_based=True)
+    assert [len(scene) for scene in merged] == [30, 10]
+    assert names == ["드레스 · 수트", "다른 드레스"]
+    activities, _ = size_content_sections(scenes, descriptions, sections, vectors)
+    assert [len(scene) for scene in activities] == [10, 10, 10, 10]
+    # 같은 세트의 이름 오판은 노출 카드 수가 커도 분리 근거로 쓰지 않는다.
+    large = [[{"id": f"l{i}p{j}"} for j in range(70)] for i in range(2)]
+    same = {p["id"]: [1, 0] for scene in large for p in scene}
+    merged, _ = size_content_sections(large, descriptions[:2], [{"start": 0, "name": "같은 의상"}], same)
+    assert [len(scene) for scene in merged] == [140]
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_content_scene_run_counts_groups_before_similarity_is_saved_and_rejects_bad_plan(monkeypatch, valid):
+    from app import customer_ai
+    rows = [{"id": f"p{i}", "order_index": i, "taken_at_source": "file", "taken_at": None,
+             "thumb_url": "u", "preview_url": "u", "similarity_group_id": None} for i in range(100)]
+    saved = []
+
+    async def embeddings(*args):
+        return [[1., 0.]] * len(rows)
+
+    async def describe(*args):
+        return {"place": "세트", "outfits": ["수트"]}
+
+    async def plan(client, scenes, *args):
+        from app.scenes import visible_photo_count
+        assert visible_photo_count(scenes[0]) == 1
+        return {"basis": "outfit", "sections": [{"start": 0 if valid else 1, "name": "수트"}]}
+
+    monkeypatch.setattr(customer_ai, "_embeddings", embeddings)
+    monkeypatch.setattr(customer_ai, "_describe_scene", describe)
+    monkeypatch.setattr(customer_ai, "_plan_content_sections", plan)
+    monkeypatch.setattr(customer_ai, "_replace_scenes", lambda db, pid, scenes, names: saved.append((scenes, names)))
+    _, done = _fake_scene_run(monkeypatch, rows)
+    if valid:
+        assert saved[0][1] == ["수트"] and len(saved[0][0][0]) == 100
+        assert done["error"] is None
+    else:
+        assert saved == [] and "invalid content section boundaries" in done["error"]

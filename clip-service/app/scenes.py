@@ -107,8 +107,8 @@ def split_scenes(photos: list[dict], gap_seconds: float = SCENE_GAP_SECONDS) -> 
 
 
 # 내용 기준 장면: 촬영 시각이 없으면(포토샵 내보내기 보정본 등 — EXIF에 시각이 빠짐) 업로드 순서(= 파일명 순서)로 늘어놓고
-# 앞뒤 CONTENT_WINDOW장 평균 임베딩의 코사인 유사도가 크게 떨어지는 곳마다 잘게 자른 뒤, AI가 본 장소·의상이 같은 이웃을 합친다
-# (`merge_described`). 사진 수로 장면 수를 정하면 촬영마다 틀렸다(2026-10-07): 흰 세트를 길게 찍은 2,249장은 너무 잘게,
+# 앞뒤 CONTENT_WINDOW장 평균 임베딩의 코사인 유사도가 크게 떨어지는 곳마다 경계 후보를 찾는다. 이후 전체 대표 사진으로
+# 큰 촬영 흐름을 잡고 size_content_sections에서 노출 카드 수에 따라 분리한다. 사진 수만으로 장면 수를 정하면 촬영마다 틀렸다:
 # 세트 27곳을 15~40장씩 찍은 636장은 세트 절반을 놓쳤다. 잘게 자르면 636장에서 세트 경계 26개 중 24개를 잡는다.
 # ponytail: 웨딩 스튜디오 두 건으로 정한 값. 정답 경계 데이터가 더 모이면 기준값을 다시 맞춘다.
 CONTENT_WINDOW = 5
@@ -121,11 +121,15 @@ CONTENT_MERGE_SIMILARITY = 0.95
 # 20장짜리 오판 조각도 흡수하되, 실제 짧은 세트는 남긴다. 636장 비교 촬영의 16장 야외 세트는 이웃과 0.920이었다.
 CONTENT_ABSORB_MAX_PHOTOS = 20
 CONTENT_ABSORB_MIN_SIMILARITY = 0.925
+# 유사컷을 접은 카드 수. 검증용 시작값이며 의미 있는 경계가 없으면 상한을 넘겨도 유지한다.
+CONTENT_VISIBLE_TARGET = 60
+CONTENT_VISIBLE_MAX = 120
+CONTENT_VISIBLE_MIN = 20
 
 
 def split_by_content(photos: list[dict], vectors: list) -> Optional[list[list[dict]]]:
     """photos: split_scenes와 같은 형식, vectors: 같은 순서의 임베딩(없으면 None). 사진이 적거나 임베딩이 없는 사진이 있으면 None.
-    반환: 업로드 순서 장면 목록(잘게 — 이름을 붙인 뒤 merge_described로 합친다)."""
+    반환: 업로드 순서의 작은 구간 목록(큰 촬영 흐름을 정하고 크기를 나눌 때 쓸 경계 후보)."""
     if len(photos) < MIN_PHOTOS_FOR_SCENES or any(vector is None for vector in vectors):
         return None
     order = sorted(range(len(photos)), key=lambda i: photos[i]["order_index"])
@@ -197,6 +201,79 @@ def described_name(description: Optional[dict]) -> Optional[str]:
     if not description:
         return None
     return " · ".join(part for part in (description["place"], ", ".join(description["outfits"])) if part)
+
+
+def visible_photo_count(photos: list[dict]) -> int:
+    """FE의 모두 보기·유사컷 접기와 같은 수: 그룹마다 표지 하나, 나머지는 사진마다 하나."""
+    return len({("group", p["similarity_group_id"]) if p.get("similarity_group_id") else ("photo", p["id"])
+                for p in photos})
+
+
+def size_content_sections(scenes: list[list[dict]], descriptions: list[Optional[dict]],
+                          sections: list[dict], vectors: dict, outfit_based: bool = False) -> tuple[list[list[dict]], list[str]]:
+    """큰 촬영 흐름은 유지하고, 노출 카드가 너무 많을 때만 기존 내용 경계에서 나눈다."""
+    starts = [section["start"] for section in sections]
+    if not starts or starts[0] != 0 or starts != sorted(set(starts)) or starts[-1] >= len(scenes):
+        raise ValueError("invalid content section boundaries")
+    sections = list(sections)
+    if outfit_based:
+        continuous = []
+        for section in sections:
+            outfits = set(section.get("outfits", []))
+            previous = set(continuous[-1].get("outfits", [])) if continuous else set()
+            if outfits and previous and (outfits <= previous or previous <= outfits):
+                if previous < outfits:
+                    continuous[-1] = {**section, "start": continuous[-1]["start"]}
+            else:
+                continuous.append(section)
+        sections = continuous
+        # 의상 구간에 사람이 없는 짧은 디테일이 독립 구간으로 오판된 경우만 흡수한다. 활동 중심 촬영의 빈 무대 등은 보존.
+        for i in range(len(sections) - 1, -1, -1):
+            lo = sections[i]["start"]
+            hi = sections[i + 1]["start"] if i + 1 < len(sections) else len(scenes)
+            photos = [p for scene in scenes[lo:hi] for p in scene]
+            if (len(sections) > 1 and visible_photo_count(photos) < CONTENT_VISIBLE_MIN
+                    and all(d is not None and not d["outfits"] for d in descriptions[lo:hi])):
+                if i == 0:
+                    sections[1] = {**sections[1], "start": 0}
+                del sections[i]
+        starts = [section["start"] for section in sections]
+    result, names = [], []
+
+    def emit(lo, hi, name):
+        photos = [photo for scene in scenes[lo:hi] for photo in scene]
+        count = visible_photo_count(photos)
+        cuts = []
+        if count > CONTENT_VISIBLE_MAX:
+            for cut in range(lo + 1, hi):
+                before, after = descriptions[cut - 1], descriptions[cut]
+                similarity = float(_centroid(scenes[cut - 1], vectors) @ _centroid(scenes[cut], vectors))
+                if similarity >= CONTENT_MERGE_SIMILARITY:
+                    continue  # 이름 오판만으로 같은 세트를 자르지 않는다.
+                changed = before and after and before["place"] != after["place"]
+                if before and after and not changed:
+                    continue
+                if not (before and after) and similarity >= CONTENT_CUT_SIMILARITY:
+                    continue
+                left = visible_photo_count([p for scene in scenes[lo:cut] for p in scene])
+                right = visible_photo_count([p for scene in scenes[cut:hi] for p in scene])
+                if min(left, right) >= CONTENT_VISIBLE_MIN:
+                    cuts.append((abs(left - CONTENT_VISIBLE_TARGET), similarity, cut))
+        if cuts:
+            cut = min(cuts)[2]
+            emit(lo, cut, name)
+            emit(cut, hi, name)
+        else:
+            result.append(photos)
+            names.append(name)
+
+    for section, end in zip(sections, [*starts[1:], len(scenes)]):
+        name = (" · ".join(section.get("outfits", [])) if outfit_based and section.get("outfits")
+                else section["name"]).strip()
+        if not name:
+            raise ValueError("empty content section name")
+        emit(section["start"], end, name)
+    return result, names
 
 
 # 장소 기준 장면(홈스냅): 사진마다 판정한 장소가 바뀌는 곳에서 나눈다 — 방을 쉬지 않고 옮기면 시간 공백으로는 못 잡는다.

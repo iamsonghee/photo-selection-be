@@ -10,7 +10,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 from google.genai import types
@@ -24,11 +24,11 @@ from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
 from app.gemini_quality_client import UNKNOWN_PLACE, _build_usage, assess_images, customer_service_tier, sum_usage
 from app.grouping import (SHOT_ANCHOR_MARGIN, SHOT_MAX, SHOT_MAX_GAP_SECONDS, SHOT_MIN, SHOT_PERCENTILE, group_shots)
-from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_ABSORB_MAX_PHOTOS, CONTENT_ABSORB_MIN_SIMILARITY,
-                        CONTENT_CUT_SIMILARITY, CONTENT_MAX_SCENES, CONTENT_MERGE_SIMILARITY,
-                        CONTENT_MIN_SCENE_PHOTOS, CONTENT_WINDOW, DESCRIBED_MERGE_MIN_SIMILARITY, MIN_PHOTOS_FOR_SCENES,
-                        MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS, described_name, merge_described,
-                        scene_gap, scene_taken_at, split_by_content, split_by_place, split_scenes)
+from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_CUT_SIMILARITY, CONTENT_MAX_SCENES,
+                        CONTENT_MIN_SCENE_PHOTOS, CONTENT_WINDOW, MIN_PHOTOS_FOR_SCENES,
+                        MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS,
+                        CONTENT_VISIBLE_MAX, CONTENT_VISIBLE_MIN, CONTENT_VISIBLE_TARGET,
+                        scene_gap, scene_taken_at, size_content_sections, split_by_content, split_by_place, split_scenes)
 
 logger = logging.getLogger(__name__)
 OTHER_SCENE = "기타 장면"
@@ -41,18 +41,20 @@ PLACELESS_ABSORB_PHOTOS = 20
 CUSTOMER_QUALITY_PROMPT_VERSION = f"{GEMINI_QUALITY_PROMPT_VERSION}-people"
 # 장소 기준 장면(홈스냅)에서 실행 settings에 남기는 값 — 시간 기준 장면과 검수 채점에서 구분.
 # 내용 기준 장면(촬영 시각 없음) 묘사: 이름 목록에서 고르면 웨딩 촬영은 실내가 전부 "스튜디오"가 됐다(2,249장에서 30개 중 24개).
-# 장소·의상을 짧게 적게 하고 같은 것끼리 합친다. 앞 장면 표현을 넘겨야 같은 세트를 같은 말로 적는다. 대표 사진은 이름 고르기(3장)보다
+# 작은 구간의 배경·의상 묘사는 큰 구간의 분리 후보를 고를 때 쓴다. 앞 표현을 넘겨야 같은 세트를 같은 말로 적는다. 대표 사진은 이름 고르기(3장)보다
 # 많이 본다 — 3장으로는 어두운 유리창 너머 브라운 수트를 검정 턱시도로 읽었다.
-DESCRIBE_PROMPT_VERSION = "describe-v5-prop-priority"
+DESCRIBE_PROMPT_VERSION = "describe-v6-general-props"
 DESCRIBE_SAMPLE_PHOTOS = 5
+SECTION_PROMPT_VERSION = "sections-v3-outfit-continuity"
+SECTION_SAMPLE_PHOTOS = 2
 # 내용 기준 장면(촬영 시각 없음)에서 실행 settings에 남기는 값.
 CONTENT_SCENE_SETTINGS = {"boundary": "content", "contentWindow": CONTENT_WINDOW, "contentCutSimilarity": CONTENT_CUT_SIMILARITY,
                           "contentMinScenePhotos": CONTENT_MIN_SCENE_PHOTOS, "contentMaxScenes": CONTENT_MAX_SCENES,
-                          "describedMergeMinSimilarity": DESCRIBED_MERGE_MIN_SIMILARITY, "contentMergeSimilarity": CONTENT_MERGE_SIMILARITY,
-                          "contentAbsorbMaxPhotos": CONTENT_ABSORB_MAX_PHOTOS,
-                          "contentAbsorbMinSimilarity": CONTENT_ABSORB_MIN_SIMILARITY,
                           "embeddingModel": GEMINI_EMBEDDING_MODEL, "namePromptVersion": DESCRIBE_PROMPT_VERSION,
-                          "sampleCount": DESCRIBE_SAMPLE_PHOTOS}
+                          "sampleCount": DESCRIBE_SAMPLE_PHOTOS, "sectionPromptVersion": SECTION_PROMPT_VERSION,
+                          "sectionSampleCount": SECTION_SAMPLE_PHOTOS, "visibleTarget": CONTENT_VISIBLE_TARGET,
+                          "visibleMax": CONTENT_VISIBLE_MAX, "visibleMinSplit": CONTENT_VISIBLE_MIN,
+                          "visibleGrouping": "adaptive-anchor-gap"}
 PLACE_SCENE_SETTINGS = {"boundary": "place", "placeWindow": PLACE_WINDOW, "placeMinRun": PLACE_MIN_RUN, "hardCutSeconds": CLOSE_GAP_SECONDS}
 
 
@@ -273,7 +275,6 @@ async def _describe_scene(client, images: list[bytes], places: list[str], outfit
         "배경뿐 아니라 주요 소품과 연출까지 앞 장면과 같을 때만 아래 장소 표현을 그대로(띄어쓰기까지) 다시 쓰세요. "
         "같은 배경이어도 하트 풍선·하트 티셔츠·꽃잎·리본·부케 같은 소품이 바뀌면 반드시 그 소품으로 새 place를 쓰세요. "
         "눈에 띄는 소품이 하나라도 있으면 흰 벽·흰 커튼 같은 일반 배경보다 소품을 우선하세요. 대표 사진에 보이지 않는 기존 표현은 쓰지 말고, "
-        "분홍 꽃잎·리본이 보이면 place에 '분홍 꽃잎'을, 하트 무늬 소품·티셔츠가 보이면 '하트'를 반드시 포함하세요. "
         "인물 한 명의 작은 장신구보다 여러 대표 사진에 공통으로 보이는 특징을 고르세요. "
         "의상도 같다고 확실할 때만 기존 표현을 그대로 쓰세요.\n"
         f"이미 쓴 장소: {', '.join(places) or '없음'}\n이미 쓴 의상: {', '.join(outfits) or '없음'}"
@@ -292,6 +293,61 @@ async def _describe_scene(client, images: list[bytes], places: list[str], outfit
     except Exception as exc:
         logger.warning("scene describing failed: %s", exc)
         return None
+
+
+class _ContentSection(BaseModel):
+    start: int
+    name: str
+    outfits: list[str]
+
+
+class _ContentSections(BaseModel):
+    basis: Literal["outfit", "activity"]
+    sections: list[_ContentSection]
+
+
+async def _plan_content_sections(client, scenes, descriptions, shoot_type, flagged, usages=None, check_running=None):
+    """전체 구간의 대표 사진으로 큰 촬영 흐름을 정한다. 크기 분할은 size_content_sections에서 한다."""
+    samples = [pick_samples(scene, flagged, SECTION_SAMPLE_PHOTOS) for scene in scenes]
+    urls = [photo["preview_url"] for sample in samples for photo in sample]
+    images = []
+    for start in range(0, len(urls), BATCH_PHOTOS):
+        if check_running:
+            check_running()
+        images.extend(await download_all(urls[start:start + BATCH_PHOTOS]))
+    contents = [
+        "아래 구간들은 한 촬영의 시간순 연속 구간입니다. 전체 촬영 흐름을 보고 고객이 사진을 고르기 좋은 큰 구간으로 묶으세요.\n"
+        "스튜디오·연출 촬영은 주인공 의상 조합이 확실히 바뀔 때 큰 구간을 나누세요. 같은 의상의 배경·소품·포즈 변화, "
+        "커플/단독 전환, 부케·반지 디테일은 같은 큰 구간입니다. 어두운 조명으로 색이 달라 보이는 의상은 전후 사진을 함께 보고 판단하세요.\n"
+        "행사·생활 촬영은 의상보다 활동·행사 단계·장소 이동을 우선하세요. 촬영 유형만으로 스튜디오라고 단정하지 말고 사진을 보세요.\n"
+        "basis는 의상 중심 연출 촬영이면 outfit, 행사·생활의 활동 중심이면 activity입니다. "
+        "outfit일 때 반지·부케 같은 인물 없는 디테일 구간을 독립 sections로 만들지 말고 같은 촬영의 앞뒤 의상 구간에 포함하세요.\n"
+        "각 section의 outfits에는 주인공별 의상 식별 표현을 적고 동일한 의상에는 전체 구간에서 정확히 같은 표현을 쓰세요. "
+        "다른 드레스라면 색이 같아도 실루엣·재질의 뚜렷한 차이를 표현에 포함하세요. 한 사람이 안 보이는 것은 의상 변화가 아닙니다. "
+        "같은 드레스의 신부 단독과 커플 구간, 같은 의상의 실내와 야외·야간은 한 section으로 묶으세요. activity의 outfits는 []여도 됩니다.\n"
+        "의상이나 활동의 확실한 변화는 짧아도 보존하되 근거 없이 잘게 나누지 마세요. 같은 의상이 나중에 돌아와도 "
+        "중간 구간을 건너뛰어 합치지 마세요. 장수와 크기에 따른 분리는 이후 별도로 하므로 여기서는 의미 있는 큰 흐름만 정하세요.\n"
+        "기존 묘사는 오판할 수 있으니 사진을 우선하세요. 이름은 큰 구간 전체를 대표하는 짧은 한국어(의상 조합 또는 활동·장소)로 적으세요.\n"
+        "sections는 {start: 시작 구간 번호(0부터), name: 이름, outfits: 의상 식별 표현 목록}입니다. 첫 start는 0, 이후는 엄격한 오름차순이고 "
+        "각 구간은 다음 start 직전까지 포함합니다. 구간 번호를 빠뜨리거나 순서를 바꾸지 마세요.\n"
+        f"촬영 유형: {shoot_type or '미지정'}, 전체 구간 수: {len(scenes)}"
+    ]
+    offset = 0
+    for index, (sample, description) in enumerate(zip(samples, descriptions)):
+        available = [image for image in images[offset:offset + len(sample)] if image]
+        offset += len(sample)
+        if not available:
+            raise ValueError(f"content section {index} has no representative image")
+        contents.append(f"구간 {index}: 기존 묘사 {json.dumps(description, ensure_ascii=False)}")
+        contents.extend(types.Part.from_bytes(data=image, mime_type="image/jpeg") for image in available)
+    if check_running:
+        check_running()
+    response = await client.aio.models.generate_content(
+        model=GEMINI_FLASH_MODEL, contents=contents,
+        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=_ContentSections, temperature=0))
+    if usages is not None and (usage := _build_usage(response)):
+        usages.append(usage)
+    return _ContentSections.model_validate_json(response.text).model_dump()
 
 
 def merge_same_named(scenes: list[list[dict]], names: list[Optional[str]]) -> tuple[list[list[dict]], list[Optional[str]]]:
@@ -444,8 +500,8 @@ async def run_scene(run_id: str, project_id: str, scene_names: Optional[list[str
 
 
 async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[list[str]], gap_seconds: int):
-    """장면 정리: 촬영 시각 공백으로 나누고(이름 목록이 있으면 장면당 대표 사진 몇 장으로 이름을 붙여) 저장한다.
-    전체 사진 임베딩이 필요 없어 유사컷 분석과 따로 돈다. 진행 수는 이름 붙일 장면 수 기준.
+    """장면 정리: 촬영 시각이 있으면 공백으로, 없으면 내용 기반 큰 촬영 구간과 노출 카드 수로 나누어 저장한다.
+    시각 없는 경로는 유사컷과 같은 임베딩을 재사용한다. 진행 수는 작은 구간을 묘사한 수 기준.
     이름 붙이기(Gemini·다운로드)를 다 끝낸 뒤에 기존 장면을 바꾼다 — 도중에 서비스가 재시작돼도 기존 장면은 남는다.
     나눌 근거가 없으면(사진이 적거나 촬영 시각 대부분이 없으면) 장면을 지운다."""
     settings = {**SCENE_SETTINGS, "gapSeconds": gap_seconds, "catalog": scene_names or [], "nameModel": GEMINI_FLASH_MODEL,
@@ -473,6 +529,12 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
             by_content = scenes is not None
             if by_content:
                 settings.update(CONTENT_SCENE_SETTINGS)
+                # 동시에 시작한 유사컷 작업의 저장 시점과 무관하게 같은 카드 수로 장면 크기를 정한다(로컬 계산만).
+                rows = [{**row, "similarity_group_id": None} for row in rows]
+                for members in group_shots([vectors[row["id"]] for row in rows], [_shot_time(row) for row in rows]):
+                    for index in members:
+                        rows[index]["similarity_group_id"] = rows[members[0]]["id"]
+                scenes = split_by_content(rows, [vectors[row["id"]] for row in rows])
         scenes = scenes or []
         names: list[Optional[str]] = [None] * len(scenes)
         # 내용 기준 장면은 이름 목록 없이 장소·의상을 적으므로 촬영 종류와 상관없이 전부 묻는다.
@@ -511,9 +573,16 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
                 if name is not None:
                     named[key] = name
                 tick()
-            if by_content:  # 잘게 자른 장면을 장소·의상이 같은(또는 사진이 거의 같은) 이웃끼리 합치고 "장소 · 의상"으로 부른다
-                scenes, descriptions = merge_described(scenes, descriptions, vectors)
-                names = [described_name(d) or OTHER_SCENE for d in descriptions]
+            if by_content:  # 큰 촬영 흐름을 먼저 잡고 유사컷 표지 수가 많을 때만 내용 경계에서 나눈다.
+                _ensure_running(db, run_id)
+                client = client or await get_client()
+                flagged = flagged if flagged is not None else _flagged_photos(db, project_id)
+                project = db.table("customer_projects").select("shoot_type").eq("id", project_id).single().execute().data
+                plan = await _plan_content_sections(client, scenes, descriptions, project.get("shoot_type"), flagged, usages,
+                                                    lambda: _ensure_running(db, run_id))
+                scenes, names = size_content_sections(scenes, descriptions, plan["sections"], vectors,
+                                                     outfit_based=plan["basis"] == "outfit")
+                settings["sectionPlan"] = plan
             else:
                 scenes, names = merge_same_named(*absorb_placeless(scenes, names))
             names = number_repeated(names)
