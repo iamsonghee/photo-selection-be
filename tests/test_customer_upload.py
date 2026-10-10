@@ -167,6 +167,33 @@ class CustomerUploadTest(unittest.TestCase):
             "customer-photos/project-1/retouched/version-1_preview.jpg",
         ])
 
+    def _retouch_delete(self, photo_rows):
+        supabase = MagicMock()
+        versions = MagicMock()
+        versions.select.return_value.eq.return_value.execute.return_value.data = [{"id": "version-1", "photo_id": "photo-1"}]
+        photos = MagicMock()
+        photos.select.return_value.eq.return_value.eq.return_value.execute.return_value.data = photo_rows
+        supabase.table.side_effect = lambda name: {"customer_photo_versions": versions, "customer_photos": photos}[name]
+        with patch.object(customer_upload, "get_supabase", return_value=supabase), patch.object(
+            customer_upload, "_authorize_customer_project", return_value={"id": "project-1"}
+        ), patch.object(customer_upload, "delete_r2_objects") as delete_r2:
+            result = asyncio.run(customer_upload.delete_customer_retouched_photo("version-1", "project-1", None))
+        return result, versions, delete_r2
+
+    def test_retouched_delete_removes_row_and_r2(self):
+        result, versions, delete_r2 = self._retouch_delete([{"id": "photo-1"}])
+        self.assertEqual(result, {"deleted": True})
+        versions.delete.return_value.eq.assert_called_once_with("id", "version-1")
+        delete_r2.assert_called_once_with([
+            "customer-photos/project-1/retouched/version-1_thumb.jpg",
+            "customer-photos/project-1/retouched/version-1_preview.jpg",
+        ])
+
+    def test_retouched_delete_rejects_other_project_version(self):
+        with self.assertRaises(HTTPException) as raised:
+            self._retouch_delete([])
+        self.assertEqual(raised.exception.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

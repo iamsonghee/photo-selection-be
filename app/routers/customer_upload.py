@@ -587,3 +587,35 @@ async def upload_customer_retouched_photos(
         raise HTTPException(status_code=500, detail="보정본 저장 실패") from e
 
     return {"uploaded": len(rows), "rejected": rejected_filenames, "versions": rows}
+
+
+@router.delete("/retouched/{version_id}")
+async def delete_customer_retouched_photo(
+    version_id: str,
+    project_id: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+):
+    """잘못 연결해 올린 보정본 한 장을 지운다 — 다시 올리면 그 원본의 다음 회차로 붙는다."""
+    supabase = get_supabase()
+    project = _authorize_customer_project(supabase, project_id, credentials, None)
+    version = (
+        supabase.table("customer_photo_versions").select("id, photo_id").eq("id", version_id).execute()
+    ).data or []
+    owned = version and (
+        supabase.table("customer_photos").select("id").eq("project_id", project["id"]).eq("id", version[0]["photo_id"]).execute()
+    ).data
+    if not owned:
+        raise HTTPException(status_code=404, detail="이 프로젝트의 보정본이 아닙니다.")
+    try:
+        supabase.table("customer_photo_versions").delete().eq("id", version_id).execute()
+    except Exception as e:
+        logger.exception("customer retouched delete failed: %s", e)
+        raise HTTPException(status_code=500, detail="보정본 삭제 실패") from e
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, delete_r2_objects, [
+            f"customer-photos/{project['id']}/retouched/{version_id}_thumb.jpg",
+            f"customer-photos/{project['id']}/retouched/{version_id}_preview.jpg",
+        ])
+    except Exception as e:
+        logger.warning("deleted customer retouched R2 cleanup failed: %s", e)
+    return {"deleted": True}
