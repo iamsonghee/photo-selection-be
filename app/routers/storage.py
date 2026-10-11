@@ -29,8 +29,12 @@ class PresignBatchBody(BaseModel):
 
 
 @router.post("/delete")
-def delete_objects(body: DeleteKeysBody):
+def delete_objects(body: DeleteKeysBody, authorization: str = Header(None)):
     """R2에서 지정한 key들 삭제. body: { "keys": string[] }"""
+    if not INTERNAL_PRESIGN_SECRET:
+        raise HTTPException(status_code=503, detail="Storage secret not configured")
+    if authorization != f"Bearer {INTERNAL_PRESIGN_SECRET}":
+        raise HTTPException(status_code=403, detail="Forbidden")
     if not body.keys:
         return {"deleted": 0}
     try:

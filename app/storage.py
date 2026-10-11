@@ -99,14 +99,18 @@ def upload_local_file_to_r2(key: str, file_path: str, content_type: str) -> Opti
 
 def delete_r2_objects(keys: list[str]) -> int:
     """R2 버킷에서 지정한 key 목록 삭제. 삭제한 객체 수 반환."""
-    if not R2_BUCKET_NAME or not keys:
+    if not keys:
         return 0
+    if not R2_BUCKET_NAME:
+        raise ValueError("R2_BUCKET_NAME must be set")
     client = get_r2_client()
     # S3/R2 DeleteObjects API는 요청 하나당 최대 1,000개 key만 받는다. 프로젝트 전체
     # 삭제(썸네일·미리보기·납품 원본 포함)는 이보다 많을 수 있으므로 안전하게 나눈다.
     for start in range(0, len(keys), 1000):
         objects = [{"Key": k} for k in keys[start : start + 1000]]
-        client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": objects})
+        result = client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": objects})
+        if result.get("Errors"):
+            raise RuntimeError("R2 failed to delete one or more objects")
     return len(keys)
 
 
@@ -116,7 +120,7 @@ def delete_r2_objects_by_prefix(prefix: str) -> int:
     (프로젝트 삭제 시 photos/{photographer_id}/{project_id}/, versions/{project_id}/ 정리용)
     """
     if not R2_BUCKET_NAME:
-        return 0
+        raise ValueError("R2_BUCKET_NAME must be set")
     client = get_r2_client()
     deleted = 0
     paginator = client.get_paginator("list_objects_v2")
@@ -124,9 +128,7 @@ def delete_r2_objects_by_prefix(prefix: str) -> int:
         contents = page.get("Contents") or []
         if not contents:
             continue
-        keys = [{"Key": obj["Key"]} for obj in contents]
-        client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": keys})
-        deleted += len(keys)
+        deleted += delete_r2_objects([obj["Key"] for obj in contents])
     return deleted
 
 

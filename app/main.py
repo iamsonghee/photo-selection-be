@@ -69,7 +69,7 @@ def health_check_db():
     """Supabase 연결 확인: photographers 테이블 조회."""
     try:
         client = get_supabase()
-        r = client.table("photographers").select("*").limit(1).execute()
-        return {"status": "ok", "db": "connected", "photographers_sample": (r.data or [])}
+        r = client.table("photographers").select("id").limit(1).execute()
+        return {"status": "ok", "db": "connected"}
     except Exception as e:
         return {"status": "error", "db": "disconnected", "message": str(e)}
