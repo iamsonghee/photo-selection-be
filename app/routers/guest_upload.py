@@ -99,3 +99,17 @@ def delete(body: KeysBody, authorization: str = Header(None)):
         return {"deleted": delete_r2_objects(body.keys)}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"R2 삭제 실패: {e!s}") from e
+
+
+@router.post("/archive-urls")
+def archive_urls(body: KeysBody, authorization: str = Header(None)):
+    _require_internal(authorization)
+    from app.storage import get_r2_client, R2_BUCKET_NAME
+    pattern = re.compile(rf"^guest-albums/{_UUID}/archives/{_UUID}/{_UUID}\.zip$")
+    if any(not pattern.fullmatch(key) for key in body.keys):
+        raise HTTPException(status_code=400, detail="Invalid archive key")
+    client = get_r2_client()
+    return {"urls": {key: client.generate_presigned_url("get_object", Params={
+        "Bucket": R2_BUCKET_NAME, "Key": key,
+        "ResponseContentDisposition": 'attachment; filename="guest-photos.zip"',
+    }, ExpiresIn=900) for key in body.keys}}

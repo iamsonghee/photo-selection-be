@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.guest_lifecycle import guest_archive_worker, guest_cleanup_worker
 from app.database import get_supabase
 from app.routers import customer_upload, guest_upload, projects, storage, upload
 from app.routers.upload import original_compress_worker, stuck_job_sweep_worker
@@ -24,7 +25,11 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(original_archive_worker())
     asyncio.create_task(final_delivery_archive_worker())
     asyncio.create_task(archive_sweep_worker())
+    guest_tasks = [asyncio.create_task(guest_archive_worker()), asyncio.create_task(guest_cleanup_worker())]
     yield
+    for task in guest_tasks:
+        task.cancel()
+    await asyncio.gather(*guest_tasks, return_exceptions=True)
     logger.info("Shutting down...")
 
 
