@@ -1,5 +1,6 @@
 """Early PUT authorization/fallback and cleanup must fail closed on uncertain references."""
 import asyncio
+import time
 import io
 import unittest
 from types import SimpleNamespace
@@ -81,7 +82,7 @@ class OriginalReservationTest(unittest.TestCase):
                     original_last_modifieds=[self.body.last_modified], original_content_types=[self.body.content_type],
                     source_widths=[100], source_heights=[100], client_upload_ids=[str(self.body.client_upload_id)],
                     taken_ats=[], taken_at_sources=[],
-                    photographer_id=self.photographer,
+                    timed_photographer=(self.photographer, time.perf_counter()),
                 ))
         self.assertEqual(raised.exception.status_code, 409)
         process.assert_not_called()

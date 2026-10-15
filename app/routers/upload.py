@@ -10,7 +10,6 @@ import time
 import unicodedata
 import uuid as uuid_module
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from uuid import UUID
@@ -106,15 +105,13 @@ def _start_request_timer() -> float:
     return time.perf_counter()
 
 
-_request_started: ContextVar[Optional[float]] = ContextVar("upload_request_started", default=None)
-
-
 def _get_timed_photographer(
     request_started: float = Depends(_start_request_timer),
     photographer_id: UUID = Depends(get_current_photographer),
-) -> UUID:
-    _request_started.set(request_started)
-    return photographer_id
+) -> tuple[UUID, float]:
+    # 시작 시각을 값으로 함께 돌려준다 — 동기 의존성은 스레드풀에서 실행돼 ContextVar 설정이
+    # 엔드포인트로 전달되지 않는다(작가 확인 시간이 auth_ms·total_ms에서 빠졌었다).
+    return photographer_id, request_started
 
 
 def _log_photographer_upload_timing(project_id: str, files: int, include_original: bool,
@@ -594,10 +591,11 @@ async def upload_photos(
     client_upload_ids: list[str] = Form(default=[]),
     taken_ats: list[str] = Form(default=[]),
     taken_at_sources: list[str] = Form(default=[]),
-    photographer_id: UUID = Depends(_get_timed_photographer),
+    timed_photographer: tuple[UUID, float] = Depends(_get_timed_photographer),
 ):
+    photographer_id, request_started = timed_photographer
     timing = {
-        "start": _request_started.get() or time.perf_counter(),
+        "start": request_started,
         "ok": 0,
         "rejected": 0,
         "bytes": 0,
@@ -1044,10 +1042,11 @@ async def _upload_photos_impl(
 @router.post("/originals/confirm")
 async def confirm_original_upload(
     job_id: str = Form(...),
-    photographer_id: UUID = Depends(_get_timed_photographer),
+    timed_photographer: tuple[UUID, float] = Depends(_get_timed_photographer),
 ):
+    photographer_id, request_started = timed_photographer
     timing = {
-        "start": _request_started.get() or time.perf_counter(),
+        "start": request_started,
         "r2_head_ms": 0.0,
         "rpc_ms": 0.0,
     }

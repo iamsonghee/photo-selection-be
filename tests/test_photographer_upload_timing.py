@@ -78,9 +78,31 @@ class PhotographerUploadTimingTests(unittest.TestCase):
         ), patch.object(upload.logger, "info", side_effect=RuntimeError("log failed")):
             result = asyncio.run(upload.upload_photos(
                 "project-1", [object()], False, False,
-                [], [], [], [], [], [], [], [], [], uuid4(),
+                [], [], [], [], [], [], [], [], [], (uuid4(), time.perf_counter()),
             ))
         self.assertEqual(result, expected)
+
+
+    def test_timing_includes_photographer_auth_dependency(self):
+        # 동기 의존성(작가 확인)은 스레드풀에서 돈다 — 그 시간이 total_ms에 들어가야 한다.
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.dependencies import get_current_photographer
+
+        def slow_photographer():
+            time.sleep(0.3)
+            return uuid4()
+
+        app = FastAPI()
+        app.include_router(upload.router)
+        app.dependency_overrides[get_current_photographer] = slow_photographer
+        path = next(route.path for route in upload.router.routes if route.path.endswith("/photos"))
+        with patch.object(upload, "_upload_photos_impl", new=AsyncMock(return_value={"uploaded": 0, "rejected": []})), \
+                self.assertLogs(upload.logger, level="INFO") as logged:
+            response = TestClient(app).post(path, data={"project_id": "project-1"}, files={"files": ("a.jpg", b"x", "image/jpeg")})
+        self.assertEqual(response.status_code, 200)
+        total_ms = int(next(part for part in logged.output[-1].split() if part.startswith("total_ms=")).split("=")[1])
+        self.assertGreaterEqual(total_ms, 300)
 
 
 if __name__ == "__main__":

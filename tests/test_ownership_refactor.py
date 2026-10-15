@@ -2,6 +2,7 @@
 동작을 유지하는지 확인한다. 리팩터링 전 인라인 코드가 반환하던 status_code/detail을
 그대로 재현하는지가 핵심 — 새 동작을 검증하는 게 아니라 회귀를 잡는 테스트다."""
 import asyncio
+import time
 import unittest
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -131,7 +132,7 @@ class UploadRouterJobEndpointsOwnershipTest(unittest.TestCase):
     def test_confirm_original_upload(self):
         job_row = {"id": "job-1", "project_id": PROJECT_ID, "status": "completed", "r2_source_key": "k"}
         self._assert_404_and_403(
-            lambda photographer_id=PHOTOGRAPHER: upload.confirm_original_upload("job-1", photographer_id),
+            lambda photographer_id=PHOTOGRAPHER: upload.confirm_original_upload("job-1", (photographer_id, time.perf_counter())),
             job_row,
         )
 
