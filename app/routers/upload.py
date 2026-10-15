@@ -10,6 +10,7 @@ import time
 import unicodedata
 import uuid as uuid_module
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from uuid import UUID
@@ -96,6 +97,72 @@ R2_EXECUTOR_MAX_WORKERS = env_int("R2_EXECUTOR_MAX_WORKERS", 6, 2, 16)
 ORIGINAL_COMPRESS_CONCURRENCY = env_int("ORIGINAL_COMPRESS_CONCURRENCY", 4, 1, 8)
 # presigned PUT URL 유효 시간 (초)
 ORIGINAL_PRESIGNED_EXPIRES = 3600
+
+# 요청 하나가 이 시간을 넘기면 Railway에서 느린 배치를 바로 찾을 수 있게 warning으로 남긴다.
+SLOW_UPLOAD_SECONDS = 15.0
+
+
+def _start_request_timer() -> float:
+    return time.perf_counter()
+
+
+_request_started: ContextVar[Optional[float]] = ContextVar("upload_request_started", default=None)
+
+
+def _get_timed_photographer(
+    request_started: float = Depends(_start_request_timer),
+    photographer_id: UUID = Depends(get_current_photographer),
+) -> UUID:
+    _request_started.set(request_started)
+    return photographer_id
+
+
+def _log_photographer_upload_timing(project_id: str, files: int, include_original: bool,
+                                    timing: dict) -> None:
+    """작가 사진 배치의 구간별 시간. 계측 실패가 업로드 응답에 영향을 주지 않는다."""
+    try:
+        total = time.perf_counter() - timing["start"]
+        fields = {
+            "project": project_id,
+            "files": files,
+            "ok": timing["ok"],
+            "rejected": timing["rejected"],
+            "mb": round(timing["bytes"] / 1_048_576, 1),
+            "include_original": include_original,
+            "auth_ms": round(timing["auth_ms"] * 1000),
+            "db_pre_ms": round(timing["db_pre_ms"] * 1000),
+            "process_ms": round(timing["process_ms"] * 1000),
+            "resize_max_ms": round(max(timing["resize"], default=0) * 1000),
+            "r2_max_ms": round(max(timing["r2"], default=0) * 1000),
+            "db_insert_ms": round(timing["db_insert_ms"] * 1000),
+            "db_post_ms": round(timing["db_post_ms"] * 1000),
+            "presign_ms": round(timing["presign_ms"] * 1000),
+            "total_ms": round(total * 1000),
+        }
+        (logger.warning if total > SLOW_UPLOAD_SECONDS else logger.info)(
+            "photographer upload timing %s",
+            " ".join(f"{key}={value}" for key, value in fields.items()),
+        )
+    except Exception:
+        pass
+
+
+def _log_original_confirm_timing(project_id: str, timing: dict) -> None:
+    """원본 confirm 구간별 시간. 계측 실패가 confirm 응답에 영향을 주지 않는다."""
+    try:
+        total = time.perf_counter() - timing["start"]
+        fields = {
+            "project": project_id,
+            "r2_head_ms": round(timing["r2_head_ms"] * 1000),
+            "rpc_ms": round(timing["rpc_ms"] * 1000),
+            "total_ms": round(total * 1000),
+        }
+        (logger.warning if total > SLOW_UPLOAD_SECONDS else logger.info)(
+            "original confirm timing %s",
+            " ".join(f"{key}={value}" for key, value in fields.items()),
+        )
+    except Exception:
+        pass
 
 # 원본(납품) 파일 상한 (20MB)
 ORIGINAL_MAX_BYTES = 20 * 1024 * 1024
@@ -372,6 +439,7 @@ async def _process_one(
     include_original: bool = False,
     original_content_type: str = "",  # 브라우저 원본 파일의 MIME type (presigned key 확장자 결정용)
     client_upload_id: Optional[str] = None,
+    timings: Optional[dict[str, list[float]]] = None,
 ) -> Optional[Tuple[str, str, int, Optional[dict], int, int]]:
     """파일 하나: 썸네일+미리보기 생성 → R2 업로드.
     include_original=True 시 presigned PUT 정보를 반환 (원본 압축은 worker가 비동기 처리).
@@ -386,6 +454,7 @@ async def _process_one(
     # direct API -> Next proxy로 fallback해도 R2 고아 객체가 새로 생기지 않는다.
     photo_id = uuid_module.UUID(client_upload_id).hex if client_upload_id else uuid_module.uuid4().hex
 
+    resize_started = time.perf_counter()
     try:
         thumb_bytes, preview_bytes, decoded_width, decoded_height = await loop.run_in_executor(
             _cpu_executor,
@@ -396,10 +465,14 @@ async def _process_one(
         logger.error(f"에러내용: {e}")
         logger.warning("resize failed for index %s: %s", index, e)
         return None
+    finally:
+        if timings is not None:
+            timings["resize"].append(time.perf_counter() - resize_started)
 
     thumb_key = f"photos/{photographer_id}/{project_id}/{photo_id}_thumb.jpg"
     preview_key = f"photos/{photographer_id}/{project_id}/{photo_id}_preview.jpg"
 
+    r2_started = time.perf_counter()
     try:
         thumb_url, preview_url = await asyncio.gather(
             loop.run_in_executor(_r2_executor, _upload_to_r2_sync, thumb_key, thumb_bytes, "image/jpeg", IMMUTABLE_CACHE_CONTROL),
@@ -409,6 +482,9 @@ async def _process_one(
         logger.error(f"에러내용: {e}")
         logger.warning("R2 upload failed for index %s: %s", index, e)
         return None
+    finally:
+        if timings is not None:
+            timings["r2"].append(time.perf_counter() - r2_started)
 
     if not thumb_url or not preview_url:
         return None
@@ -518,7 +594,49 @@ async def upload_photos(
     client_upload_ids: list[str] = Form(default=[]),
     taken_ats: list[str] = Form(default=[]),
     taken_at_sources: list[str] = Form(default=[]),
-    photographer_id: UUID = Depends(get_current_photographer),
+    photographer_id: UUID = Depends(_get_timed_photographer),
+):
+    timing = {
+        "start": _request_started.get() or time.perf_counter(),
+        "ok": 0,
+        "rejected": 0,
+        "bytes": 0,
+        "auth_ms": 0.0,
+        "db_pre_ms": 0.0,
+        "process_ms": 0.0,
+        "resize": [],
+        "r2": [],
+        "db_insert_ms": 0.0,
+        "db_post_ms": 0.0,
+        "presign_ms": 0.0,
+    }
+    try:
+        return await _upload_photos_impl(
+            project_id, files, include_original, early_original_upload,
+            original_filenames, original_file_sizes, original_last_modifieds,
+            original_content_types, source_widths, source_heights,
+            client_upload_ids, taken_ats, taken_at_sources, photographer_id, timing,
+        )
+    finally:
+        _log_photographer_upload_timing(project_id, len(files), include_original, timing)
+
+
+async def _upload_photos_impl(
+    project_id: str,
+    files: list[UploadFile],
+    include_original: bool,
+    early_original_upload: bool,
+    original_filenames: list[str],
+    original_file_sizes: list[int],
+    original_last_modifieds: list[int],
+    original_content_types: list[str],
+    source_widths: list[int],
+    source_heights: list[int],
+    client_upload_ids: list[str],
+    taken_ats: list[str],
+    taken_at_sources: list[str],
+    photographer_id: UUID,
+    timing: dict,
 ):
     """
     사진 일괄 업로드: 썸네일(300px/75%) + 미리보기(1200px/82%) 생성 후 R2 병렬 업로드.
@@ -537,6 +655,7 @@ async def upload_photos(
 
     # 프로젝트 소유 확인
     project = require_owned_project(supabase, project_id, photographer_id, select="id, status")
+    timing["auth_ms"] = time.perf_counter() - timing["start"]
 
     # 허용된 파일만 읽음 (BUG-01: 거부 파일 목록 수집 / BUG-02: 소문자 정규화)
     valid: list[tuple[bytes, str, str, int]] = []  # (contents, content_type, compressed_filename, file_size)
@@ -567,6 +686,7 @@ async def upload_photos(
         if not contents:
             rejected_filenames.append(f.filename or "(unknown)")
             continue
+        timing["bytes"] += len(contents)
         valid.append((contents, ct, f.filename or "", len(contents)))
         # original_* 배열은 files와 인덱스 동기화 — 파싱 실패 시 압축 파일 정보로 fallback
         orig_fn = _normalize_filename(original_filenames[i]) if i < len(original_filenames) and original_filenames[i] else (f.filename or "")
@@ -598,6 +718,7 @@ async def upload_photos(
             }
         )
 
+    db_pre_started = time.perf_counter()
     if early_original_upload is True:
         if not include_original:
             raise HTTPException(status_code=400, detail="원본 업로드 설정을 확인해주세요.")
@@ -682,6 +803,7 @@ async def upload_photos(
                         accepted_new += 1
             valid = [valid[index] for index in accepted_indices]
             meta = [meta[index] for index in accepted_indices]
+    timing["db_pre_ms"] = time.perf_counter() - db_pre_started
 
     loop = asyncio.get_event_loop()
     effective_concurrency = UPLOAD_WITH_ORIGINAL_CONCURRENCY if include_original else UPLOAD_PHOTOS_CONCURRENCY
@@ -691,9 +813,10 @@ async def upload_photos(
         async with sem:
             return await _process_one(
                 loop, contents, index, project_id, photographer_id,
-                include_original, orig_ct, client_upload_id,
+                include_original, orig_ct, client_upload_id, timing,
             )
 
+    process_started = time.perf_counter()
     results = await asyncio.gather(
         *[
             _limited_process_one(contents, idx, meta[idx][1], meta[idx][4])
@@ -701,6 +824,7 @@ async def upload_photos(
         ],
         return_exceptions=True,
     )
+    timing["process_ms"] = time.perf_counter() - process_started
 
     # asyncio.gather는 입력 순서를 보존하므로, valid의 원래 파일 순서 그대로 number가 매겨진다.
     rows: list[dict] = []
@@ -780,9 +904,11 @@ async def upload_photos(
         print(f"[mem] after_batch_trim rss={_rss_mb():.1f}MB", flush=True)
 
     if not rows:
+        timing["rejected"] = len(rejected_filenames)
         return {"uploaded": 0, "rejected": rejected_filenames}
 
     # number 할당 + INSERT를 한 트랜잭션(RPC) 안에서 원자 처리 — 동시 업로드 배치 간 번호 충돌 방지
+    db_insert_started = time.perf_counter()
     try:
         inserted = _insert_photos_with_numbers(supabase, project_id, rows)
     except Exception as e:
@@ -791,10 +917,13 @@ async def upload_photos(
         logger.error(f"에러내용: {e}")
         logger.exception("photos insert failed: %s", e)
         raise HTTPException(status_code=500, detail="사진 저장 실패") from e
+    finally:
+        timing["db_insert_ms"] = time.perf_counter() - db_insert_started
 
     if not inserted:
         raise HTTPException(status_code=500, detail="사진 저장 실패")
 
+    db_post_started = time.perf_counter()
     count_res = (
         supabase.table("photos")
         .select("id", count="exact")
@@ -836,7 +965,9 @@ async def upload_photos(
         except Exception as e:
             # job은 이미 저장됐다. 다음 페이지 진입 시 복구 배너가 다시 조회할 수 있다.
             logger.exception("created original_jobs lookup failed: %s", e)
+    timing["db_post_ms"] = time.perf_counter() - db_post_started
 
+    presign_started = time.perf_counter()
     for photo_row, (presigned_info, _orig_fn, _orig_ct, _orig_sz, _orig_lm, _client_upload_id) in zip(inserted, presigned_infos):
         if not presigned_info:
             continue
@@ -879,6 +1010,7 @@ async def upload_photos(
             })
         except Exception as e:
             logger.exception("original presign failed for photo %s: %s", photo_row["id"], e)
+    timing["presign_ms"] = time.perf_counter() - presign_started
 
     replayed = sum(1 for item in presigned_infos if item[5] and item[5] in existing_client_ids)
     if replayed:
@@ -902,6 +1034,8 @@ async def upload_photos(
     }
     if original_presigned_response:
         response["original_presigned"] = original_presigned_response
+    timing["ok"] = len(inserted)
+    timing["rejected"] = len(rejected_filenames)
     return response
 
 
@@ -910,17 +1044,32 @@ async def upload_photos(
 @router.post("/originals/confirm")
 async def confirm_original_upload(
     job_id: str = Form(...),
-    photographer_id: UUID = Depends(get_current_photographer),
+    photographer_id: UUID = Depends(_get_timed_photographer),
 ):
+    timing = {
+        "start": _request_started.get() or time.perf_counter(),
+        "r2_head_ms": 0.0,
+        "rpc_ms": 0.0,
+    }
+    try:
+        return await _confirm_original_upload_impl(job_id, photographer_id, timing)
+    finally:
+        _log_original_confirm_timing(timing.get("project", "unknown"), timing)
+
+
+async def _confirm_original_upload_impl(job_id: str, photographer_id: UUID, timing: dict):
     """presigned PUT 완료 통지: 소유권 확인 → 멱등 상태 체크 → R2 HEAD → pending 전이."""
     supabase = get_supabase()
     # 소유권 확인 (job → project → photographer)
     job = require_owned_job(supabase, job_id, photographer_id, select="id,status,r2_source_key,project_id")
+    project_id = str(job["project_id"])
+    timing["project"] = project_id
     # 멱등: 이미 pending/processing/completed이면 바로 OK 반환
     if job["status"] in ("pending", "processing", "completed"):
         return {"ok": True}
     # awaiting_upload: R2 HEAD로 파일 실제 존재 확인 (서버 측 수행)
     loop = asyncio.get_event_loop()
+    r2_head_started = time.perf_counter()
     try:
         await loop.run_in_executor(_executor, _head_r2_object_sync, job["r2_source_key"])
     except KeyError:
@@ -928,12 +1077,17 @@ async def confirm_original_upload(
     except Exception as e:
         logger.exception("R2 HEAD failed for job %s: %s", job_id, e)
         raise HTTPException(status_code=502, detail=f"R2 HEAD 확인 실패: {e}")
+    finally:
+        timing["r2_head_ms"] = time.perf_counter() - r2_head_started
     # 조건부 UPDATE: status = 'awaiting_upload' 행만 전이 (RPC 내부에서 WHERE status='awaiting_upload')
+    rpc_started = time.perf_counter()
     try:
         supabase.rpc("confirm_original_upload", {"p_job_id": job_id}).execute()
     except Exception as e:
         logger.exception("confirm_original_upload RPC failed for job %s: %s", job_id, e)
         raise HTTPException(status_code=500, detail="confirm 처리 실패") from e
+    finally:
+        timing["rpc_ms"] = time.perf_counter() - rpc_started
     return {"ok": True}
 
 
