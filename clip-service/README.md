@@ -4,14 +4,34 @@ CLIP 임베딩 기반 유사컷(burst shot) 그룹핑 분석 서비스. `photo-s
 
 ## 로컬 실행
 
+로컬 FE는 로컬 clip-service를 본다(FE `.env.local`의 `CLIP_SERVICE_URL=http://localhost:8001`, FE `.env.example` 참고).
+배포된 clip-service를 보면 아직 배포하지 않은 clip-service 변경이 테스트되지 않는다 — 오류 없이 예전 동작이 나온다.
+로컬 clip-service가 꺼져 있으면 FE의 AI 정리 시작·작가 Gemini 분석·보정본 매칭이 실패하고, 사진 삭제 뒤 유사컷 묶음 동기화를 건너뛴다.
+
 ```bash
 cd clip-service
-python -m venv .venv && source .venv/bin/activate
-pip install --index-url https://download.pytorch.org/whl/cpu torch
-pip install -r requirements.txt
-cp .env.example .env  # 값 채우기
-uvicorn app.main:app --reload --port 8001
+python3.11 -m venv .venv
+.venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env  # 값 채우기 — 아래 표
+.venv/bin/uvicorn app.main:app --port 8001
 ```
+
+- Python 3.11(배포 Dockerfile과 같음). 시작할 때 `app.main`이 torch·opencv를 불러오므로 AI 정리만 쓸 때도 전체 설치가 필요하다(약 1.6GB, macOS arm64 휠 있음).
+- **`--reload`를 쓰지 않는다.** AI 정리 실행은 이 프로세스 안에서 백그라운드로 수십 분 돈다. 재시작되면 끊기고 10분 뒤 실패로 처리된다.
+  대신 clip-service 코드를 바꾸거나 브랜치를 옮기면 직접 재시작해야 그 코드가 돈다.
+- 시작할 때 도는 작업은 없다. FE에서 요청이 올 때만 일한다. 다만 로컬 `.env`는 운영 Supabase를 가리키고 Gemini 키는 유료이므로,
+  로컬 실행도 운영 DB에 쓰고 비용이 든다. 테스트는 전용 테스트 프로젝트에서 하고, 같은 프로젝트를 다른 판정 버전(배포본·다른 브랜치)으로
+  번갈아 돌리지 않는다 — 판정 버전이 바뀔 때마다 전체 사진을 다시 판정한다.
+
+| `.env` 키 | 필수 | 값 |
+|---|---|---|
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | 예 | BE `.env`와 같은 값 |
+| `CLIP_INTERNAL_TOKEN` | 예 | 그 사람 FE `.env.local`의 `CLIP_INTERNAL_TOKEN`과 같은 값(운영 값이 아니어도 됨) |
+| `GEMINI_API_KEY` | AI 기능 쓸 때 | Gemini 키 |
+| `GEMINI_CUSTOMER_QUALITY_SERVICE_TIER` | 아니오 | 셀프 고객 흔들림 판정 티어. 없으면 `standard`. `flex`는 절반 가격·지연 가변 |
+
+확인: `curl http://localhost:8001/health` → `{"status":"ok"}`. 포트 8001은 로컬 clip-service용이다(BE는 8000, FE는 3001).
 
 ## API (OpenCLIP)
 
