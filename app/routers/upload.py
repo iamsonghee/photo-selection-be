@@ -1003,6 +1003,8 @@ async def _upload_photos_impl(
             presigned_url = generate_presigned_put_url(source_key, ct, ORIGINAL_PRESIGNED_EXPIRES)
             original_presigned_response.append({
                 "job_id": job["id"],
+                # 여러 장을 한 요청으로 보낼 때 FE가 사진과 원본 주소를 짝짓는 키(실패한 사진은 항목이 빠진다).
+                "client_upload_id": _client_upload_id,
                 "url": presigned_url,
                 "source_key": source_key,
                 "content_type": ct,
