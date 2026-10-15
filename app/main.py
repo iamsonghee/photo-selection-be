@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,6 +14,15 @@ from app.original_upload_reservations import original_reservation_sweep_worker
 from app.archive import original_archive_worker, archive_sweep_worker, final_delivery_archive_worker
 
 logger = logging.getLogger(__name__)
+
+# 앱 로거(app.*)의 INFO를 표준 출력으로 내보낸다 — 로그 설정이 없으면 파이썬 기본값(WARNING)이라
+# 업로드 단계별 시간·워커 진행 로그가 Railway에 하나도 남지 않았다(2026-10-16 확인).
+_app_logger = logging.getLogger("app")
+_app_logger.setLevel(logging.INFO)
+if not _app_logger.handlers:
+    _app_log_handler = logging.StreamHandler(sys.stdout)
+    _app_log_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    _app_logger.addHandler(_app_log_handler)
 
 
 @asynccontextmanager
