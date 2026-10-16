@@ -30,7 +30,9 @@ from pillow_heif import register_heif_opener
 register_heif_opener()
 
 from app.database import get_supabase
-from app.dependencies import get_current_photographer
+import httpx
+
+from app.dependencies import _is_retryable_gateway_error, get_current_photographer
 from app.beta_policy import get_max_photos_per_project
 from app.env_utils import env_int
 from app.ownership import require_owned_job, require_owned_project
@@ -99,6 +101,28 @@ ORIGINAL_PRESIGNED_EXPIRES = 3600
 
 # 요청 하나가 이 시간을 넘기면 Railway에서 느린 배치를 바로 찾을 수 있게 warning으로 남긴다.
 SLOW_UPLOAD_SECONDS = 15.0
+
+
+_DB_RETRY_ATTEMPTS = 3
+_DB_RETRY_BACKOFF_SECONDS = 0.2
+
+
+async def _db(call, *args, **kwargs):
+    """동기 Supabase 호출을 스레드에서 실행하고, 전송 계층 일시 오류는 짧게 다시 시도한다.
+
+    Supabase client는 HTTP/2 소켓 하나를 공유해 연결이 잠깐 끊기면 진행 중이던 요청이 함께
+    `Server disconnected`를 맞는다(2026-10-16 운영: 원본 작업 조회가 끊겨 5장 원본 주소가 빠짐).
+    조회와 같은 값으로 다시 써도 되는 쓰기에만 쓴다.
+    """
+    for attempt in range(1, _DB_RETRY_ATTEMPTS + 1):
+        try:
+            return await asyncio.to_thread(call, *args, **kwargs)
+        except Exception as error:
+            transient = isinstance(error, httpx.TransportError) or _is_retryable_gateway_error(error)
+            if not transient or attempt == _DB_RETRY_ATTEMPTS:
+                raise
+            logger.warning("supabase 일시 오류 — 재시도 %d/%d: %s", attempt, _DB_RETRY_ATTEMPTS, type(error).__name__)
+            await asyncio.sleep(_DB_RETRY_BACKOFF_SECONDS * attempt)
 
 
 def _start_request_timer() -> float:
@@ -654,7 +678,7 @@ async def _upload_photos_impl(
     # 프로젝트 소유 확인
     # 이 함수의 동기 Supabase 호출은 모두 스레드에서 실행한다 — async 안에서 바로 부르면 DB를 기다리는
     # 동안 이벤트 루프가 멈춰 동시에 들어온 다른 업로드·confirm 요청까지 함께 기다렸다(2026-10-16 실측).
-    project = await asyncio.to_thread(require_owned_project, supabase, project_id, photographer_id, select="id, status")
+    project = await _db(require_owned_project, supabase, project_id, photographer_id, select="id, status")
     timing["auth_ms"] = time.perf_counter() - timing["start"]
 
     # 허용된 파일만 읽음 (BUG-01: 거부 파일 목록 수집 / BUG-02: 소문자 정규화)
@@ -737,7 +761,7 @@ async def _upload_photos_impl(
     # 베타 제한 체크/잔여량 계산용 — 잠금 없는 빠른 카운트.
     # 실제 number 할당은 모든 파일 처리가 끝난 뒤 insert_photos_with_numbers RPC가 INSERT와 함께 원자적으로 처리한다.
     try:
-        current_count = await asyncio.to_thread(_count_photos, supabase, project_id)
+        current_count = await _db(_count_photos, supabase, project_id)
     except Exception as e:
         logger.exception("photo count check failed: %s", e)
         raise HTTPException(status_code=500, detail="사진 수 확인 실패") from e
@@ -747,7 +771,7 @@ async def _upload_photos_impl(
     existing_client_ids: set[str] = set()
     if request_client_ids:
         try:
-            existing_r = await asyncio.to_thread(
+            existing_r = await _db(
                 supabase.table("photos")
                 .select("client_upload_id")
                 .eq("project_id", project_id)
@@ -767,7 +791,7 @@ async def _upload_photos_impl(
     _ensure_project_accepts_new_photos(project.get("status", ""), new_item_count)
 
     # 등급별 업로드 한도 체크 (관리자는 None=무제한)
-    max_photos = await asyncio.to_thread(get_max_photos_per_project, supabase, photographer_id)
+    max_photos = await _db(get_max_photos_per_project, supabase, photographer_id)
     if max_photos is not None and current_count >= max_photos and new_item_count > 0:
         try:
             await asyncio.to_thread(supabase.table("admin_audit_logs").insert({
@@ -924,7 +948,7 @@ async def _upload_photos_impl(
         raise HTTPException(status_code=500, detail="사진 저장 실패")
 
     db_post_started = time.perf_counter()
-    count_res = await asyncio.to_thread(
+    count_res = await _db(
         supabase.table("photos")
         .select("id", count="exact")
         .eq("project_id", project_id)
@@ -936,7 +960,7 @@ async def _upload_photos_impl(
         else current_count + len(inserted)
     )
     try:
-        await asyncio.to_thread(supabase.table("projects").update({"photo_count": photo_count}).eq("id", project_id).execute)
+        await _db(supabase.table("projects").update({"photo_count": photo_count}).eq("id", project_id).execute)
     except Exception as e:
         logger.error(f"에러내용: {e}")
         logger.exception("projects photo_count update failed: %s", e)
@@ -955,7 +979,7 @@ async def _upload_photos_impl(
     jobs_by_photo: dict[str, dict] = {}
     if original_photo_ids:
         try:
-            jobs_r = await asyncio.to_thread(
+            jobs_r = await _db(
                 supabase.table("original_jobs")
                 .select("id,photo_id,r2_source_key,source_content_type")
                 .in_("photo_id", original_photo_ids)
@@ -963,8 +987,10 @@ async def _upload_photos_impl(
             )
             jobs_by_photo = {str(job["photo_id"]): job for job in (jobs_r.data or [])}
         except Exception as e:
-            # job은 이미 저장됐다. 다음 페이지 진입 시 복구 배너가 다시 조회할 수 있다.
+            # 조회 실패를 "job 없음"으로 보고 넘어가면 원본 주소가 빠진 성공 응답이 나가 FE가 다시 보내지 않는다.
+            # 사진·job은 이미 저장됐으니 오류로 응답해 FE가 같은 업로드 ID로 다시 보내게 한다(replay가 주소를 준다).
             logger.exception("created original_jobs lookup failed: %s", e)
+            raise HTTPException(status_code=500, detail="원본 업로드 주소 확인 실패") from e
     timing["db_post_ms"] = time.perf_counter() - db_post_started
 
     presign_started = time.perf_counter()
@@ -1064,7 +1090,7 @@ async def _confirm_original_upload_impl(job_id: str, photographer_id: UUID, timi
     """presigned PUT 완료 통지: 소유권 확인 → 멱등 상태 체크 → R2 HEAD → pending 전이."""
     supabase = get_supabase()
     # 소유권 확인 (job → project → photographer)
-    job = await asyncio.to_thread(require_owned_job, supabase, job_id, photographer_id, select="id,status,r2_source_key,project_id")
+    job = await _db(require_owned_job, supabase, job_id, photographer_id, select="id,status,r2_source_key,project_id")
     project_id = str(job["project_id"])
     timing["project"] = project_id
     # 멱등: 이미 pending/processing/completed이면 바로 OK 반환
@@ -1085,7 +1111,7 @@ async def _confirm_original_upload_impl(job_id: str, photographer_id: UUID, timi
     # 조건부 UPDATE: status = 'awaiting_upload' 행만 전이 (RPC 내부에서 WHERE status='awaiting_upload')
     rpc_started = time.perf_counter()
     try:
-        await asyncio.to_thread(supabase.rpc("confirm_original_upload", {"p_job_id": job_id}).execute)
+        await _db(supabase.rpc("confirm_original_upload", {"p_job_id": job_id}).execute)
     except Exception as e:
         logger.exception("confirm_original_upload RPC failed for job %s: %s", job_id, e)
         raise HTTPException(status_code=500, detail="confirm 처리 실패") from e
