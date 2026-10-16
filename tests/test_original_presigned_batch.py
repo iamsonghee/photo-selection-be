@@ -65,18 +65,18 @@ class OriginalPresignedBatchTests(unittest.TestCase):
         self.assertEqual(items[ids[2]]["source_key"], "src/2.jpg")
 
 
-    def _upload_with_jobs_lookup(self, jobs_lookup):
+    def _upload_with_jobs_lookup(self, jobs_lookup, processed=None, insert=None):
         ids = [str(uuid4()) for _ in range(5)]
         files = [UploadFile(filename=f"p{i}.jpg", file=io.BytesIO(b"jpeg"), headers=Headers({"content-type": "image/jpeg"})) for i in range(5)]
-        processed = [("t", "p", 10, {"source_key": f"src/{i}.jpg", "photo_hex": f"h{i}", "content_type": "image/jpeg"}, 100, 100) for i in range(5)]
-        inserted = [{"id": f"photo-{i}"} for i in range(5)]
+        processed = processed or [("t", "p", 10, {"source_key": f"src/{i}.jpg", "photo_hex": f"h{i}", "content_type": "image/jpeg"}, 100, 100) for i in range(5)]
+        insert = insert or MagicMock(return_value=[{"id": f"photo-{i}"} for i in range(5)])
         db = _db([], jobs_lookup)
         with patch.object(upload, "get_supabase", return_value=db), \
                 patch.object(upload, "require_owned_project", return_value={"id": PROJECT, "status": "preparing"}), \
                 patch.object(upload, "_count_photos", return_value=0), \
                 patch.object(upload, "get_max_photos_per_project", return_value=None), \
                 patch.object(upload, "_process_one", new=AsyncMock(side_effect=processed)), \
-                patch.object(upload, "_insert_photos_with_numbers", return_value=inserted), \
+                patch.object(upload, "_insert_photos_with_numbers", new=insert), \
                 patch.object(upload, "_DB_RETRY_BACKOFF_SECONDS", 0), \
                 patch.object(upload, "generate_presigned_put_url", side_effect=lambda key, *_: f"https://r2/{key}"):
             result = asyncio.run(upload.upload_photos(
@@ -97,6 +97,27 @@ class OriginalPresignedBatchTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             self._upload_with_jobs_lookup(httpx.RemoteProtocolError("Server disconnected"))
         self.assertEqual(raised.exception.status_code, 500)
+
+
+    def test_storage_failure_fails_the_request_instead_of_dropping_a_photo(self):
+        # 예전에는 R2 저장 실패 사진이 거절 목록에도 없이 빠진 채 200이 나가, 원본 미포함 업로드에서 사진이 조용히 사라질 수 있었다.
+        ok = ("t", "p", 10, {"source_key": "src/x.jpg", "photo_hex": "h", "content_type": "image/jpeg"}, 100, 100)
+        insert = MagicMock()
+        with self.assertRaises(HTTPException) as raised:
+            self._upload_with_jobs_lookup(None, processed=[ok, ok, RuntimeError("R2 timeout"), ok, ok], insert=insert)
+        self.assertEqual(raised.exception.status_code, 500)
+        insert.assert_not_called()  # 아무것도 저장하지 않아 FE 재전송이 깔끔하다
+
+    def test_unreadable_image_is_reported_as_rejected(self):
+        jobs = [{"id": f"job-{i}", "photo_id": f"photo-{i}", "r2_source_key": f"src/{i}.jpg", "source_content_type": "image/jpeg"} for i in range(4)]
+        ok = lambda i: ("t", "p", 10, {"source_key": f"src/{i}.jpg", "photo_hex": f"h{i}", "content_type": "image/jpeg"}, 100, 100)
+        insert = MagicMock(return_value=[{"id": f"photo-{i}"} for i in range(4)])
+        ids, _db_mock, result = self._upload_with_jobs_lookup(
+            [MagicMock(data=jobs)], processed=[ok(0), upload._UnreadableImage("broken"), ok(1), ok(2), ok(3)], insert=insert,
+        )
+        self.assertEqual(result["rejected"], ["p1.jpg"])
+        self.assertEqual(len(insert.call_args.args[2]), 4)
+        self.assertNotIn(ids[1], {item["client_upload_id"] for item in result["original_presigned"]})
 
 
 if __name__ == "__main__":

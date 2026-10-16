@@ -451,6 +451,10 @@ def _process_original_sync(image_bytes: bytes, content_type: str) -> bytes:
     return last
 
 
+class _UnreadableImage(Exception):
+    """썸네일·미리보기를 만들 수 없는 파일 — 다시 보내도 같으므로 거절 목록으로 알린다."""
+
+
 async def _process_one(
     loop: asyncio.AbstractEventLoop,
     contents: bytes,
@@ -485,7 +489,7 @@ async def _process_one(
     except Exception as e:
         logger.error(f"에러내용: {e}")
         logger.warning("resize failed for index %s: %s", index, e)
-        return None
+        raise _UnreadableImage(str(e)) from e
     finally:
         if timings is not None:
             timings["resize"].append(time.perf_counter() - resize_started)
@@ -502,13 +506,13 @@ async def _process_one(
     except Exception as e:
         logger.error(f"에러내용: {e}")
         logger.warning("R2 upload failed for index %s: %s", index, e)
-        return None
+        raise  # 일시 오류일 수 있다 — 요청 전체를 실패시켜 FE가 같은 키로 다시 보내게 한다
     finally:
         if timings is not None:
             timings["r2"].append(time.perf_counter() - r2_started)
 
     if not thumb_url or not preview_url:
-        return None
+        raise RuntimeError(f"R2 upload returned no url for index {index}")
 
     r2_stored_bytes = len(thumb_bytes) + len(preview_bytes)
     if UPLOAD_MEM_LOG:
@@ -850,6 +854,13 @@ async def _upload_photos_impl(
     )
     timing["process_ms"] = time.perf_counter() - process_started
 
+    # 저장소·서버 일시 오류로 처리 못 한 사진이 있으면 성공 응답에서 조용히 빠지지 않게 요청 전체를 실패시킨다.
+    # FE가 같은 업로드 ID로 다시 보내면 R2 키가 같아 덮어쓰기만 되고, 이미 저장된 사진은 replay로 처리된다.
+    transient_failure = next((r for r in results if isinstance(r, Exception) and not isinstance(r, _UnreadableImage)), None)
+    if transient_failure is not None:
+        logger.error("photo processing failed, asking client to retry: %s", transient_failure)
+        raise HTTPException(status_code=500, detail="사진 저장 중 일시 오류가 발생했습니다. 다시 시도해 주세요.") from transient_failure
+
     # asyncio.gather는 입력 순서를 보존하므로, valid의 원래 파일 순서 그대로 number가 매겨진다.
     rows: list[dict] = []
     # presigned_infos는 rows와 1:1 대응한다.
@@ -863,9 +874,9 @@ async def _upload_photos_impl(
         source_width,
         source_height,
     ), (taken_at, taken_at_source) in zip(results, valid, meta, taken):
-        if isinstance(r, Exception):
-            logger.error(f"에러내용: {r}")
-            logger.warning("process task failed: %s", r)
+        if isinstance(r, Exception) or r is None:
+            # 읽을 수 없는 이미지: 거절 목록에 넣어 FE가 실패로 표시하게 한다(조용히 빠지지 않게).
+            rejected_filenames.append(compressed_fn or orig_fn or "(unknown)")
             continue
         if r is not None:
             (
