@@ -21,6 +21,7 @@ from app.config import (
     GEMINI_QUALITY_CONCURRENCY,
     GEMINI_QUALITY_MAX_RETRIES,
     GEMINI_QUALITY_TIMEOUT_SECONDS,
+    GEMINI_STAGE_TIMEOUT_SECONDS,
 )
 from app.gemini_client import get_client, is_retryable, retry_delay
 
@@ -89,18 +90,70 @@ UNKNOWN_PLACE = "알 수 없음"
 
 
 def customer_schema(place_names: Optional[list[str]] = None):
-    """셀프 고객 판정 스키마·프롬프트. place_names가 있으면 사진을 찍은 장소(목록 중 하나 또는 UNKNOWN_PLACE)도 묻는다 —
-    홈스냅 장면을 장소가 바뀌는 곳에서 나누기 위함. 같은 호출에 붙여 사진을 한 번만 보낸다(입력 토큰 +약 9%)."""
+    """셀프 고객 판정 스키마·프롬프트. place_names(홈스냅)가 있으면 같은 호출에서 사진마다 찍은 장소(목록 중 하나 또는 UNKNOWN_PLACE)도
+    묻는다 — 사진을 한 번만 보낸다(장소 목록 기준 입력 토큰 +약 9%). 웨딩 본식 단계는 여기서 묻지 않는다(`judge_stages`)."""
     if not place_names:
         return CustomerPhotoAssessment, _CUSTOMER_PROMPT
     places = [*place_names, UNKNOWN_PLACE]
     schema = create_model("CustomerPlaceAssessment", __base__=CustomerPhotoAssessment, place=(Literal[tuple(places)], ...))
     end = "주어진 JSON 스키마 형식으로만 응답하세요."
-    prompt = _CUSTOMER_PROMPT.replace(end, f"""- place: 이 사진을 찍은 장소를 배경을 보고 목록 중 하나로 고르세요. 배경이 거의 안 보여 장소를 알 수 없으면 "{UNKNOWN_PLACE}".
-  목록: {", ".join(places)}
+    field = f"""- place: 이 사진을 찍은 장소를 배경을 보고 목록 중 하나로 고르세요. 배경이 거의 안 보여 장소를 알 수 없으면 "{UNKNOWN_PLACE}".
+  목록: {", ".join(places)}"""
+    return schema, _CUSTOMER_PROMPT.replace(end, f"{field}\n\n{end}")
 
-{end}""")
-    return schema, prompt
+
+# 단계 판정(웨딩 본식): 흔들림 판정과 따로, 촬영 순서로 이어진 사진 STAGE_BATCH_PHOTOS장을 한 호출에 보여 주고 사진마다 단계를 받는다.
+# 앞뒤 흐름을 봐야 맞히는 사진(노래를 듣는 신부 = 축가, 버진로드 행진 사이 키스 = 행진, 아버지가 신랑에게 인계 = 신부 입장)을 한 장만 보고는
+# 예식으로 읽었다. 2026-10-15 짱쭌 본식 1,285장(잠정 정답): 흔들림 호출에 얹은 한 장 판정 84.4% → 10장 묶음 89.3%(다듬은 뒤 93.5 → 94.7%,
+# 장면 경계 ±3장 정밀도 67 → 90%). 묶음끼리 STAGE_BATCH_OVERLAP장 겹쳐 앞 묶음 끝을 맥락으로만 다시 본다(라벨은 앞 묶음 것).
+# 해상도는 낮음(장당 약 280토큰): 기본 해상도(85.7%, $0.60)보다 정확하고 싸다 — 1,285장 약 $0.20, 3,439장 약 $0.55(표준 단가).
+# 구간 대표 사진만 한 번에 보여 주는 방식은 85.4%로 낮았고 구간 141개짜리 응답은 개수를 못 맞췄다. 판단 기준 문구를 더 늘린 v3(하객 유무·
+# 앉은 신부)는 두 프로젝트 모두 낮아졌다(94.7 → 93.4%, 81.0 → 76.7%).
+# 문구·묶음 크기·해상도를 바꾸면 버전을 올린다(판정 캐시 버전에 들어가 전체 재판정).
+STAGE_PROMPT_VERSION = "stage-v2-context10-low"
+STAGE_BATCH_PHOTOS = 10
+STAGE_BATCH_OVERLAP = 2
+STAGE_MEDIA_RESOLUTION = types.MediaResolution.MEDIA_RESOLUTION_LOW
+# 응답 개수 제한(minItems·maxItems)은 이 개수 이하에서만 건다 — 56처럼 크면 Gemini가 400(INVALID_ARGUMENT)으로 거절한다.
+_SCHEMA_MAX_ITEMS = 20
+
+_STAGE_PROMPT = """아래 사진 {n}장은 한 결혼식 본식을 시간 순서대로 이어 찍은 사진입니다(사진 1이 가장 먼저).
+사진마다 촬영 단계를 아래 목록에서 하나씩 고르세요. 한 장만 보지 말고 앞뒤 사진의 흐름을 함께 보세요 — 예를 들어 노래하는 사람 앞뒤의
+신부 단독 컷은 축가를 듣는 장면이고, 버진로드를 걸어 나가는 사진 사이의 키스 클로즈업은 행진입니다. 어느 단계에나 나올 수 있는
+하객 얼굴·손·소품 클로즈업은 앞뒤 사진의 단계를 따르세요. 정말 알 수 없을 때만 "{unknown}".
+단계(이름: 판단 기준):
+{lines}
+stages에는 사진 1부터 차례로 정확히 {n}개를 적으세요."""
+
+
+class _StageList(BaseModel):
+    stages: list[str]
+
+
+def stage_prompt(count: int, stage_names: list[str], hints: Optional[dict[str, str]] = None) -> str:
+    hints = hints or {}
+    lines = "\n".join(f"- {name}: {hints[name]}" if hints.get(name) else f"- {name}" for name in stage_names)
+    return _STAGE_PROMPT.format(n=count, unknown=UNKNOWN_PLACE, lines=lines)
+
+
+def stage_schema(count: int, stage_names: list[str]) -> types.Schema:
+    stages = types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING, enum=[*stage_names, UNKNOWN_PLACE]),
+                          **({"min_items": count, "max_items": count} if count <= _SCHEMA_MAX_ITEMS else {}))
+    return types.Schema(type=types.Type.OBJECT, properties={"stages": stages}, required=["stages"])
+
+
+def stage_windows(count: int, context: int = 0) -> list[tuple[int, int, int]]:
+    """사진 count장(앞 context장은 맥락으로만)을 나눈 묶음 [(시작, 끝(미포함), 이 묶음에서 라벨을 쓰는 첫 위치)].
+    묶음끼리 STAGE_BATCH_OVERLAP장 겹치고, 겹친 앞부분(첫 묶음은 맥락 사진)은 라벨을 쓰지 않는다."""
+    windows: list[tuple[int, int, int]] = []
+    start = 0
+    while count > context:
+        end = min(count, start + STAGE_BATCH_PHOTOS)
+        windows.append((start, end, context if start == 0 else STAGE_BATCH_OVERLAP))
+        if end == count:
+            break
+        start = end - STAGE_BATCH_OVERLAP
+    return windows
 
 
 # ponytail: 운영(Python 3.11)의 SDK는 service_tier를 받지만 로컬 Python 3.9용 SDK(1.47)에는 없다 — 없으면 표준으로 보낸다.
@@ -214,3 +267,72 @@ async def assess_images(
 
     results = await asyncio.gather(*[_run(i, img) for i, img in enumerate(images)])
     return list(results), usages
+
+
+async def _judge_stage_window(client, images: list[Optional[bytes]], stage_names: list[str], hints: Optional[dict[str, str]],
+                              stats: dict) -> tuple[list[str], Optional[dict]]:
+    """묶음 하나(이어 찍은 사진들)의 사진별 단계. 재시도는 `_assess_one`과 같은 규칙(응답 형식·개수가 틀리면 한 번만 다시 묻는다)."""
+    contents: list = [stage_prompt(len(images), stage_names, hints)]
+    for k, image in enumerate(images):
+        contents.append(f"사진 {k + 1}")
+        contents.append(types.Part.from_bytes(data=image, mime_type="image/jpeg") if image else "(이미지 없음)")
+    tier = {"service_tier": GEMINI_CUSTOMER_QUALITY_SERVICE_TIER} if _SUPPORTS_SERVICE_TIER else {}
+    flex = tier.get("service_tier") == "flex"
+    allowed = {*stage_names, UNKNOWN_PLACE}
+    last_exc: Optional[Exception] = None
+    for attempt in range(GEMINI_QUALITY_MAX_RETRIES + 1):
+        stats["attempts"] = stats.get("attempts", 0) + 1
+        try:
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=GEMINI_FLASH_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=stage_schema(len(images), stage_names),
+                        temperature=0,
+                        media_resolution=STAGE_MEDIA_RESOLUTION,
+                        **tier,
+                    ),
+                ),
+                timeout=GEMINI_FLEX_TIMEOUT_SECONDS if flex else GEMINI_STAGE_TIMEOUT_SECONDS,
+            )
+            stages = _StageList.model_validate_json(response.text).stages
+            if len(stages) != len(images) or not allowed.issuperset(stages):
+                raise ValueError(f"stage answer has {len(stages)} items for {len(images)} photos or an unlisted stage")
+            return stages, _build_usage(response)
+        except Exception as e:
+            last_exc = e
+            stats["failed_attempts"] = stats.get("failed_attempts", 0) + 1
+            retry = (is_retryable(e) and not (flex and isinstance(e, asyncio.TimeoutError))) \
+                or (isinstance(e, (ValidationError, ValueError)) and attempt == 0)
+            if attempt < GEMINI_QUALITY_MAX_RETRIES and retry:
+                await asyncio.sleep(retry_delay(e, attempt, base=5.0 if flex else 1.0))
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
+
+
+async def judge_stages(images: list[Optional[bytes]], stage_names: list[str], hints: Optional[dict[str, str]] = None,
+                       context: int = 0, stats: Optional[dict] = None) -> tuple[list[Optional[str]], list[dict]]:
+    """촬영 순서로 놓인 사진들의 단계(`stage_windows` 묶음마다 한 호출). images 앞 context장은 앞 묶음 끝 사진 — 맥락으로만 보고 라벨은 돌려주지 않는다.
+    반환: (images[context:]와 같은 순서의 단계 — 실패한 묶음의 사진은 None, 실제 usage 목록)."""
+    client = await get_client()
+    sem = asyncio.Semaphore(GEMINI_QUALITY_CONCURRENCY)
+    stats = stats if stats is not None else {}
+    labels: list[Optional[str]] = [None] * len(images)
+    usages: list[dict] = []
+
+    async def run(start: int, end: int, keep: int):
+        async with sem:
+            try:
+                stages, usage = await _judge_stage_window(client, images[start:end], stage_names, hints, stats)
+            except Exception as e:  # 묶음 하나가 실패해도 나머지로 다듬는다(그 사진들은 판정 없음 = 앞 단계를 따른다)
+                logger.warning("gemini stage judgment failed for photos %d-%d: %s", start, end - 1, type(e).__name__)
+                return
+            if usage:
+                usages.append(usage)
+            labels[start + keep:end] = stages[keep:]
+
+    await asyncio.gather(*[run(*window) for window in stage_windows(len(images), context)])
+    return labels[context:], usages

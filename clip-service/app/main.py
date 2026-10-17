@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from postgrest.exceptions import APIError
@@ -44,7 +45,13 @@ class CustomerAnalyzeRequest(BaseModel):
     # 촬영 종류별 장면 경계 공백(초, FE 카탈로그). 없으면 기본값(scenes.SCENE_GAP_SECONDS).
     scene_gap_seconds: int | None = Field(default=None, ge=30, le=1800)
     # 흔들림 확인(kind=quality)에서 사진마다 장소도 물을 목록(FE 카탈로그, 홈스냅). 있으면 장면을 장소 기준으로 다시 나눈다.
+    # 웨딩 본식은 장면 정리(kind=scene)에도 같은 목록을 보낸다 — 장면 실행이 이 판정을 기다려 단계로 나눈다.
     place_names: list[str] | None = None
+    # place: 장소(홈스냅), stage: 촬영 단계(웨딩 본식). stage면 place_hints(단계 이름 → 판단 기준, FE 카탈로그)를 판정 문구에 넣는다.
+    place_basis: Literal["place", "stage"] | None = None
+    place_hints: dict[str, str] | None = None
+    # 웨딩 본식 장면 정리(kind=scene)만: place_names 중 본식 단계(FE 카탈로그). 본식 범위 밖 본식 단계 정리·카메라 합치기에 쓴다.
+    place_main_stages: list[str] | None = None
 
 
 class AnalyzeGeminiRequest(BaseModel):
@@ -114,11 +121,12 @@ def analyze_customer(kind: str, req: CustomerAnalyzeRequest, background_tasks: B
         current = _latest_customer_run(db, req.project_id, kind)
         raise HTTPException(status_code=409, detail={"error": "already_processing", "run_id": current and current["id"]})
     if kind == "scene":
-        background_tasks.add_task(customer_ai.run_scene, run["id"], req.project_id, req.scene_names, req.scene_gap_seconds)
+        background_tasks.add_task(customer_ai.run_scene, run["id"], req.project_id, req.scene_names, req.scene_gap_seconds,
+                                  req.place_names, req.place_basis, req.place_hints, req.place_main_stages)
     elif kind == "similarity":
         background_tasks.add_task(customer_ai.run_similarity, run["id"], req.project_id)
     else:
-        background_tasks.add_task(customer_ai.run_quality, run["id"], req.project_id, req.place_names)
+        background_tasks.add_task(customer_ai.run_quality, run["id"], req.project_id, req.place_names, req.place_basis, req.place_hints)
     return {"status": "processing", "run_id": run["id"]}
 
 
