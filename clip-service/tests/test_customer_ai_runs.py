@@ -26,7 +26,7 @@ def _quality_run(monkeypatch, photo_count, status_after=None, fail_query=False):
         calls["download"].append(len(urls))
         return [b"x" for _ in urls]
 
-    async def assess(images, on_each=None, customer=False, stats=None, place_names=None):
+    async def assess(images, on_each=None, customer=False, stats=None, place_names=None, place_basis=None, place_hints=None):
         calls["assess"] += 1
         value = SimpleNamespace(eyes_closed=SimpleNamespace(value="ok"), blur_or_shake=SimpleNamespace(value="ok"),
                                 focus_issue=SimpleNamespace(value="ok"), face_occluded=SimpleNamespace(value="ok"),
@@ -52,9 +52,10 @@ def test_quality_downloads_judges_and_saves_in_batches(monkeypatch):
     assert done == {"total": 91, "processed": 91, "failed": 0, "error": None}
     upserts = db.table.return_value.upsert.call_args_list
     assert [len(call.args[0]) for call in upserts] == [40, 40, 10]
-    # 사진마다 현재 판정 한 행만 — 다른 프롬프트 버전·다른 모델 판정을 지운다.
-    neq = db.table.return_value.delete.return_value.eq.return_value.neq.call_args_list
-    assert {call.args[0] for call in neq} == {"prompt_version", "model"}
+    # 사진마다 현재 판정 한 행만 — 지금 판정이 있는 사진(이미 판정 1장 + 새로 90장)의 다른 프롬프트 버전·다른 모델 판정을 지운다.
+    scoped = db.table.return_value.delete.return_value.eq.return_value.in_
+    assert [len(call.args[1]) for call in scoped.call_args_list] == [91, 91]
+    assert {call.args[0] for call in scoped.return_value.neq.call_args_list} == {"prompt_version", "model"}
 
 
 def test_superseded_quality_run_stops_before_spending_more(monkeypatch):

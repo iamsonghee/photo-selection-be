@@ -9,7 +9,7 @@ import hashlib
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import numpy as np
@@ -22,11 +22,14 @@ from app.config import (CUSTOMER_AI_HEAVY_RUNS, GEMINI_EMBEDDING_DIMENSION, GEMI
 from app.db import get_supabase
 from app.downloader import download_all
 from app.gemini_client import embed_images, get_client
-from app.gemini_quality_client import UNKNOWN_PLACE, _build_usage, assess_images, customer_service_tier, sum_usage
+from app.gemini_quality_client import (STAGE_BATCH_OVERLAP, STAGE_BATCH_PHOTOS, STAGE_MEDIA_RESOLUTION, STAGE_PROMPT_VERSION,
+                                       UNKNOWN_PLACE, _build_usage, assess_images, customer_service_tier, judge_stages, sum_usage)
 from app.grouping import (SHOT_ANCHOR_MARGIN, SHOT_MAX, SHOT_MAX_GAP_SECONDS, SHOT_MIN, SHOT_PERCENTILE, group_shots)
 from app.scenes import (CLOSE_GAP_SECONDS, CONTENT_CUT_SIMILARITY, CONTENT_MAX_SCENES,
                         CONTENT_MIN_SCENE_PHOTOS, CONTENT_WINDOW, MIN_PHOTOS_FOR_SCENES,
                         MIN_SCENE_PHOTOS, PLACE_MIN_RUN, PLACE_WINDOW, SCENE_SETTINGS,
+                        STAGE_MIN_LABELED_RATIO, STAGE_MIN_RUN, STAGE_WINDOW, STAGE_SEGMENT_CUT_SIMILARITY,
+                        STAGE_SEGMENT_MIN_PHOTOS, STAGE_SEGMENT_MIN_RUN, STAGE_SEGMENT_WINDOW, CAMERA_MIN_PHOTOS,
                         CONTENT_VISIBLE_MAX, CONTENT_VISIBLE_MIN, CONTENT_VISIBLE_TARGET,
                         CONTENT_FILENAME_MIN_DIGITS, CONTENT_FILENAME_MAX_SPAN_FACTOR, content_order,
                         CONTENT_GENERIC_PLACES,
@@ -60,6 +63,21 @@ CONTENT_SCENE_SETTINGS = {"boundary": "content", "contentWindow": CONTENT_WINDOW
                           "filenameMinDigits": CONTENT_FILENAME_MIN_DIGITS, "filenameMaxSpanFactor": CONTENT_FILENAME_MAX_SPAN_FACTOR,
                           "samePlaceCutSimilarity": CONTENT_CUT_SIMILARITY, "genericPlaces": sorted(CONTENT_GENERIC_PLACES)}
 PLACE_SCENE_SETTINGS = {"boundary": "place", "placeWindow": PLACE_WINDOW, "placeMinRun": PLACE_MIN_RUN, "hardCutSeconds": CLOSE_GAP_SECONDS}
+# 단계 기준 장면(웨딩 본식)에서 실행 settings에 남기는 값 — 검수 채점에서 장소·시간·내용 기준과 구분.
+STAGE_SCENE_SETTINGS = {"boundary": "stage", "placeWindow": STAGE_WINDOW, "placeMinRun": STAGE_MIN_RUN,
+                        "minLabeledRatio": STAGE_MIN_LABELED_RATIO, "hardCutSeconds": CLOSE_GAP_SECONDS,
+                        "labelOrder": "capture-time-else-filename-sequence-else-upload", "waitsForQuality": True,
+                        "waitsForSimilarity": True, "segmentWindow": STAGE_SEGMENT_WINDOW,
+                        "segmentCutSimilarity": STAGE_SEGMENT_CUT_SIMILARITY, "segmentMinPhotos": STAGE_SEGMENT_MIN_PHOTOS,
+                        "segmentMinRun": STAGE_SEGMENT_MIN_RUN, "cameraMinPhotos": CAMERA_MIN_PHOTOS,
+                        "outsideMain": "neighbor-stage", "cameraMerge": "phase-weighted-alignment"}
+# 흔들림 확인 실행이 웨딩 본식 단계 판정에 쓴 방식(실행 settings 기록용).
+STAGE_JUDGE_SETTINGS = {"promptVersion": STAGE_PROMPT_VERSION, "batchPhotos": STAGE_BATCH_PHOTOS, "overlap": STAGE_BATCH_OVERLAP,
+                        "mediaResolution": STAGE_MEDIA_RESOLUTION.value, "order": "capture-time-else-filename-sequence-else-upload"}
+# 단계 기준 장면 실행은 같은 정리에서 함께 시작한 흔들림 확인(사진마다 단계 판정)과 유사컷(임베딩 — 다듬기에 쓴다)이 끝나길 이 간격으로 확인하며 기다린다.
+QUALITY_WAIT_SECONDS = 10
+# 장면 요청이 다른 요청보다 먼저 도착할 수 있다 — 이 시간 안에 시작된 실행을 같은 정리로 보고, 지나도 새 실행이 없으면 최근 실행 결과를 쓴다.
+QUALITY_START_GRACE_SECONDS = 120
 
 
 def place_list(names: Optional[list[str]]) -> Optional[list[str]]:
@@ -68,10 +86,22 @@ def place_list(names: Optional[list[str]]) -> Optional[list[str]]:
     return places or None
 
 
-def quality_prompt_version(place_names: Optional[list[str]] = None) -> str:
-    """장소도 묻는 판정은 장소 목록마다 버전이 다르다 — 목록이 바뀌면 다시 판정한다(같은 목록이면 캐시 재사용)."""
+def stage_hints(names: Optional[list[str]], hints: Optional[dict]) -> dict[str, str]:
+    """단계별 판단 기준 중 목록에 있는 이름의 것만(문자열만). 판정 문구와 캐시 버전이 같은 값을 쓰도록 한 곳에서 거른다."""
+    hints = hints if isinstance(hints, dict) else {}
+    return {name: hints[name].strip() for name in names or [] if isinstance(hints.get(name), str) and hints[name].strip()}
+
+
+def quality_prompt_version(place_names: Optional[list[str]] = None, place_basis: Optional[str] = None,
+                           place_hints: Optional[dict[str, str]] = None) -> str:
+    """장소도 묻는 판정은 장소 목록마다 버전이 다르다 — 목록이 바뀌면 다시 판정한다(같은 목록이면 캐시 재사용).
+    단계 기준(웨딩 본식)은 목록·판단 기준·단계 문구 버전이 하나라도 바뀌면 다시 판정한다."""
     if not place_names:
         return CUSTOMER_QUALITY_PROMPT_VERSION
+    if place_basis == "stage":
+        payload = {"names": place_names, "hints": stage_hints(place_names, place_hints), "prompt": STAGE_PROMPT_VERSION}
+        digest = hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8]
+        return f"{CUSTOMER_QUALITY_PROMPT_VERSION}-stage-{digest}"
     digest = hashlib.sha1(json.dumps(place_names, ensure_ascii=False).encode()).hexdigest()[:8]
     return f"{CUSTOMER_QUALITY_PROMPT_VERSION}-place-{digest}"
 SCENE_SAMPLE_PHOTOS = 3
@@ -82,6 +112,7 @@ PAGE_ROWS = 1000  # PostgREST 최대 행 수 — 넘는 조회는 나눠 읽는�
 # 만들다 운영 DB가 20분 멈췄다(2026-10-05, 1,285장 재정리). 한 요청 약 6MB로 나눠 읽는다.
 EMBEDDING_PAGE_ROWS = 100
 BATCH_PHOTOS = 40  # 한 번에 내려받아 판정·저장하는 사진 수(메모리: 1200px 미리보기 40장 ≈ 10MB)
+CLEANUP_PHOTOS = 200  # 이전 판정 정리 요청 하나에 넣는 사진 ID 수(URL 길이 — 장면 저장의 200장 묶음과 같은 값)
 HEARTBEAT_SECONDS = 60
 
 # 진행 갱신(updated_at)이 이만큼 없으면 멈춘 실행(서비스 재시작 등으로 프로세스가 사라진 것). 살아 있는 실행은
@@ -132,15 +163,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_at(value) -> datetime:
+    """DB 시각(ISO 문자열) → UTC datetime. 시간대가 없으면 UTC로 본다."""
+    at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+
+
 def is_stale(run: dict, now: datetime) -> bool:
     """진행 중인데 마지막 진행 갱신 뒤 STALE_RUN_SECONDS 넘게 멈춘 실행(서비스 재시작 등). 갱신 기록 전 실행은 시작 시각 기준."""
     last = run.get("updated_at") or run.get("started_at")
     if run.get("status") != "processing" or not last:
         return False
-    last_at = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
-    if last_at.tzinfo is None:
-        last_at = last_at.replace(tzinfo=timezone.utc)
-    return (now - last_at).total_seconds() > STALE_RUN_SECONDS
+    return (now - _parse_at(last)).total_seconds() > STALE_RUN_SECONDS
 
 
 def _ensure_running(db, run_id: str):
@@ -207,13 +241,7 @@ def _shot_time(row: dict) -> Optional[float]:
 async def _embeddings(db, run_id: str, project_id: str, rows: list[dict], tick=None) -> list[Optional[np.ndarray]]:
     """사진별 임베딩(rows 순서). 이미 저장된 사진은 재사용하고 새 사진만 BATCH_PHOTOS장씩 Gemini로 계산해 바로 저장한다
     (중간에 멈춰도 계산한 만큼은 남아 다음 실행이 재사용)."""
-    stored = {
-        row["photo_id"]: np.asarray(row["embedding"], dtype=np.float64)
-        for row in _all_rows(lambda: db.table("customer_ai_embeddings").select("photo_id,embedding")
-                             .eq("project_id", project_id).eq("model", GEMINI_EMBEDDING_MODEL)
-                             .eq("dimension", GEMINI_EMBEDDING_DIMENSION).eq("version", GEMINI_EMBEDDING_VERSION)
-                             .order("photo_id"), page_rows=EMBEDDING_PAGE_ROWS)
-    }
+    stored = _stored_embeddings(db, project_id)
     missing = [row for row in rows if row["id"] not in stored]
     if tick:
         tick(len(rows) - len(missing))
@@ -231,6 +259,17 @@ async def _embeddings(db, run_id: str, project_id: str, rows: list[dict], tick=N
                 payload, on_conflict="project_id,photo_id,model,dimension,version").execute()
         stored.update({row["id"]: vector for row, vector in zip(batch, vectors) if vector is not None})
     return [stored.get(row["id"]) for row in rows]
+
+
+def _stored_embeddings(db, project_id: str) -> dict[str, np.ndarray]:
+    """저장된 임베딩(사진 ID → 벡터). 계산하지 않는다."""
+    return {
+        row["photo_id"]: np.asarray(row["embedding"], dtype=np.float64)
+        for row in _all_rows(lambda: db.table("customer_ai_embeddings").select("photo_id,embedding")
+                             .eq("project_id", project_id).eq("model", GEMINI_EMBEDDING_MODEL)
+                             .eq("dimension", GEMINI_EMBEDDING_DIMENSION).eq("version", GEMINI_EMBEDDING_VERSION)
+                             .order("photo_id"), page_rows=EMBEDDING_PAGE_ROWS)
+    }
 
 
 class _SceneName(BaseModel):
@@ -441,19 +480,26 @@ def _flagged_photos(db, project_id: str) -> set[str]:
             if "likely" in (row.get("eyes_closed"), row.get("blur_or_shake"), row.get("focus_issue"))}
 
 
-def _place_scenes(db, project_id: str, place_names: Optional[list[str]], rows: Optional[list[dict]] = None):
-    """흔들림 확인에서 사진마다 판정한 장소로 나눈 장면(이름 = 장소, 반복은 번호). 장소 판정이 없거나 부족하거나(흔들림 확인을
-    껐거나 아직 진행 중) 지금 촬영 종류의 장소 목록과 맞지 않으면(촬영 종류를 바꾼 뒤) None — 시간 기준 장면을 쓴다."""
+def _place_scenes(db, project_id: str, place_names: Optional[list[str]], rows: Optional[list[dict]] = None,
+                  place_basis: Optional[str] = None, place_hints: Optional[dict] = None, vectors: Optional[dict] = None,
+                  main_stages: Optional[set[str]] = None):
+    """흔들림 확인에서 사진마다 판정한 장소(웨딩 본식은 촬영 단계)로 나눈 장면(이름 = 라벨, 반복은 번호). 판정이 없거나 부족하거나
+    (흔들림 확인을 껐거나 아직 진행 중) 지금 촬영 종류의 목록과 맞지 않으면(촬영 종류를 바꾼 뒤) None — 다른 기준 장면을 쓴다.
+    단계 기준은 촬영 시각이 없어도(보정본) 파일명 연번으로 복원한 순서(`content_order`)로 다듬고, vectors(임베딩)·main_stages(본식 단계)를
+    `split_by_place`에 넘긴다."""
     place_names = place_list(place_names)
     if not place_names:
         return None
+    version = quality_prompt_version(place_names, place_basis, place_hints)
     labels = {row["photo_id"]: row.get("place") for row in _all_rows(lambda: db.table("customer_quality_assessments")
               .select("photo_id,place:raw_response->>place").eq("project_id", project_id)
-              .eq("model", GEMINI_FLASH_MODEL).eq("prompt_version", quality_prompt_version(place_names)).order("photo_id"))}
+              .eq("model", GEMINI_FLASH_MODEL).eq("prompt_version", version).order("photo_id"))}
     if rows is None:
-        rows = _all_rows(lambda: db.table("customer_photos").select("id,order_index,taken_at,taken_at_source")
+        rows = _all_rows(lambda: db.table("customer_photos").select("id,filename,order_index,taken_at,taken_at_source")
                          .eq("project_id", project_id).order("id"))
-    placed = split_by_place(rows, labels, PLACELESS_SCENES | {UNKNOWN_PLACE}, OTHER_SCENE)
+    rules = ({"window": STAGE_WINDOW, "min_run": STAGE_MIN_RUN, "untimed_order": True, "min_labeled_ratio": STAGE_MIN_LABELED_RATIO,
+              "vectors": vectors, "main_stages": main_stages} if place_basis == "stage" else {})
+    placed = split_by_place(content_order(rows), labels, PLACELESS_SCENES | {UNKNOWN_PLACE}, OTHER_SCENE, **rules)
     return placed and (placed[0], number_repeated(placed[1]))
 
 
@@ -500,13 +546,83 @@ def _replace_scenes(db, project_id: str, scenes: list[list[dict]], names: list[O
             db.table("customer_photos").update({"scene_id": saved["id"]}).in_("id", ids[start:start + 200]).execute()
 
 
-async def run_scene(run_id: str, project_id: str, scene_names: Optional[list[str]] = None, gap_seconds: Optional[int] = None):
+async def run_scene(run_id: str, project_id: str, scene_names: Optional[list[str]] = None, gap_seconds: Optional[int] = None,
+                    place_names: Optional[list[str]] = None, place_basis: Optional[str] = None,
+                    place_hints: Optional[dict[str, str]] = None, main_stages: Optional[list[str]] = None):
     db = get_supabase()
     async with _heartbeat(db, run_id):
-        await _run_scene(db, run_id, project_id, scene_names, gap_seconds or SCENE_SETTINGS["gapSeconds"])
+        await _run_scene(db, run_id, project_id, scene_names, gap_seconds or SCENE_SETTINGS["gapSeconds"],
+                         place_names, place_basis, place_hints, main_stages)
 
 
-async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[list[str]], gap_seconds: int):
+def _latest_run(db, project_id: str, kind: str) -> Optional[dict]:
+    rows = db.table("customer_ai_runs").select("status,created_at,updated_at,started_at,failed_count").eq("project_id", project_id) \
+        .eq("kind", kind).order("created_at", desc=True).limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
+async def _wait_for_run(db, run_id: str, project_id: str, kind: str, since: Optional[datetime] = None) -> Optional[str]:
+    """같은 정리에서 함께 시작한 kind 실행(흔들림 확인·유사컷)이 끝날 때까지 기다리고 그 상태(completed·failed, 없으면 None)를 돌려준다.
+    since: 이 정리(장면 실행)를 시작한 시각 — 이 시각 전후 QUALITY_START_GRACE_SECONDS 안에 만든 실행을 같은 정리로 보고, 그만큼 지나도 없으면
+    최근 실행 결과를 쓴다. 없으면 지금. 흔들림 뒤에 유사컷을 기다릴 때 지금을 기준으로 하면, 이미 끝난 같은 정리의 유사컷 실행을 옛 실행으로 보고
+    유예 시간을 다 기다렸다(2026-10-15 짱쭌: 흔들림 끝난 뒤 2분 더 기다림).
+    기다리는 동안 heartbeat는 run_scene이 계속 남기고, 이 실행이 대체됐으면 _ensure_running이 멈춘다.
+    그 실행이 멈춘 채(서비스 재시작 등) 남아 있으면 failed로 본다."""
+    started = since or datetime.now(timezone.utc)
+    while True:
+        _ensure_running(db, run_id)
+        now = datetime.now(timezone.utc)
+        waited = (now - started).total_seconds()
+        latest = _latest_run(db, project_id, kind)
+        if latest and latest["status"] == "processing":
+            if is_stale(latest, now):
+                return "failed"
+        elif latest and (_parse_at(latest["created_at"]) >= started - timedelta(seconds=QUALITY_START_GRACE_SECONDS)
+                         or waited >= QUALITY_START_GRACE_SECONDS):
+            return latest["status"]
+        elif not latest and waited >= QUALITY_START_GRACE_SECONDS:
+            return None
+        await asyncio.sleep(QUALITY_WAIT_SECONDS)
+
+
+async def _run_stage_scene(db, run_id: str, project_id: str, rows: list[dict], stage_names: Optional[list[str]],
+                           hints: Optional[dict], settings: dict, main_stages: Optional[list[str]] = None):
+    """단계 기준 장면(웨딩 본식, docs/wedding-ceremony-scene-plan.md): 같은 정리의 흔들림 확인이 사진마다 단계를 판정한다(이어 찍은
+    10장 묶음, `judge_stages`). 이 실행은 그 판정과 유사컷(임베딩)이 끝날 때까지 진행 중으로 기다렸다가(중간 장면을 보이지 않는다)
+    단계가 바뀌는 곳에서 나눠 저장한다. 다듬기는 임베딩 구간 다수결(임베딩이 빠진 사진이 있으면 창 다수결), 본식 범위 밖 본식 단계는 이웃 단계로,
+    카메라별로 내보낸 파일은 카메라마다 다듬어 합친다(`split_by_place`). Gemini를 직접 부르지 않는다. 흔들림 확인이 실패하면 이 실행도
+    실패로 닫고 기존 장면은 그대로 둔다. 유사컷이 실패해도 창 다수결로 나눈다. 사진이 적거나 단계 판정이 부족하면 장면 없이 끝낸다."""
+    stage_names = place_list(stage_names)
+    hints = stage_hints(stage_names, hints)
+    main = {name for name in main_stages or [] if name in (stage_names or [])} or None
+    settings = {**settings, **STAGE_SCENE_SETTINGS, "stages": stage_names or [], "mainStages": sorted(main or []),
+                "stagePromptVersion": quality_prompt_version(stage_names, "stage", hints)}
+    _progress(db, run_id, 0, 0, settings=settings, every=1)
+    placed = None
+    if stage_names and len(rows) >= MIN_PHOTOS_FOR_SCENES:
+        since = datetime.now(timezone.utc)
+        status = await _wait_for_run(db, run_id, project_id, "quality", since)
+        if status != "completed":
+            raise RuntimeError(f"흔들림 확인이 끝나지 않아 촬영 단계로 나누지 못했습니다(status={status})")
+        await _wait_for_run(db, run_id, project_id, "similarity", since)
+        stored = _stored_embeddings(db, project_id)
+        vectors = {row["id"]: stored[row["id"]] for row in rows if row["id"] in stored}
+        settings["smoothing"] = "embedding-segments" if len(vectors) == len(rows) else "window"
+        _progress(db, run_id, 0, 0, settings=settings, every=1)
+        placed = _place_scenes(db, project_id, stage_names, rows, "stage", hints, vectors, main)
+        failed = (_latest_run(db, project_id, "quality") or {}).get("failed_count") or 0
+        if placed is None and failed:
+            # 판정이 대량 실패해(Gemini 크레딧 소진·장애 — 2026-10-15 해군 2,268장) 단계가 부족하면 기존 장면을 지우지 않고 실패로 닫는다.
+            # 화면은 "AI 정리 실패 · 다시 시도", 다시 정리하면 실패한 사진만 다시 판정한다.
+            raise RuntimeError(f"흔들림 확인 {failed}장이 실패해 촬영 단계가 부족합니다 — 기존 장면을 그대로 둡니다")
+    _ensure_running(db, run_id)
+    _replace_scenes(db, project_id, *(placed or ([], [])))
+    _done(db, run_id, 0, 0, 0, usage=sum_usage([]))
+
+
+async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[list[str]], gap_seconds: int,
+                     place_names: Optional[list[str]] = None, place_basis: Optional[str] = None,
+                     place_hints: Optional[dict[str, str]] = None, main_stages: Optional[list[str]] = None):
     """장면 정리: 촬영 시각이 있으면 공백으로, 없으면 내용 기반 큰 촬영 구간과 노출 카드 수로 나누어 저장한다.
     시각 없는 경로는 유사컷과 같은 임베딩을 재사용한다. 진행 수는 작은 구간을 묘사한 수 기준.
     이름 붙이기(Gemini·다운로드)를 다 끝낸 뒤에 기존 장면을 바꾼다 — 도중에 서비스가 재시작돼도 기존 장면은 남는다.
@@ -518,7 +634,10 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
         rows = capture_order(_all_rows(lambda: db.table("customer_photos")
                                        .select("id,filename,order_index,preview_url,thumb_url,taken_at,taken_at_source,similarity_group_id")
                                        .eq("project_id", project_id).order("id")))
-        placed = _place_scenes(db, project_id, scene_names, rows)
+        if place_basis == "stage":  # 웨딩 본식: 흔들림 확인의 단계 판정을 기다려 단계로만 나눈다(시간·내용 기준을 돌리지 않는다).
+            await _run_stage_scene(db, run_id, project_id, rows, place_names or scene_names, place_hints, settings, main_stages)
+            return
+        placed = _place_scenes(db, project_id, place_names or scene_names, rows)
         if placed:  # 흔들림 확인에서 장소까지 판정했으면 그걸로 나누고 이름도 붙인다(Gemini 이름 호출 없음)
             _progress(db, run_id, 0, 0, settings={**settings, **PLACE_SCENE_SETTINGS}, every=1)
             _ensure_running(db, run_id)
@@ -597,7 +716,7 @@ async def _run_scene(db, run_id: str, project_id: str, scene_names: Optional[lis
             names = number_repeated(names)
         _ensure_running(db, run_id)
         # 이름을 붙이는 사이 흔들림 확인(장소 판정)이 끝났으면 장소 기준 장면이 더 정확하다 — 그걸 저장한다.
-        placed = _place_scenes(db, project_id, scene_names, rows)
+        placed = _place_scenes(db, project_id, place_names or scene_names, rows)
         _replace_scenes(db, project_id, *(placed or (scenes, names)))
         db.table("customer_ai_runs").update({"settings": {**settings, **(PLACE_SCENE_SETTINGS if placed else {}), "nameCache": named}}) \
             .eq("id", run_id).execute()
@@ -645,25 +764,34 @@ async def _run_similarity(db, run_id: str, project_id: str):
         _done(db, run_id, len(rows), 0, len(rows), str(exc)[:500])
 
 
-async def run_quality(run_id: str, project_id: str, place_names: Optional[list[str]] = None):
+async def run_quality(run_id: str, project_id: str, place_names: Optional[list[str]] = None,
+                      place_basis: Optional[str] = None, place_hints: Optional[dict[str, str]] = None):
     db = get_supabase()
     async with _heartbeat(db, run_id), _heavy_slot():
-        await _run_quality(db, run_id, project_id, place_names)
+        await _run_quality(db, run_id, project_id, place_names, place_basis, place_hints)
 
 
-async def _run_quality(db, run_id: str, project_id: str, place_names: Optional[list[str]] = None):
+async def _run_quality(db, run_id: str, project_id: str, place_names: Optional[list[str]] = None,
+                       place_basis: Optional[str] = None, place_hints: Optional[dict[str, str]] = None):
     """흔들림·눈 감음·인물 구성 판정. 같은 모델·프롬프트 버전으로 이미 판정한 사진은 다시 부르지 않고(사진을 추가하고
     다시 정리할 때 새 사진만), 나머지를 BATCH_PHOTOS장씩 내려받아 판정하고 바로 저장한다.
     place_names(홈스냅)가 있으면 사진을 찍은 장소도 같은 호출에서 묻고, 끝나면 장면을 장소 기준으로 다시 나눈다 —
-    장면 정리는 기다리지 않고 시간 기준 장면을 먼저 보여주고, 이 판정이 끝나면 더 정확한 장면으로 바뀐다."""
+    장면 정리는 기다리지 않고 시간 기준 장면을 먼저 보여주고, 이 판정이 끝나면 더 정확한 장면으로 바뀐다.
+    place_basis="stage"(웨딩 본식)면 장소 대신 촬영 단계를 판정한다: 사진을 촬영 순서로 놓고 내려받은 사진을 이어 찍은 10장 묶음으로
+    따로 묻는다(`judge_stages`, place_hints = 단계별 판단 기준). 앞 배치 끝 사진은 다음 배치 첫 묶음의 맥락으로 함께 보낸다(촬영 순서로 바로 이어질 때).
+    판정은 흔들림 판정 행의 raw_response.place에 함께 저장하고, 장면은 이 판정을 기다리던 장면 실행이 나눠 저장한다(`_run_stage_scene`)."""
     place_names = place_list(place_names)
-    version = quality_prompt_version(place_names)
+    stage = place_basis == "stage" and bool(place_names)
+    place_hints = stage_hints(place_names, place_hints) if stage else None
+    version = quality_prompt_version(place_names, place_basis, place_hints)
     total = processed = 0
     usages: list[dict] = []
     stats: dict = {}  # 실제 보낸 요청·실패한 요청 수(재시도·타임아웃 포함)
     try:
-        rows = _all_rows(lambda: db.table("customer_photos").select("id,order_index,preview_url")
+        rows = _all_rows(lambda: db.table("customer_photos").select("id,order_index,preview_url,filename,taken_at,taken_at_source")
                          .eq("project_id", project_id).order("order_index").order("id"))
+        if stage:  # 단계는 이어 찍은 사진 묶음으로 묻는다 — 촬영 시각 → 파일명 연번 → 업로드 순서
+            rows = capture_order(content_order(rows))
         done = {row["photo_id"] for row in _all_rows(lambda: db.table("customer_quality_assessments").select("photo_id")
                 .eq("project_id", project_id).eq("model", GEMINI_FLASH_MODEL)
                 .eq("prompt_version", version).order("photo_id"))}
@@ -671,33 +799,53 @@ async def _run_quality(db, run_id: str, project_id: str, place_names: Optional[l
         total, processed = len(rows), len(rows) - len(pending)
         tick = _progress(db, run_id, total, processed, settings={
             "model": GEMINI_FLASH_MODEL, "promptVersion": version, "placeNames": place_names or [],
+            "placeBasis": place_basis or ("place" if place_names else None),
             "serviceTier": customer_service_tier(),
             "timeoutSeconds": GEMINI_FLEX_TIMEOUT_SECONDS if customer_service_tier() == "flex" else GEMINI_QUALITY_TIMEOUT_SECONDS,
-            "image": "preview-1200", "batchPhotos": BATCH_PHOTOS})
+            "image": "preview-1200", "batchPhotos": BATCH_PHOTOS, **({"stageJudge": STAGE_JUDGE_SETTINGS} if stage else {})})
+        position = {row["id"]: index for index, row in enumerate(rows)}
+        saved: set[str] = set()
+        tail: list[Optional[bytes]] = []  # 앞 배치 끝 사진(단계 판정 맥락)
+        previous: Optional[str] = None
         for start in range(0, len(pending), BATCH_PHOTOS):
             batch = pending[start:start + BATCH_PHOTOS]
             _ensure_running(db, run_id)
             images = await download_all([row["preview_url"] for row in batch])
-            assessments, batch_usages = await assess_images(images, on_each=tick, customer=True, stats=stats, place_names=place_names)
+            quality = assess_images(images, on_each=tick, customer=True, stats=stats, place_names=None if stage else place_names)
+            if stage:
+                context = tail if previous is not None and position[batch[0]["id"]] == position[previous] + 1 else []
+                (assessments, batch_usages), (stages, stage_usages) = await asyncio.gather(
+                    quality, judge_stages(context + images, place_names, place_hints, len(context), stats))
+                usages += stage_usages
+                tail, previous = images[-STAGE_BATCH_OVERLAP:], batch[-1]["id"]
+            else:
+                assessments, batch_usages = await quality
+                stages = [None] * len(batch)
             usages += batch_usages
             payload = [{"project_id": project_id, "photo_id": row["id"], "model": GEMINI_FLASH_MODEL,
                         "prompt_version": version,
                         "eyes_closed": value.eyes_closed.value, "blur_or_shake": value.blur_or_shake.value,
                         "focus_issue": value.focus_issue.value, "face_occluded": value.face_occluded.value,
                         "primary_subject_detected": value.primary_subject_detected, "notes": value.notes,
-                        "raw_response": value.model_dump(mode="json")}
-                       for row, value in zip(batch, assessments) if value is not None]
+                        "raw_response": {**value.model_dump(mode="json"), **({"place": label} if stage else {})}}
+                       for row, value, label in zip(batch, assessments, stages) if value is not None]
             _ensure_running(db, run_id)
             if payload:
                 db.table("customer_quality_assessments").upsert(
                     payload, on_conflict="project_id,photo_id,model,prompt_version").execute()
+                saved.update(row["photo_id"] for row in payload)
             processed += len(payload)
-        # 사진마다 현재 모델·프롬프트 판정 한 행만 남긴다 — 프로젝트 조회가 사진별로 한 행을 고르므로 남으면 섞인다.
-        db.table("customer_quality_assessments").delete().eq("project_id", project_id) \
-            .neq("prompt_version", version).execute()
-        db.table("customer_quality_assessments").delete().eq("project_id", project_id) \
-            .neq("model", GEMINI_FLASH_MODEL).execute()
-        placed = _place_scenes(db, project_id, place_names)
+        # 사진마다 판정 한 행만 남긴다 — 프로젝트 조회가 사진별로 한 행을 고르므로 남으면 섞인다. 지금 모델·버전 판정이 있는 사진의
+        # 다른 판정만 지운다: 이번에 판정에 실패한 사진은 이전 판정(흔들림 표시)을 남기고 다음 정리에서 다시 판정한다
+        # (2026-10-15 해군: 크레딧 소진으로 2,268장 실패 → 전부 지워 흔들림 표시까지 잃었다).
+        current = sorted(done | saved)
+        for start in range(0, len(current), CLEANUP_PHOTOS):
+            chunk = current[start:start + CLEANUP_PHOTOS]
+            db.table("customer_quality_assessments").delete().eq("project_id", project_id).in_("photo_id", chunk) \
+                .neq("prompt_version", version).execute()
+            db.table("customer_quality_assessments").delete().eq("project_id", project_id).in_("photo_id", chunk) \
+                .neq("model", GEMINI_FLASH_MODEL).execute()
+        placed = _place_scenes(db, project_id, place_names) if place_basis != "stage" else None
         if placed:
             _ensure_running(db, run_id)
             _replace_scenes(db, project_id, *placed)
